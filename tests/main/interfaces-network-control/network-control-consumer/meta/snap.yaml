@@ -1,0 +1,9 @@
+name: network-control-consumer
+version: 1.0
+summary: Basic network-control consumer snap
+description: A basic snap declaring a plug on network-control
+
+apps:
+  cmd:
+    command: bin/cmd
+    plugs: [network-control]

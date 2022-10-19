@@ -1,0 +1,39 @@
+summary: Ensure network errors are handled gracefully
+
+# no iptables on core18+
+systems: [-ubuntu-core-18-*, -ubuntu-core-2*]
+
+restore: |
+    echo "Restoring iptables rules"
+    iptables -D OUTPUT -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable || true
+
+debug: |
+    echo "iptables rules:"
+    iptables -L -n -v
+
+execute: |
+    # Do a store op to avoid an unexpected device auth refresh on snap find
+    # below, which would produce different kind of error.
+    snap refresh
+
+    systemctl stop snapd.{socket,service}
+
+    echo "Disabling DNS queries"
+    iptables -I OUTPUT -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable
+    # centos 7 doesn't support caching dns, so no flushing required
+    if [ "$SPREAD_SYSTEM" != "centos-7-64" ]; then
+        if systemctl is-active systemd-resolved; then
+            if command -v resolvectl ; then
+                resolvectl flush-caches
+            else
+                # before systemd 239, the tool was named systemd-resolve
+                systemd-resolve --flush-caches
+            fi
+        fi
+    fi
+
+    systemctl start snapd.{socket,service}
+
+    OUT=$(snap find test 2>&1 || true)
+    iptables -D OUTPUT -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable
+    echo "$OUT" | MATCH "error: unable to contact snap store"

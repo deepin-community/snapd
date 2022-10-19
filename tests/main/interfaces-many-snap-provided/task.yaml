@@ -1,0 +1,76 @@
+summary: Ensure that commands run when their snap provided interfaces are connected
+
+details: |
+    Install a test snap that plugs as many snap provided interfaces as is
+    possible and verify the command can run (ie, don't test the interface
+    functionality itself). This will help catch things like AppArmor 
+    policy syntax errors, seccomp policy parsing, udev querying bugs, etc.
+
+# memory issue inside the adt environment
+backends: [-autopkgtest]
+
+# Ideally we would run this everywhere, but on systems with full security
+# support, it takes a while, which leads to travis timeouts. Limit to:
+# - Ubuntu Core 16 amd64
+# - Ubuntu classic 14.04 i386 VM
+# - Ubuntu classic 16.04 amd64 VM
+# - Ubuntu classic 18.04 amd64 VM
+# - All Ubuntu autopkgtests
+# - Debian sid amd64 VM
+# - Debian 9 amd64 VM
+# - TODO: All Fedora systems (for classic-only; unrelated error elsewhere)
+systems: [ubuntu-core-1*-64, ubuntu-14.04-32, ubuntu-16.04-64, ubuntu-18.04-64, ubuntu-18.04-32, ubuntu-*-amd64, ubuntu-*-armhf, ubuntu-*-arm64, ubuntu-*-i386, ubuntu-*-ppc64el, debian-*]
+
+# Start early as it takes a long time.
+priority: 100
+
+environment:
+    CONSUMER_SNAP: test-snapd-policy-app-consumer
+
+restore: |
+    # Remove the snaps to avoid timeout in next test
+    PROVIDER_SNAP="test-snapd-policy-app-provider-classic"
+    if os.query is-core; then
+        PROVIDER_SNAP="test-snapd-policy-app-provider-core"
+    fi
+    snap remove --purge "$PROVIDER_SNAP"
+    snap remove --purge "$CONSUMER_SNAP"
+
+debug: |
+    # get the full journal to see any out-of-memory errors
+    # shellcheck disable=SC2119
+    "$TESTSTOOLS"/journal-state get-log
+
+execute: |
+    PROVIDER_SNAP="test-snapd-policy-app-provider-classic"    
+    if os.query is-core; then
+        PROVIDER_SNAP="test-snapd-policy-app-provider-core"
+    fi
+
+    echo "Given a snap is installed"
+    "$TESTSTOOLS"/snaps-state install-local "$PROVIDER_SNAP"
+    "$TESTSTOOLS"/snaps-state install-local "$CONSUMER_SNAP"
+
+    echo "For each snap-provided slot from $PROVIDER_SNAP"
+    SNAP_MOUNT_DIR="$(os.paths snap-mount-dir)"
+    for slotcmd in "$SNAP_MOUNT_DIR"/bin/"$PROVIDER_SNAP".* ; do
+        slotcmd_bn=$(basename "$slotcmd")
+        slot_iface=$(echo "$slotcmd_bn" | tr '.' ':')
+
+        #shellcheck disable=SC2001
+        plugcmd=$(echo "$slotcmd" | sed "s/$PROVIDER_SNAP/$CONSUMER_SNAP/")
+        plugcmd_bn=$(basename "$plugcmd")
+        plug_iface=$(echo "$plugcmd_bn" | tr '.' ':')
+
+        CONNECTED_PATTERN="$slot_iface +$CONSUMER_SNAP"
+
+        echo "When slot $slot_iface is connected"
+        snap connect "$plug_iface" "$slot_iface"
+        snap interfaces | MATCH "$CONNECTED_PATTERN"
+
+        echo "Then $slotcmd should succeed"
+        "$slotcmd" | MATCH PASS
+
+        echo "Then $plugcmd should succeed"
+        "$plugcmd" | MATCH PASS
+    done

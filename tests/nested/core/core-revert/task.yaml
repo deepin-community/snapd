@@ -1,0 +1,71 @@
+summary: core revert test
+
+systems: [ubuntu-16.04-64]
+
+kill-timeout: 30m
+
+environment:
+    IMAGE_FILE: /tmp/work-dir/images/ubuntu-core-new.img
+
+debug: |
+    systemctl stop nested-vm || true
+    if [ -f "$IMAGE_FILE" ]; then
+        loops=$(kpartx -avs "$IMAGE_FILE" | cut -d' ' -f 3)
+
+        part=$(echo "$loops" | tail -1)
+
+        tmp=$(mktemp -d)
+        mount "/dev/mapper/$part" "$tmp"
+
+        grep --text "hsearch_r failed for.* No such process" "$tmp/system-data/var/log/syslog"
+
+        umount "$tmp"
+        rm -rf "$tmp"
+        kpartx -ds "$IMAGE_FILE"
+    fi
+
+execute: |
+    #shellcheck source=tests/lib/nested.sh
+    . "$TESTSLIB/nested.sh"
+
+    if [ "$NESTED_BUILD_SNAPD_FROM_CURRENT" = "true" ] || [ "$NESTED_CORE_CHANNEL" = "$NESTED_CORE_REFRESH_CHANNEL" ]; then
+        echo "This test need to start from beta/candidate/stable channel"
+        exit 0
+    fi
+
+    echo "Refresh the core snap to $NESTED_CORE_REFRESH_CHANNEL channel"
+    nested_exec "snap info core" | MATCH "tracking: +latest/${NESTED_CORE_CHANNEL}"
+    nested_exec "sudo snap refresh --${NESTED_CORE_REFRESH_CHANNEL} core" || true
+
+    if ! nested_wait_for_ssh; then
+        echo "ssh not stablished, exiting..."
+        exit 1
+    fi
+
+    echo "Wait until the refresh is completed"
+    while ! nested_exec "snap changes" | MATCH "Done.*Refresh \"core\" snap from \"${NESTED_CORE_REFRESH_CHANNEL}\" channel"; do
+        sleep 1
+    done
+    nested_exec "snap info core" | MATCH "tracking: +latest/${NESTED_CORE_REFRESH_CHANNEL}"
+
+    echo "Sanity check, no refresh should be done here but the command shouldn't fail"
+    nested_exec "sudo snap refresh"
+
+    echo "Revert the core snap"
+    nested_exec "sudo snap revert core" || true
+
+    if ! nested_wait_for_ssh; then
+        echo "ssh not stablished, exiting..."
+        exit 1
+    fi
+
+    echo "Wait until the revert is completed"
+    while ! nested_exec "snap changes" | MATCH "Done.*Revert \"core\" snap"; do sleep 1 ; done
+
+    echo "Check the revert was done properly"
+    nested_exec "snap info core" | MATCH "tracking: +latest/${NESTED_CORE_REFRESH_CHANNEL}"
+    nested_exec "ifconfig" | MATCH eth0
+
+
+    nested_exec "sudo snap refresh"
+    nested_exec "sudo cat /var/log/syslog" | not MATCH "hsearch_r failed for.* No such process"

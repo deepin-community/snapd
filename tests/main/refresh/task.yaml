@@ -1,0 +1,170 @@
+summary: Check that the refresh command works.
+
+details: |
+    These tests exercise the refresh command using different store backends.
+    The concrete store to be used is controlled with the STORE_TYPE variant,
+    the defined values are fake, for a local store, or remote, for the currently
+    configured remote store.
+    When executing against the remote stores the tests rely in the existence of
+    a given snap with an updatable version (version string like 2.0+fake1) in the
+    edge channel.
+
+# ubuntu-14.04: systemd-run not supported
+systems: [-ubuntu-core-*, -ubuntu-14.04*]
+
+environment:
+    SNAP_NAME/parallel_strict_fake,parallel_strict_remote: test-snapd-tools_instance
+    SNAP_NAME/strict_fake,strict_remote: test-snapd-tools
+    SNAP_NAME/classic_fake,classic_remote: test-snapd-classic-confinement
+    SNAP_VERSION_PATTERN: \d+\.\d+\+fake1
+    BLOB_DIR: $(pwd)/fake-store-blobdir
+    STORE_TYPE/parallel_strict_fake,strict_fake,classic_fake: fake
+    STORE_TYPE/parallel_strict_remote,strict_remote,classic_remote: ${REMOTE_STORE}
+
+prepare: |
+    if [ "$STORE_TYPE" = "fake" ]; then
+        if os.query is-core; then
+            exit
+        fi
+        if [ "$TRUST_TEST_KEYS" = "false" ]; then
+            echo "This test needs test keys to be trusted"
+            exit
+        fi
+    fi
+
+    flags=
+    if [[ "$SNAP_NAME" =~ classic ]]; then
+        case "$SPREAD_SYSTEM" in
+            ubuntu-core-*|fedora-*|arch-*|centos-*)
+                exit
+                ;;
+        esac
+        flags=--classic
+    fi
+
+    if [[ "$SPREAD_VARIANT" =~ parallel ]]; then
+        snap set system experimental.parallel-instances=true
+    fi
+
+    echo "Given a snap is installed"
+    snap install $flags "$SNAP_NAME"
+
+    if [ "$STORE_TYPE" = "fake" ]; then
+        #shellcheck source=tests/lib/store.sh
+        . "$TESTSLIB"/store.sh
+        setup_fake_store "$BLOB_DIR"
+
+        echo "And a new version of that snap put in the controlled store"
+        #shellcheck source=tests/lib/store.sh
+        . "$TESTSLIB"/store.sh
+        init_fake_refreshes "$BLOB_DIR" "$SNAP_NAME"
+    fi
+
+restore: |
+    if [ "$STORE_TYPE" = "fake" ]; then
+        if os.query is-core; then
+            exit
+        fi
+        if [ "$TRUST_TEST_KEYS" = "false" ]; then
+            echo "This test needs test keys to be trusted"
+            exit
+        fi
+        #shellcheck source=tests/lib/store.sh
+        . "$TESTSLIB"/store.sh
+        teardown_fake_store "$BLOB_DIR"
+    fi
+
+    if [[ "$SPREAD_VARIANT" =~ parallel ]]; then
+        snap set system experimental.parallel-instances=null
+    fi
+
+execute: |
+    if [ "$STORE_TYPE" = "fake" ]; then
+        if os.query is-core; then
+            exit
+        fi
+        if [ "$TRUST_TEST_KEYS" = "false" ]; then
+            echo "This test needs test keys to be trusted"
+            exit
+        fi
+    fi
+
+    if [[ "$SNAP_NAME" =~ classic ]]; then
+        case "$SPREAD_SYSTEM" in
+            ubuntu-core-*|fedora-*|arch-*|centos-*)
+                exit
+                ;;
+        esac
+    fi
+
+    # FIXME: currently the --list from channel doesn't work
+    # echo "Then the new version is available for the snap to be refreshed"
+    # expected="$SNAP_NAME +$SNAP_VERSION_PATTERN"
+    # snap refresh --list | grep -Pzq "$expected"
+    #
+    # echo "================================="
+
+    # Set refresh app awareness even on core systems, where we do not have
+    # inotify tools, so that we exercise that code path, even if it is not
+    # measured in the test.
+    snap set system experimental.refresh-app-awareness=true
+    tests.cleanup defer snap unset system experimental.refresh-app-awareness
+
+    #shellcheck source=tests/lib/pkgdb.sh
+    if os.query is-classic && not os.query is-trusty && not os.query is-amazon-linux; then
+      . "$TESTSLIB/pkgdb.sh"
+      distro_install_package inotify-tools
+      # XXX: probably a bug in defer, this fails without ' ' quotes around the rest.
+      # shellcheck disable=SC2016
+      tests.cleanup defer 'bash -c ". $TESTSLIB/pkgdb.sh; distro_purge_package inotify-tools"'
+      systemd-run \
+        --unit test-snapd-watch-inhibit.service \
+        -- \
+        "$(command -v inotifywait)" \
+        --monitor \
+        --recursive \
+        --outfile /tmp/inhibit.events \
+        /var/lib/snapd/inhibit
+      tests.cleanup defer systemctl stop test-snapd-watch-inhibit.service
+    fi
+
+    echo "When the snap is refreshed"
+    snap refresh --ignore-running --channel=edge "$SNAP_NAME"
+
+    if [ -f /tmp/inhibit.events ]; then
+      echo "During the refresh process, the inhibition lock was established and released"
+      MATCH "/var/lib/snapd/inhibit/ OPEN $SNAP_NAME.lock" /tmp/inhibit.events
+      MATCH "/var/lib/snapd/inhibit/ MODIFY $SNAP_NAME.lock" /tmp/inhibit.events
+      MATCH "/var/lib/snapd/inhibit/ CLOSE_WRITE,CLOSE $SNAP_NAME.lock" /tmp/inhibit.events
+      tests.cleanup pop  # stop the inotifywait unit
+      tests.cleanup pop  # remove inotify-tools
+    fi
+    tests.cleanup pop  # unset refresh-app-awareness
+
+    echo "Then the new version is listed"
+    expected="$SNAP_NAME +$SNAP_VERSION_PATTERN"
+    snap list | grep -Pzq "$expected"
+
+    echo "When a snap is refreshed and has no update it exit 0"
+    snap refresh "$SNAP_NAME" 2>stderr.out
+    MATCH "snap \"$SNAP_NAME\" has no updates available" < stderr.out
+
+    echo "classic snaps "
+
+    echo "When multiple snaps have no update we have a good message"
+    "$TESTSTOOLS"/snaps-state install-local basic
+    snap refresh "$SNAP_NAME" basic 2>&1 | MATCH "All snaps up to date."
+
+    echo "When moving to stable"
+    snap refresh --stable "$SNAP_NAME"
+    snap info "$SNAP_NAME" | MATCH "tracking: +latest/stable"
+
+    snap refresh --candidate "$SNAP_NAME" 2>&1 | MATCH "$SNAP_NAME \\(candidate\\).*"
+    snap info "$SNAP_NAME" | MATCH "tracking: +latest/candidate"
+
+    echo "When multiple snaps are refreshed we error if we have unknown names"
+    if snap refresh core invälid-snap-name 2> out.err; then
+        echo "snap refresh invalid-snap-name should fail but it did not?"
+        exit 1
+    fi
+    tr '\n' ' ' < out.err | tr -s ' ' | MATCH 'cannot refresh .* is not installed'

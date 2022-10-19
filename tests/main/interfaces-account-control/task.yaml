@@ -1,0 +1,32 @@
+summary: Check that is possible to handle user accounts
+
+details: |
+    This test makes sure that a snap using the account-control interface
+    can handle the user accounts properly.
+
+systems: [ubuntu-core-16-64, ubuntu-core-18-64]
+
+environment:
+    TSNAP/ac: account-control-consumer
+    TSNAP/accore18: account-control-consumer-core18
+
+prepare: |
+    echo "Given a snap declaring a plug on account-control is installed"
+    "$TESTSTOOLS"/snaps-state install-local "$TSNAP"
+
+    echo "And the account-control plug is connected"
+    snap connect "$TSNAP":account-control
+
+restore: |
+    echo "Ensure alice is gone from the system"
+    for f in /var/lib/extrausers/*; do
+        sed -i '/^alice:/d' "$f"
+    done
+    snap remove --purge "$TSNAP"
+
+execute: |
+    snap run "$TSNAP".useradd --extrausers alice
+    echo alice:password | snap run "$TSNAP".chpasswd
+
+    # User deletion is unsupported yet on Core: https://bugs.launchpad.net/ubuntu/+source/shadow/+bug/1659534
+    # snap run $TSNAP".userdel --extrausers alice

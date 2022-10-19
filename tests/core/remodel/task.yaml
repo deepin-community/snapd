@@ -1,0 +1,118 @@
+summary: |
+    Test remodel
+
+# TODO:UC20: enable for UC20
+systems: [ubuntu-core-1*-64]
+
+prepare: |
+    if [ "$TRUST_TEST_KEYS" = "false" ]; then
+        echo "This test needs test keys to be trusted"
+        exit
+    fi
+    #shellcheck source=tests/lib/core-config.sh
+    . "$TESTSLIB"/core-config.sh
+    #shellcheck source=tests/lib/systemd.sh
+    . "$TESTSLIB"/systemd.sh
+
+    systemctl stop snapd.service snapd.socket
+    clean_snapd_lib
+
+    # Generic setup for test account
+    prepare_core_model
+    prepare_test_account developer1
+    prepare_test_model developer1-pc
+    prepare_testrootorg_store
+
+    # kick first boot again
+    systemctl start snapd.service snapd.socket
+
+    # wait for first boot to be done
+    wait_for_first_boot_change
+
+restore: |
+    if [ "$TRUST_TEST_KEYS" = "false" ]; then
+        echo "This test needs test keys to be trusted"
+        exit
+    fi
+    #shellcheck source=tests/lib/core-config.sh
+    . "$TESTSLIB"/core-config.sh
+    #shellcheck source=tests/lib/systemd.sh
+    . "$TESTSLIB"/systemd.sh
+
+    systemctl stop snapd.service snapd.socket
+    clean_snapd_lib
+
+    # Generic restore for test account
+    restore_test_account developer1
+    restore_test_model developer1-pc
+    restore_testrootorg_store
+    restore_core_model
+
+    rm -f /var/lib/snapd/seed/assertions/test-snapd-with-configure_*.assert
+
+    # kick first boot again
+    systemctl start snapd.service snapd.socket
+
+    # wait for first boot to be done
+    wait_for_first_boot_change
+
+    # extra paranoia because failure to cleanup earlier took us a long time
+    # to find
+    if [ -e /var/snap/test-snapd-tools/current ]; then
+        echo "Leftover test-snapd-tools data dir found, test does not "
+        echo "properly cleanup"
+        echo "see https://github.com/snapcore/snapd/pull/6620"
+        exit 1
+    fi
+
+execute: |
+    if [ "$TRUST_TEST_KEYS" = "false" ]; then
+        echo "This test needs test keys to be trusted"
+        exit
+    fi
+    #shellcheck source=tests/lib/core-config.sh
+    . "$TESTSLIB"/core-config.sh
+    #shellcheck source=tests/lib/systems.sh
+    . "$TESTSLIB"/systems.sh
+
+    SNAP="$(get_snap_for_system test-snapd-tools)"
+
+    # sanity check
+    not snap list "$SNAP"
+
+    echo "Wait for first boot to be done"
+    wait_for_first_boot_change
+
+    echo "We have the right model assertion"
+    snap debug model|MATCH "model: my-model"
+
+    echo "Now we remodel"
+    MODEL="$(get_test_model developer1-pc-revno2)"
+    snap remodel "${TESTSLIB}/assertions/${MODEL}"
+
+    echo "and we got the new required snap"
+    snap list "$SNAP"
+
+    echo "and we got the new model assertion"
+    snap debug model|MATCH "revision: 2"
+    snap changes | MATCH "Refresh model assertion from revision 0 to 2"
+
+    echo "and we cannot remove the new required snap"
+    not snap remove --purge "$SNAP"
+
+    echo "And we can remodel again this time test-snapd-tools is no longer required"
+    MODEL="$(get_test_model developer1-pc-revno3)"
+    snap remodel "${TESTSLIB}/assertions/${MODEL}"
+    snap debug model|MATCH "revision: 3"
+    snap changes | MATCH "Refresh model assertion from revision 2 to 3"
+    echo "and $SNAP is still available"
+    snap list "$SNAP"
+    echo "and we can clean it up here because it is no longer required"
+    snap remove --purge "$SNAP"
+
+    echo "and test that the remodel shows up in 'snap changes'"
+
+    echo "and check that this remodel has just a single task"
+    snap change --last=remodel > remodel.txt
+    MATCH "Set new model assertion" < remodel.txt
+    [ "$(grep -c today remodel.txt)" -eq 1 ]

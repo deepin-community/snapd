@@ -1,0 +1,349 @@
+#!/bin/sh -eu
+
+export LANG=C.UTF-8
+export LANGUAGE=en
+
+if command -v goctest >/dev/null; then
+    goctest="goctest"
+else
+    goctest="go test"
+fi
+COVERMODE=${COVERMODE:-atomic}
+
+if [ -z "${GITHUB_WORKFLOW:-}" ]; then
+    # when *not* running inside github, ensure we use go-1.10 by default
+    export PATH=/usr/lib/go-1.10/bin:"${PATH}"
+fi
+
+# add workaround for https://github.com/golang/go/issues/24449
+if [ "$(uname -m)" = "s390x" ]; then
+    if go version | grep -q go1.10; then
+        echo "covermode 'atomic' crashes on s390x with go1.10, reseting "
+        echo "to 'set'. see https://github.com/golang/go/issues/24449"
+        COVERMODE="set"
+    fi
+fi
+
+export GOPATH="${GOPATH:-$(realpath "$(dirname "$0")"/../../../../)}"
+export PATH="$PATH:${GOPATH%%:*}/bin"
+
+short=
+
+STATIC=
+UNIT=
+
+case "${1:-all}" in
+    all)
+        STATIC=1
+        UNIT=1
+        ;;
+    --static)
+        STATIC=1
+        ;;
+    --unit)
+        UNIT=1
+        ;;
+    --short-unit)
+        UNIT=1
+        short=1
+        ;;
+    *)
+        echo "Wrong flag ${1}. To run a single suite use --static, --unit, --spread."
+        exit 1
+esac
+
+CURRENTTRAP="true"
+EXIT_CODE=99
+
+store_exit_code() {
+    EXIT_CODE=$?
+}
+
+exit_with_exit_code() {
+    exit $EXIT_CODE
+}
+
+addtrap() {
+    CURRENTTRAP="$CURRENTTRAP ; $1"
+    # shellcheck disable=SC2064
+    trap "store_exit_code; $CURRENTTRAP ; exit_with_exit_code" EXIT
+}
+
+endmsg() {
+    if [ $EXIT_CODE -eq 0 ]; then
+        p="success.txt"
+        m="All good, what could possibly go wrong."
+    else
+        p="failure.txt"
+        m="Crushing failure and despair."
+    fi
+    echo
+    if [ -t 1 ] && [ -z "$STATIC" ]; then
+        cat "data/$p"
+    else
+        echo "$m"
+    fi
+}
+addtrap endmsg
+
+# Append the coverage profile of a package to the project coverage.
+append_coverage() (
+    profile="$1"
+    if [ -f "$profile" ]; then
+        grep -v "^mode:" -- "$profile" >> .coverage/coverage.out || true
+        rm "$profile"
+    fi
+)
+
+missing_interface_spread_test() {
+    snap_yaml="tests/lib/snaps/test-snapd-policy-app-consumer/meta/snap.yaml"
+    core_snap_yaml="tests/lib/snaps/test-snapd-policy-app-provider-core/meta/snap.yaml"
+    classic_snap_yaml="tests/lib/snaps/test-snapd-policy-app-provider-classic/meta/snap.yaml"
+    for iface in $(go run ./tests/lib/list-interfaces.go) ; do
+        search="plugs: \\[ $iface \\]"
+        case "$iface" in
+            bool-file|gpio|pwm|dsp|netlink-driver|hidraw|i2c|iio|serial-port|spi)
+                # skip gadget provided interfaces for now
+                continue
+                ;;
+            dbus|content)
+                search="interface: $iface"
+                ;;
+            autopilot)
+                search='plugs: \[ autopilot-introspection \]'
+                ;;
+        esac
+        if ! grep -q "$search" "$snap_yaml" ; then
+            echo "Missing high-level test for interface '$iface'. Please add to:"
+            echo "* $snap_yaml"
+            echo "* $core_snap_yaml (if needed)"
+            echo "* $classic_snap_yaml (if needed)"
+            exit 1
+        fi
+    done
+}
+
+
+if [ "$STATIC" = 1 ]; then
+    ./get-deps.sh
+
+    # Run static tests.
+    echo Checking docs
+    ./mdlint.py ./*.md docs/*.md
+
+    # XXX: remove once we can use an action, see workflows/test.yaml for
+    #      details why we still use this script
+    if [ -n "${TRAVIS_PULL_REQUEST:-}" ] && [ "${TRAVIS_PULL_REQUEST:-}" != "false" ]; then
+        echo Checking pull request summary
+        ./check-pr-title.py "$TRAVIS_PULL_REQUEST"
+    fi
+
+    if [ -z "${SKIP_GOFMT:-}" ]; then
+        echo Checking formatting
+        fmt=""
+        for dir in $(go list -f '{{.Dir}}' ./... | grep -v '/vendor/' | grep -E 'snapd/[A-Za-z0-9_]+$' ); do
+            # skip vendor packages
+            # skip subpackages of packages under snapd, gofmt already inspects them
+            s="$(${GOFMT:-gofmt} -s -l -d "$dir" || true)"
+            if [ -n "$s" ]; then
+                fmt="$s\\n$fmt"
+            fi
+        done
+        if [ -n "$fmt" ]; then
+            echo "Formatting wrong in following files:"
+            # shellcheck disable=SC2001
+            echo "$fmt" | sed -e 's/\\n/\n/g'
+            exit 1
+        fi
+    fi
+
+    # go vet
+    echo Running vet
+    go list ./... | grep -v '/vendor/' | xargs go vet
+
+    echo 'Checking for usages of http.Status*'
+    got=""
+    for dir in $(go list -f '{{.Dir}}' ./... | grep -v '/vendor/' ); do
+        s="$(grep -nP 'http\.Status(?!Text)' "$dir"/*.go || true)"
+        if [ -n "$s" ]; then
+            got="$s\\n$got"
+        fi
+    done
+
+    if [ -n "$got" ]; then
+        echo 'Usages of http.Status*, we prefer the numeric values directly:'
+        echo "$got"
+        exit 1
+    fi
+
+    echo "Checking for direct usages of math/rand"
+    got=""
+    for dir in $(go list -f '{{.Dir}}' ./... | grep -v '/vendor/' ); do
+        # shellcheck disable=SC2063
+        s="$(grep -nP --exclude '*_test.go' --exclude 'randutil/*.go' math/rand "$dir"/*.go || true)"
+        if [ -n "$s" ]; then
+            got="$s\\n$got"
+        fi
+    done
+
+    if [ -n "$got" ]; then
+        echo 'Direct usages of math/rand, we prefer randutil:'
+        echo "$got"
+        exit 1
+    fi
+
+    if command -v shellcheck >/dev/null; then
+        echo Checking shell scripts...
+        ( git ls-files -z 2>/dev/null ||
+                find . \( -name .git -o -name vendor \) -prune -o -print0 ) |
+            xargs -0 file -N |
+            awk -F": " '$2~/shell.script/{print $1}' |
+            xargs shellcheck -x
+        regexp='GOPATH(?!%%:\*)(?!:)[^= ]*/'
+        if  grep -qPr                   --exclude HACKING.md --exclude 'Makefile.*' --exclude-dir .git --exclude-dir vendor "$regexp"; then
+            echo "Using GOPATH as if it were a single entry and not a list:"
+            grep -PHrn -C1 --color=auto --exclude HACKING.md --exclude 'Makefile.*' --exclude-dir .git --exclude-dir vendor "$regexp"
+            echo "Use GOHOME, or {GOPATH%%:*}, instead."
+            exit 1
+        fi
+        unset regexp
+        # also run spread-shellcheck
+        ./spread-shellcheck spread.yaml tests
+    fi
+
+    echo "Checking spelling errors"
+    if ! command -v misspell >/dev/null; then
+        go get -u github.com/client9/misspell/cmd/misspell
+    fi
+    # FIXME: auter is only misspelled in the changelog so we should fix there
+    # PROCES is used in the seccomp tests (PRIO_PROCES{,S,SS})
+    # exportfs is used in the nfs-support test
+    MISSPELL_IGNORE="auther,PROCES,PROCESSS,proces,processs,exportfs"
+    git ls-files -z -- . ':!:./po' ':!:./vendor' |
+        xargs -0 misspell -error -i "$MISSPELL_IGNORE"
+
+    if dpkg --compare-versions "$(go version | awk '$3 ~ /^go[0-9]/ {print substr($3, 3)}')" ge 1.12; then
+        echo "Checking for ineffective assignments"
+        if ! command -v ineffassign >/dev/null; then
+            go get -u github.com/gordonklaus/ineffassign
+        fi
+        # ineffassign knows about ignoring vendor/ \o/
+        ineffassign ./...
+    fi
+
+    echo "Checking for naked returns"
+    if ! command -v nakedret >/dev/null; then
+        go get -u github.com/alexkohler/nakedret
+    fi
+    got=$(go list ./... | grep -v '/osutil/udev/' | grep -v '/vendor/' | xargs nakedret 2>&1)
+    if [ -n "$got" ]; then
+        echo "$got"
+        if [ -z "${SKIP_NAKEDRET:-}" ]; then
+            exit 1
+        else
+            echo "Ignoring nakedret errors as requested"
+        fi
+    fi
+
+    echo "Checking all interfaces have minimal spread test"
+    missing_interface_spread_test
+
+    echo "Checking for incorrect multiline strings in spread tests"
+    badmultiline=$(find tests -name 'task.yaml' -print0 -o -name 'spread.yaml' -print0 | \
+                       xargs -0 grep -R -n -E '(restore*|prepare*|execute|debug):\s*$' || true)
+    if [ -n "$badmultiline" ]; then
+        echo "Incorrect multiline strings at the following locations:"
+        echo "$badmultiline"
+        exit 1
+    fi
+
+    echo "Checking for potentially incorrect use of MATCH -v"
+    badMATCH=$(find tests -name 'task.yaml' -print0 -o -name 'spread.yaml' -print0 | \
+                       xargs -0 grep -R -n -E 'MATCH +-v' || true)
+    if [ -n "$badMATCH" ]; then
+        echo "Potentially incorrect use of MATCH -v at the following locations:"
+        echo "$badMATCH"
+        exit 1
+    fi
+
+    # FIXME: re-add staticcheck with a matching version for the used go-version
+fi
+
+if [ "$UNIT" = 1 ]; then
+    ./get-deps.sh
+
+    echo "Show go version"
+    command -v go
+    go version
+
+    tags=
+    if [ -n "${GO_BUILD_TAGS-}" ]; then
+        echo "Using build tags: $GO_BUILD_TAGS"
+        tags="-tags $GO_BUILD_TAGS"
+    fi
+
+    echo Building
+    # shellcheck disable=SC2086
+    go build -v $tags github.com/snapcore/snapd/...
+
+    # tests
+    echo Running tests from "$PWD"
+    if [ "$short" = 1 ]; then
+            # shellcheck disable=SC2046,SC2086
+            GOTRACEBACK=1 $goctest $tags -short -timeout 5m $(go list ./... | grep -v '/vendor/' )
+    else
+        coverage=""
+        if [ -z "${SKIP_COVERAGE-}" ]; then
+            coverage="-coverprofile=.coverage/coverage.out -covermode=$COVERMODE"
+            # Prepare the coverage output profile.
+            rm -rf .coverage
+            mkdir .coverage
+            echo "mode: $COVERMODE" > .coverage/coverage.out
+        else
+            echo "Skipping test coverage"
+        fi
+
+        if command -v dpkg >/dev/null && dpkg --compare-versions "$(go version | awk '$3 ~ /^go[0-9]/ {print substr($3, 3)}')" ge 1.10; then
+            # shellcheck disable=SC2046,SC2086
+            GOTRACEBACK=1 $goctest $tags -timeout 5m $coverage $(go list ./... | grep -v '/vendor/' )
+        else
+            for pkg in $(go list ./... | grep -v '/vendor/' ); do
+                # shellcheck disable=SC2086
+                GOTRACEBACK=1 go test $tags -timeout 5m -i "$pkg"
+                if [ -z "${SKIP_COVERAGE-}" ]; then
+                    # shellcheck disable=SC2086
+                    GOTRACEBACK=1 $goctest $tags -timeout 5m $coverage "$pkg"
+                    append_coverage .coverage/profile.out
+                fi
+            done
+        fi
+    fi
+
+    # python unit test for mountinfo.query and version-compare
+    command -v python2 && python2 ./tests/lib/tools/mountinfo.query --run-unit-tests
+    command -v python3 && python3 ./tests/lib/tools/mountinfo.query --run-unit-tests
+    command -v python2 && python2 ./tests/lib/tools/version-compare --run-unit-tests
+    command -v python3 && python3 ./tests/lib/tools/version-compare --run-unit-tests
+fi
+
+UNCLEAN="$(git status -s|grep '^??')" || true
+SKIP_UNCLEAN=${SKIP_UNCLEAN=}
+if [ -n "$UNCLEAN" ] && [ -z "$SKIP_UNCLEAN" ]; then
+    cat <<EOF
+
+There are files left in the git tree after the tests:
+
+$UNCLEAN
+EOF
+    exit 1
+fi
+
+if [ -n "${SKIP_DIRTY_CHECK-}" ]; then
+    exit 0
+fi
+
+if git describe --always --dirty | grep -q dirty; then
+    echo "Build tree is dirty"
+    git diff
+    exit 1
+fi

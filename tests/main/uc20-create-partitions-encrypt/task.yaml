@@ -1,0 +1,168 @@
+summary: Integration tests for the snap-bootstrap binary
+
+# use the same system and tooling as uc20
+systems: [ubuntu-20.04-64]
+
+environment:
+    # an empty $topsrcdir/tests/go.mod seems to break importing or building go
+    # packages referenced by their import paths while under the tests directory,
+    # need to disable go modules support for this test
+    GO111MODULE: off
+
+prepare: |
+    echo "Create a fake block device image that looks like an image from u-i"
+    truncate --size=10GB fake.img
+
+    apt install -y cryptsetup
+
+    echo "Setup the image as a block device"
+    # use a script here as this code needs to be run on the next boot
+    cat > losetup.sh <<'EOF'
+    #!/bin/sh -e
+    echo "Setting up loop"
+    losetup -fP fake.img
+    losetup -a |grep fake.img|cut -f1 -d: > loop.txt
+    EOF
+    chmod +x ./losetup.sh
+    ./losetup.sh
+    LOOP="$(cat loop.txt)"
+
+    echo "Create a partition that looks like a uc20 image"
+    cat <<EOF | sfdisk "$LOOP"
+    label: gpt
+
+    start=2048, size=2048, type=21686148-6449-6E6F-744E-656564454649, name="BIOS Boot"
+    start=4096, size=2457600, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="ubuntu-seed"
+    EOF
+    retry -n 3 --wait 1 test -e "${LOOP}p2"
+    udevadm trigger --settle "${LOOP}p2"
+    mkfs.vfat "${LOOP}p2"
+    udevadm trigger --settle "${LOOP}p2"
+    echo "Double check that we got the expected partitions"
+    sfdisk -l "$LOOP" | MATCH 'BIOS boot'
+    sfdisk -l "$LOOP" | MATCH 'EFI System'
+
+    echo "Get the UC20 gadget"
+    snap download --channel=20/edge pc
+    unsquashfs -d gadget-dir pc_*.snap
+
+restore: |
+    for m in ubuntu-seed ubuntu-save ubuntu-data ubuntu-boot; do
+        if mountpoint "/run/mnt/$m"; then
+            umount "/run/mnt/$m"
+        fi
+    done
+    if mountpoint ./mnt; then
+        umount ./mnt
+    fi
+
+    cryptsetup close /dev/mapper/ubuntu-save || true
+    cryptsetup close /dev/mapper/ubuntu-data || true
+    cryptsetup close /dev/mapper/test-udata || true
+
+    if [ -f loop.txt ]; then
+        LOOP="$(cat loop.txt)"
+        losetup -d "$LOOP"
+        losetup -l | NOMATCH "$LOOP"
+    fi
+    apt autoremove -y cryptsetup
+
+    rm -Rf /run/mnt
+
+debug: |
+    cat /proc/partitions
+
+execute: |
+    # this test simulates a reinstall, to clear the TPM this requires
+    # a reboot so the losetup has to be redone
+    if [ "$SPREAD_REBOOT" = 1 ]; then
+        ./losetup.sh
+    fi
+    LOOP="$(cat loop.txt)"
+
+    echo "Setup simulated ubuntu-seed mount"
+    mkdir -p /run/mnt/ubuntu-seed
+    mount "${LOOP}"p2 /run/mnt/ubuntu-seed
+
+    echo "Install EFI binaries"
+    bootdir=/run/mnt/ubuntu-boot/EFI/boot
+    seedbootdir=/run/mnt/ubuntu-seed/EFI/boot
+    mkdir -p "$bootdir" "$seedbootdir"
+    cp /usr/lib/shim/shimx64.efi.signed "$seedbootdir"/bootx64.efi
+    cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed "$seedbootdir"/grubx64.efi
+    cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed "$bootdir"/grubx64.efi
+
+    sbverify --list "$seedbootdir"/bootx64.efi
+    sbverify --list "$seedbootdir"/grubx64.efi
+    sbverify --list "$bootdir"/grubx64.efi
+    # TODO:UC20: make kernel-dir non-empty once we have a gadget that has a
+    #            "$kernel:" style ref in the meta/gadget.yaml
+    kerneldir=""
+
+    echo "Run the snap-bootstrap tool"
+    go get ../../lib/uc20-create-partitions
+    uc20-create-partitions \
+        --encrypt \
+        ./gadget-dir "$kerneldir" "$LOOP"
+    # keep for later
+
+    echo "Check that the ubuntu-data key files were created"
+    test "$(stat --printf=%s unsealed-key)" -eq 32
+    # recovery key is 16 bytes long
+    test "$(stat --printf=%s recovery-key)" -eq 16
+    echo "Check that the ubuntu-save key files were created"
+    test "$(stat --printf=%s save-key)" -eq 32
+    # recovery key is 16 bytes long
+    test "$(stat --printf=%s reinstall-key)" -eq 16
+
+    echo "Check that the partitions are created"
+    sfdisk -d "$LOOP" | MATCH "^${LOOP}p1 .*size=\s*2048, type=21686148-6449-6E6F-744E-656564454649,.*BIOS Boot"
+    sfdisk -d "$LOOP" | MATCH "^${LOOP}p2 .*size=\s*2457600, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B,.*ubuntu-seed"
+    sfdisk -d "$LOOP" | MATCH "^${LOOP}p3 .*size=\s*1536000, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4,.*ubuntu-boot"
+    sfdisk -d "$LOOP" | MATCH "^${LOOP}p4 .*size=\s*32768, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4,.*ubuntu-save"
+    sfdisk -d "$LOOP" | MATCH "^${LOOP}p5 .*size=\s*15500753, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4,.*ubuntu-data"
+
+    not cryptsetup isLuks "${LOOP}p1"
+    not cryptsetup isLuks "${LOOP}p2"
+    not cryptsetup isLuks "${LOOP}p3"
+    cryptsetup isLuks "${LOOP}p4"
+    cryptsetup isLuks "${LOOP}p5"
+
+    cryptsetup luksDump "${LOOP}p4" | MATCH 'Label:\s*ubuntu-save-enc'
+    POSIXLY_CORRECT=1 file -s /dev/mapper/ubuntu-save | MATCH 'volume name "ubuntu-save"'
+
+    cryptsetup luksDump "${LOOP}p5" | MATCH 'Label:\s*ubuntu-data-enc'
+    POSIXLY_CORRECT=1 file -s /dev/mapper/ubuntu-data | MATCH 'volume name "ubuntu-data"'
+
+    cryptsetup close /dev/mapper/ubuntu-data
+    cryptsetup close /dev/mapper/ubuntu-save
+
+    mkdir -p ./mnt
+
+    # Test the unsealed key
+    echo "Ensure that we can open the encrypted ubuntu-data device using the unsealed key"
+    cryptsetup open --key-file unsealed-key "${LOOP}p5" test
+    mount /dev/mapper/test ./mnt
+    umount ./mnt
+    cryptsetup close /dev/mapper/test
+
+    # Test the recovery key
+    echo "Ensure that we can open the encrypted ubuntu-data device using the recovery key"
+    cryptsetup open --key-file recovery-key "${LOOP}p5" test-recovery
+    mount /dev/mapper/test-recovery ./mnt
+    umount ./mnt
+    cryptsetup close /dev/mapper/test-recovery
+
+    # Test the save key
+    echo "Ensure that we can open the encrypted ubuntu-save device using the run mode key"
+    cryptsetup open --key-file save-key "${LOOP}p4" test-save
+    mount /dev/mapper/test-save ./mnt
+    umount ./mnt
+    cryptsetup close /dev/mapper/test-save
+
+    # Test the reinstall key
+    echo "Ensure that we can open the encrypted ubuntu-save device using the reinstall key"
+    cryptsetup open --key-file reinstall-key "${LOOP}p4" test-reinstall
+    mount /dev/mapper/test-reinstall ./mnt
+    umount ./mnt
+    cryptsetup close /dev/mapper/test-reinstall
