@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2020 Canonical Ltd
+ * Copyright (C) 2020-2022 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -51,16 +51,15 @@ type Grouping string
 // any Add or AddBatch AddUnresolved/AddToUpdate can also be used
 // again.
 //
-//                      V
-//                      |
-//        /-> AddUnresolved, AddToUpdate
-//        |             |
-//        |             V
-//        |------> ToResolve -> empty? done
-//        |             |
-//        |             V
-//        \ __________ Add
-//
+//	              V
+//	              |
+//	/-> AddUnresolved, AddToUpdate
+//	|             |
+//	|             V
+//	|------> ToResolve -> empty? done
+//	|             |
+//	|             V
+//	\ __________ Add
 //
 // If errors prevent from fulfilling assertions from a ToResolve,
 // AddError and AddGroupingError can be used to report the errors so
@@ -303,7 +302,7 @@ func (p *Pool) isPredefined(ref *Ref) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if !IsNotFound(err) {
+	if !errors.Is(err, &NotFoundError{}) {
 		return false, err
 	}
 	return false, nil
@@ -317,7 +316,7 @@ func (p *Pool) isResolved(ref *Ref) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if !IsNotFound(err) {
+	if !errors.Is(err, &NotFoundError{}) {
 		return false, err
 	}
 	return false, nil
@@ -325,7 +324,7 @@ func (p *Pool) isResolved(ref *Ref) (bool, error) {
 
 func (p *Pool) curRevision(ref *Ref) (int, error) {
 	a, err := ref.Resolve(p.groundDB.Find)
-	if err != nil && !IsNotFound(err) {
+	if err != nil && !errors.Is(err, &NotFoundError{}) {
 		return 0, err
 	}
 	if err == nil {
@@ -336,7 +335,7 @@ func (p *Pool) curRevision(ref *Ref) (int, error) {
 
 func (p *Pool) curSeqRevision(seq *AtSequence) (int, error) {
 	a, err := seq.Resolve(p.groundDB.Find)
-	if err != nil && !IsNotFound(err) {
+	if err != nil && !errors.Is(err, &NotFoundError{}) {
 		return 0, err
 	}
 	if err == nil {
@@ -561,10 +560,7 @@ func (p *Pool) add(a Assertion, g *internal.Grouping) error {
 		Type:       AccountKeyType,
 		PrimaryKey: []string{a.SignKeyID()},
 	}
-	if err := p.addPrerequisite(keyRef, g); err != nil {
-		return err
-	}
-	return nil
+	return p.addPrerequisite(keyRef, g)
 }
 
 func (p *Pool) resolveWith(unresolved map[string]unresolvedAssertRecord, uniq string, u unresolvedAssertRecord, a Assertion, extrag *internal.Grouping) (ok bool, err error) {
@@ -742,11 +738,12 @@ var (
 
 // unresolvedBookkeeping processes any left over unresolved assertions
 // since the last ToResolve invocation and intervening calls to Add/AddBatch,
-//  * they were either marked as in error which will be propagated
-//    to all groups requiring them
-//  * simply unresolved, which will be propagated to groups requiring them
-//    as ErrUnresolved
-//  * unchanged (update case)
+//   - they were either marked as in error which will be propagated
+//     to all groups requiring them
+//   - simply unresolved, which will be propagated to groups requiring them
+//     as ErrUnresolved
+//   - unchanged (update case)
+//
 // unresolvedBookkeeping will also promote any recorded prerequisites
 // into actively unresolved, as long as not all the groups requiring them
 // are in error.
@@ -923,10 +920,11 @@ func (p *Pool) AddSequenceToUpdate(toUpdate *AtSequence, group string) error {
 	if err != nil {
 		return err
 	}
-
-	u := *toUpdate
 	retrieve := func(ref *Ref) (Assertion, error) {
 		return ref.Resolve(p.groundDB.Find)
+	}
+	retrieveSeq := func(seq *AtSequence) (Assertion, error) {
+		return seq.Resolve(p.groundDB.Find)
 	}
 	add := func(a Assertion) error {
 		if !a.Type().SequenceForming() {
@@ -934,15 +932,12 @@ func (p *Pool) AddSequenceToUpdate(toUpdate *AtSequence, group string) error {
 		}
 		// sequence forming assertions are never predefined, so no check for it.
 		// final add corresponding to toUpdate itself.
+		u := *toUpdate
 		u.Revision = a.Revision()
 		return p.addUnresolvedSeq(&u, gnum)
 	}
-	f := NewFetcher(p.groundDB, retrieve, add)
-	ref := &Ref{
-		Type:       toUpdate.Type,
-		PrimaryKey: append(u.SequenceKey, fmt.Sprintf("%d", u.Sequence)),
-	}
-	if err := f.Fetch(ref); err != nil {
+	f := NewSequenceFormingFetcher(p.groundDB, retrieve, retrieveSeq, add)
+	if err := f.FetchSequence(toUpdate); err != nil {
 		return err
 	}
 	return nil
@@ -960,7 +955,7 @@ func (p *Pool) CommitTo(db *Database) error {
 
 	retrieve := func(ref *Ref) (Assertion, error) {
 		a, err := p.bs.Get(ref.Type, ref.PrimaryKey, ref.Type.MaxSupportedFormat())
-		if IsNotFound(err) {
+		if errors.Is(err, &NotFoundError{}) {
 			// fallback to pre-existing assertions
 			a, err = ref.Resolve(db.Find)
 		}
@@ -1019,4 +1014,9 @@ func (p *Pool) ClearGroups() error {
 	p.groups = make(map[uint16]*groupRec)
 	p.curPhase = poolPhaseAdd
 	return nil
+}
+
+// Backstore returns the memory backstore of this pool.
+func (p *Pool) Backstore() Backstore {
+	return p.bs
 }

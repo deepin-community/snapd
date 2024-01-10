@@ -44,6 +44,8 @@ import (
 func Test(t *testing.T) { TestingT(t) }
 
 type lkenvTestSuite struct {
+	testutil.BaseTest
+
 	envPath    string
 	envPathbak string
 }
@@ -59,22 +61,23 @@ var (
 )
 
 func (l *lkenvTestSuite) SetUpTest(c *C) {
+	l.BaseTest.SetUpTest(c)
 	l.envPath = filepath.Join(c.MkDir(), "snapbootsel.bin")
 	l.envPathbak = l.envPath + "bak"
 }
 
 // unpack test data packed with gzip
-func unpackTestData(data []byte) (resData []byte, err error) {
+func unpackTestData(data []byte) ([]byte, error) {
 	b := bytes.NewBuffer(data)
-	var r io.Reader
-	r, err = gzip.NewReader(b)
+	r, err := gzip.NewReader(b)
 	if err != nil {
-		return
+		return nil, err
 	}
+
 	var env bytes.Buffer
 	_, err = env.ReadFrom(r)
 	if err != nil {
-		return
+		return nil, err
 	}
 	return env.Bytes(), nil
 }
@@ -91,7 +94,7 @@ func (l *lkenvTestSuite) TestCtoGoString(c *C) {
 		{[]byte{'a', 'b', 'c', 'd', 0}, "abcd"},
 		// no trailing \0 - assume corrupted "" ?
 		{[]byte{'a', 'b', 'c', 'd', 'e'}, ""},
-		// first \0 is the cutof
+		// first \0 is the cutoff
 		{[]byte{'a', 'b', 0, 'z', 0}, "ab"},
 	} {
 		c.Check(lkenv.CToGoString(t.input), Equals, t.expected)

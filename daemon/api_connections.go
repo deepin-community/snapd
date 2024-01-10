@@ -20,6 +20,7 @@
 package daemon
 
 import (
+	"errors"
 	"net/http"
 	"sort"
 
@@ -265,7 +266,7 @@ func getConnections(c *Command, r *http.Request, user *auth.UserState) Response 
 	snapName = ifacestate.RemapSnapFromRequest(snapName)
 	if snapName != "" {
 		if err := checkSnapInstalled(c.d.overlord.State(), snapName); err != nil {
-			if err == state.ErrNoState {
+			if errors.Is(err, state.ErrNoState) {
 				return SnapNotFound(snapName, err)
 			}
 			return InternalError("cannot access snap state: %v", err)
@@ -283,5 +284,5 @@ func getConnections(c *Command, r *http.Request, user *auth.UserState) Response 
 	sort.Sort(byCrefConnJSON(connsjson.Established))
 	sort.Sort(byCrefConnJSON(connsjson.Undesired))
 
-	return SyncResponse(connsjson, nil)
+	return SyncResponse(connsjson)
 }

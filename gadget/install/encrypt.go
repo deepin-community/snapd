@@ -1,4 +1,5 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
+//go:build !nosecboot
 // +build !nosecboot
 
 /*
@@ -23,43 +24,47 @@ package install
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os/exec"
 
 	"github.com/snapcore/snapd/gadget"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/secboot"
-)
-
-var (
-	tempFile = ioutil.TempFile
+	"github.com/snapcore/snapd/secboot/keys"
 )
 
 var (
 	secbootFormatEncryptedDevice = secboot.FormatEncryptedDevice
-	secbootAddRecoveryKey        = secboot.AddRecoveryKey
 )
 
-// encryptedDevice represents a LUKS-backed encrypted block device.
-type encryptedDevice struct {
-	parent *gadget.OnDiskStructure
-	name   string
-	Node   string
+// encryptedDeviceCryptsetup represents a encrypted block device.
+type encryptedDevice interface {
+	Node() string
+	Close() error
 }
 
-// newEncryptedDevice creates an encrypted device in the existing partition using the
-// specified key.
-func newEncryptedDevice(part *gadget.OnDiskStructure, key secboot.EncryptionKey, name string) (*encryptedDevice, error) {
-	dev := &encryptedDevice{
+// encryptedDeviceLUKS represents a LUKS-backed encrypted block device.
+type encryptedDeviceLUKS struct {
+	parent *gadget.OnDiskStructure
+	name   string
+	node   string
+}
+
+// expected interface is implemented
+var _ = encryptedDevice(&encryptedDeviceLUKS{})
+
+// newEncryptedDeviceLUKS creates an encrypted device in the existing
+// partition using the specified key with the LUKS backend.
+func newEncryptedDeviceLUKS(part *gadget.OnDiskStructure, encType secboot.EncryptionType, key keys.EncryptionKey, label, name string) (encryptedDevice, error) {
+	dev := &encryptedDeviceLUKS{
 		parent: part,
 		name:   name,
 		// A new block device is used to access the encrypted data. Note that
 		// you can't open an encrypted device under different names and a name
 		// can't be used in more than one device at the same time.
-		Node: fmt.Sprintf("/dev/mapper/%s", name),
+		node: fmt.Sprintf("/dev/mapper/%s", name),
 	}
 
-	if err := secbootFormatEncryptedDevice(key, name+"-enc", part.Node); err != nil {
+	if err := secbootFormatEncryptedDevice(key, encType, label, part.Node); err != nil {
 		return nil, fmt.Errorf("cannot format encrypted device: %v", err)
 	}
 
@@ -70,15 +75,15 @@ func newEncryptedDevice(part *gadget.OnDiskStructure, key secboot.EncryptionKey,
 	return dev, nil
 }
 
-func (dev *encryptedDevice) AddRecoveryKey(key secboot.EncryptionKey, rkey secboot.RecoveryKey) error {
-	return secbootAddRecoveryKey(key, rkey, dev.parent.Node)
+func (dev *encryptedDeviceLUKS) Node() string {
+	return dev.node
 }
 
-func (dev *encryptedDevice) Close() error {
+func (dev *encryptedDeviceLUKS) Close() error {
 	return cryptsetupClose(dev.name)
 }
 
-func cryptsetupOpen(key secboot.EncryptionKey, node, name string) error {
+func cryptsetupOpen(key keys.EncryptionKey, node, name string) error {
 	cmd := exec.Command("cryptsetup", "open", "--key-file", "-", node, name)
 	cmd.Stdin = bytes.NewReader(key[:])
 	if output, err := cmd.CombinedOutput(); err != nil {

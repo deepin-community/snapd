@@ -37,13 +37,6 @@ import (
 	"github.com/snapcore/snapd/testutil"
 )
 
-func makeMockMountInfo(c *C, content string) string {
-	fn := filepath.Join(c.MkDir(), "mountinfo")
-	err := ioutil.WriteFile(fn, []byte(content), 0644)
-	c.Assert(err, IsNil)
-	return fn
-}
-
 func (s *SnapSuite) TestAutoImportAssertsHappy(c *C) {
 	restore := release.MockOnClassic(false)
 	defer restore()
@@ -77,14 +70,14 @@ func (s *SnapSuite) TestAutoImportAssertsHappy(c *C) {
 
 	})
 
-	fakeAssertsFn := filepath.Join(c.MkDir(), "auto-import.assert")
+	testDir := c.MkDir()
+	fakeAssertsFn := filepath.Join(testDir, "auto-import.assert")
 	err := ioutil.WriteFile(fakeAssertsFn, fakeAssertData, 0644)
 	c.Assert(err, IsNil)
 
-	mockMountInfoFmt := `
-24 0 8:18 / %s rw,relatime shared:1 - ext4 /dev/sdb2 rw,errors=remount-ro,data=ordered`
-	content := fmt.Sprintf(mockMountInfoFmt, filepath.Dir(fakeAssertsFn))
-	restore = snap.MockMountInfoPath(makeMockMountInfo(c, content))
+	mockMountInfoFmt := fmt.Sprintf(`24 0 8:18 / %s rw,relatime shared:1 - ext4 /dev/sdb2 rw,errors=remount-ro,data=ordered
+`, testDir)
+	restore = osutil.MockMountInfo(mockMountInfoFmt)
 	defer restore()
 
 	logbuf, restore := logger.MockLogger()
@@ -112,14 +105,14 @@ func (s *SnapSuite) TestAutoImportAssertsNotImportedFromLoop(c *C) {
 		panic("not reached")
 	})
 
-	fakeAssertsFn := filepath.Join(c.MkDir(), "auto-import.assert")
+	testDir := c.MkDir()
+	fakeAssertsFn := filepath.Join(testDir, "auto-import.assert")
 	err := ioutil.WriteFile(fakeAssertsFn, fakeAssertData, 0644)
 	c.Assert(err, IsNil)
 
-	mockMountInfoFmtWithLoop := `
-24 0 8:18 / %s rw,relatime shared:1 - squashfs /dev/loop1 rw,errors=remount-ro,data=ordered`
+	mockMountInfoFmtWithLoop := `24 0 8:18 / %s rw,relatime shared:1 - squashfs /dev/loop1 rw,errors=remount-ro,data=ordered`
 	content := fmt.Sprintf(mockMountInfoFmtWithLoop, filepath.Dir(fakeAssertsFn))
-	restore = snap.MockMountInfoPath(makeMockMountInfo(c, content))
+	restore = osutil.MockMountInfo(content)
 	defer restore()
 
 	rest, err := snap.Parser(snap.Client()).ParseArgs([]string{"auto-import"})
@@ -127,35 +120,6 @@ func (s *SnapSuite) TestAutoImportAssertsNotImportedFromLoop(c *C) {
 	c.Assert(rest, DeepEquals, []string{})
 	c.Check(s.Stdout(), Equals, "")
 	c.Check(s.Stderr(), Equals, "")
-}
-
-func (s *SnapSuite) TestAutoImportCandidatesHappy(c *C) {
-	dirs := make([]string, 4)
-	args := make([]interface{}, len(dirs))
-	files := make([]string, len(dirs))
-	for i := range dirs {
-		dirs[i] = c.MkDir()
-		args[i] = dirs[i]
-		files[i] = filepath.Join(dirs[i], "auto-import.assert")
-		err := ioutil.WriteFile(files[i], nil, 0644)
-		c.Assert(err, IsNil)
-	}
-
-	mockMountInfoFmtWithLoop := `
-too short
-24 0 8:18 / %[1]s rw,relatime foo ext3 /dev/meep2 no,separator
-24 0 8:18 / %[2]s rw,relatime - ext3 /dev/meep2 rw,errors=remount-ro,data=ordered
-24 0 8:18 / %[3]s rw,relatime opt:1 - ext4 /dev/meep3 rw,errors=remount-ro,data=ordered
-24 0 8:18 / %[4]s rw,relatime opt:1 opt:2 - ext2 /dev/meep1 rw,errors=remount-ro,data=ordered
-`
-
-	content := fmt.Sprintf(mockMountInfoFmtWithLoop, args...)
-	restore := snap.MockMountInfoPath(makeMockMountInfo(c, content))
-	defer restore()
-
-	l, err := snap.AutoImportCandidates()
-	c.Check(err, IsNil)
-	c.Check(l, DeepEquals, files[1:])
 }
 
 func (s *SnapSuite) TestAutoImportAssertsHappyNotOnClassic(c *C) {
@@ -173,8 +137,7 @@ func (s *SnapSuite) TestAutoImportAssertsHappyNotOnClassic(c *C) {
 
 	mockMountInfoFmt := `
 24 0 8:18 / %s rw,relatime shared:1 - ext4 /dev/sdb2 rw,errors=remount-ro,data=ordered`
-	content := fmt.Sprintf(mockMountInfoFmt, filepath.Dir(fakeAssertsFn))
-	restore = snap.MockMountInfoPath(makeMockMountInfo(c, content))
+	restore = osutil.MockMountInfo(mockMountInfoFmt)
 	defer restore()
 
 	rest, err := snap.Parser(snap.Client()).ParseArgs([]string{"auto-import"})
@@ -200,10 +163,8 @@ func (s *SnapSuite) TestAutoImportIntoSpool(c *C) {
 	err := ioutil.WriteFile(fakeAssertsFn, fakeAssertData, 0644)
 	c.Assert(err, IsNil)
 
-	mockMountInfoFmt := `
-24 0 8:18 / %s rw,relatime shared:1 - squashfs /dev/sc1 rw,errors=remount-ro,data=ordered`
-	content := fmt.Sprintf(mockMountInfoFmt, filepath.Dir(fakeAssertsFn))
-	restore = snap.MockMountInfoPath(makeMockMountInfo(c, content))
+	mockMountInfoFmt := fmt.Sprintf(`24 0 8:18 / %s rw,relatime shared:1 - squashfs /dev/sc1 rw,errors=remount-ro,data=ordered`, filepath.Dir(fakeAssertsFn))
+	restore = osutil.MockMountInfo(mockMountInfoFmt)
 	defer restore()
 
 	rest, err := snap.Parser(snap.Client()).ParseArgs([]string{"auto-import"})
@@ -223,6 +184,9 @@ func (s *SnapSuite) TestAutoImportIntoSpool(c *C) {
 
 func (s *SnapSuite) TestAutoImportFromSpoolHappy(c *C) {
 	restore := release.MockOnClassic(false)
+	defer restore()
+
+	restore = osutil.MockMountInfo(``)
 	defer restore()
 
 	fakeAssertData := []byte("my-assertion")
@@ -293,10 +257,8 @@ func (s *SnapSuite) TestAutoImportIntoSpoolUnhappyTooBig(c *C) {
 	err := ioutil.WriteFile(fakeAssertsFn, fakeAssertData, 0644)
 	c.Assert(err, IsNil)
 
-	mockMountInfoFmt := `
-24 0 8:18 / %s rw,relatime shared:1 - squashfs /dev/sc1 rw,errors=remount-ro,data=ordered`
-	content := fmt.Sprintf(mockMountInfoFmt, filepath.Dir(fakeAssertsFn))
-	restore = snap.MockMountInfoPath(makeMockMountInfo(c, content))
+	mockMountInfoFmt := fmt.Sprintf(`24 0 8:18 / %s rw,relatime shared:1 - squashfs /dev/sc1 rw,errors=remount-ro,data=ordered`, filepath.Dir(fakeAssertsFn))
+	restore = osutil.MockMountInfo(mockMountInfoFmt)
 	defer restore()
 
 	_, err = snap.Parser(snap.Client()).ParseArgs([]string{"auto-import"})
@@ -304,29 +266,56 @@ func (s *SnapSuite) TestAutoImportIntoSpoolUnhappyTooBig(c *C) {
 }
 
 func (s *SnapSuite) TestAutoImportUnhappyInInstallMode(c *C) {
-	restore := release.MockOnClassic(false)
-	defer restore()
+	restoreRelease := release.MockOnClassic(false)
+	defer restoreRelease()
+
+	restoreMountInfo := osutil.MockMountInfo(``)
+	defer restoreMountInfo()
 
 	_, restoreLogger := logger.MockLogger()
 	defer restoreLogger()
 
-	mockProcCmdlinePath := filepath.Join(c.MkDir(), "cmdline")
-	err := ioutil.WriteFile(mockProcCmdlinePath, []byte("foo=bar snapd_recovery_mode=install snapd_recovery_system=20191118"), 0644)
-	c.Assert(err, IsNil)
+	modeenvContent := `mode=install
+recovery_system=20200202
+`
+	c.Assert(os.MkdirAll(filepath.Dir(dirs.SnapModeenvFile), 0755), IsNil)
+	c.Assert(ioutil.WriteFile(dirs.SnapModeenvFile, []byte(modeenvContent), 0644), IsNil)
 
-	restore = osutil.MockProcCmdline(mockProcCmdlinePath)
-	defer restore()
-
-	_, err = snap.Parser(snap.Client()).ParseArgs([]string{"auto-import"})
+	_, err := snap.Parser(snap.Client()).ParseArgs([]string{"auto-import"})
 	c.Assert(err, IsNil)
 	c.Check(s.Stdout(), Equals, "")
 	c.Check(s.Stderr(), Equals, "auto-import is disabled in install-mode\n")
+}
+
+func (s *SnapSuite) TestAutoImportUnhappyInInstallInInitrdMode(c *C) {
+	restoreRelease := release.MockOnClassic(false)
+	defer restoreRelease()
+
+	restoreMountInfo := osutil.MockMountInfo(``)
+	defer restoreMountInfo()
+
+	_, restoreLogger := logger.MockLogger()
+	defer restoreLogger()
+
+	modeenvContent := `mode=run
+recovery_system=20200202
+`
+	c.Assert(os.MkdirAll(filepath.Dir(dirs.SnapModeenvFile), 0755), IsNil)
+	c.Assert(ioutil.WriteFile(dirs.SnapModeenvFile, []byte(modeenvContent), 0644), IsNil)
+
+	_, err := snap.Parser(snap.Client()).ParseArgs([]string{"auto-import"})
+	c.Assert(err, IsNil)
+	c.Check(s.Stdout(), Equals, "")
+	c.Check(s.Stderr(), Equals, "")
 }
 
 var mountStatic = []string{"mount", "-t", "ext4,vfat", "-o", "ro", "--make-private"}
 
 func (s *SnapSuite) TestAutoImportFromRemovable(c *C) {
 	restore := release.MockOnClassic(false)
+	defer restore()
+
+	restore = osutil.MockMountInfo(``)
 	defer restore()
 
 	_, restoreLogger := logger.MockLogger()
@@ -400,6 +389,9 @@ func (s *SnapSuite) TestAutoImportNoRemovable(c *C) {
 	})
 	defer restore()
 
+	restore = osutil.MockMountInfo(``)
+	defer restore()
+
 	mountCmd := testutil.MockCommand(c, "mount", "exit 1")
 	defer mountCmd.Restore()
 
@@ -421,6 +413,9 @@ func (s *SnapSuite) TestAutoImportNoRemovable(c *C) {
 
 func (s *SnapSuite) TestAutoImportFromMount(c *C) {
 	restore := release.MockOnClassic(false)
+	defer restore()
+
+	restore = osutil.MockMountInfo(``)
 	defer restore()
 
 	_, restoreLogger := logger.MockLogger()
@@ -488,17 +483,15 @@ func (s *SnapSuite) TestAutoImportUC20CandidatesIgnoresSystemPartitions(c *C) {
 		c.Assert(ioutil.WriteFile(file, nil, 0644), IsNil)
 	}
 
-	mockMountInfoFmtWithLoop := `
-24 0 8:18 / %[1]s%[2]s rw,relatime foo ext3 /dev/meep2 no,separator
+	mockMountInfoFmtWithLoop := `24 0 8:18 / %[1]s%[2]s rw,relatime foo - ext3 /dev/meep2 rw,errors=remount-ro,data=ordered
 24 0 8:18 / %[1]s%[3]s rw,relatime - ext3 /dev/meep2 rw,errors=remount-ro,data=ordered
 24 0 8:18 / %[1]s%[4]s rw,relatime opt:1 - ext4 /dev/meep3 rw,errors=remount-ro,data=ordered
 24 0 8:18 / %[1]s%[5]s rw,relatime opt:1 opt:2 - ext2 /dev/meep4 rw,errors=remount-ro,data=ordered
 24 0 8:18 / %[1]s%[6]s rw,relatime opt:1 opt:2 - ext2 /dev/meep5 rw,errors=remount-ro,data=ordered
-24 0 8:18 / %[1]s%[7]s rw,relatime opt:1 opt:2 - ext2 /dev/meep78 rw,errors=remount-ro,data=ordered
-`
+24 0 8:18 / %[1]s%[7]s rw,relatime opt:1 opt:2 - ext2 /dev/meep78 rw,errors=remount-ro,data=ordered`
 
 	content := fmt.Sprintf(mockMountInfoFmtWithLoop, args...)
-	restore := snap.MockMountInfoPath(makeMockMountInfo(c, content))
+	restore := osutil.MockMountInfo(content)
 	defer restore()
 
 	l, err := snap.AutoImportCandidates()
@@ -541,17 +534,15 @@ func (s *SnapSuite) TestAutoImportAssertsManagedEmptyReply(c *C) {
 		default:
 			c.Fatalf("unexpected request: %v (expected %d got %d)", r, total, n)
 		}
-
 	})
 
 	fakeAssertsFn := filepath.Join(c.MkDir(), "auto-import.assert")
 	err := ioutil.WriteFile(fakeAssertsFn, fakeAssertData, 0644)
 	c.Assert(err, IsNil)
 
-	mockMountInfoFmt := `
-24 0 8:18 / %s rw,relatime shared:1 - ext4 /dev/sdb2 rw,errors=remount-ro,data=ordered`
+	mockMountInfoFmt := `24 0 8:18 / %s rw,relatime shared:1 - ext4 /dev/sdb2 rw,errors=remount-ro,data=ordered`
 	content := fmt.Sprintf(mockMountInfoFmt, filepath.Dir(fakeAssertsFn))
-	restore = snap.MockMountInfoPath(makeMockMountInfo(c, content))
+	restore = osutil.MockMountInfo(content)
 	defer restore()
 
 	rest, err := snap.Parser(snap.Client()).ParseArgs([]string{"auto-import"})

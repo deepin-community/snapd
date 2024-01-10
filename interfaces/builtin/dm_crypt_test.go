@@ -85,13 +85,15 @@ func (s *DmCryptInterfaceSuite) TestAppArmorSpec(c *C) {
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/dev/mapper/control")
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/dev/dm-[0-9]*")
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/run/systemd/seats/*")
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/{,var/}run/cryptsetup/ rw,")
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/{,var/}run/cryptsetup/* rwk,")
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/{,run/}media/{,**}")
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "mount options=(ro,nosuid,nodev) /dev/dm-[0-9]*")
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "mount options=(rw,nosuid,nodev) /dev/dm-[0-9]*")
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/{,usr/}sbin/cryptsetup ixr,")
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/{,usr/}bin/mount ixr,")
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/{,usr/}bin/umount ixr,")
-	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/run/mount/utab* wrlk,")
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/{,var/}run/mount/utab* wrlk,")
 }
 
 func (s *DmCryptInterfaceSuite) TestUDevSpec(c *C) {
@@ -105,7 +107,7 @@ KERNEL=="dm-[0-9]", TAG+="snap_consumer_app"`)
 	c.Assert(spec.Snippets(), testutil.Contains, `# dm-crypt
 SUBSYSTEM=="block", TAG+="snap_consumer_app"`)
 	c.Assert(spec.Snippets(), testutil.Contains,
-		fmt.Sprintf(`TAG=="snap_consumer_app", RUN+="%v/snap-device-helper $env{ACTION} snap_consumer_app $devpath $major:$minor"`, dirs.DistroLibExecDir))
+		fmt.Sprintf(`TAG=="snap_consumer_app", SUBSYSTEM!="module", SUBSYSTEM!="subsystem", RUN+="%v/snap-device-helper $env{ACTION} snap_consumer_app $devpath $major:$minor"`, dirs.DistroLibExecDir))
 }
 
 func (s *DmCryptInterfaceSuite) TestSeccompSpec(c *C) {

@@ -100,7 +100,7 @@ func (s *aliasesSuite) TestAliasSuccess(c *check.C) {
 	st.Unlock()
 	c.Assert(err, check.IsNil)
 
-	// sanity check
+	// validity check
 	c.Check(osutil.IsSymlink(filepath.Join(dirs.SnapBinariesDir, "alias1")), check.Equals, true)
 }
 
@@ -180,9 +180,9 @@ func (s *aliasesSuite) TestAliasErrors(c *check.C) {
 		req, err := http.NewRequest("POST", "/v2/aliases", buf)
 		c.Assert(err, check.IsNil)
 
-		rsp := s.errorReq(c, req, nil)
-		c.Check(rsp.Status, check.Equals, 400)
-		c.Check(rsp.Result.(*daemon.ErrorResult).Message, check.Matches, scen.err)
+		rspe := s.errorReq(c, req, nil)
+		c.Check(rspe.Status, check.Equals, 400)
+		c.Check(rspe.Message, check.Matches, scen.err)
 	}
 }
 
@@ -233,7 +233,7 @@ func (s *aliasesSuite) TestUnaliasSnapSuccess(c *check.C) {
 	err = chg.Err()
 	c.Assert(err, check.IsNil)
 
-	// sanity check
+	// validity check
 	var snapst snapstate.SnapState
 	err = snapstate.Get(st, "alias-snap", &snapst)
 	c.Assert(err, check.IsNil)
@@ -288,7 +288,7 @@ func (s *aliasesSuite) TestUnaliasDWIMSnapSuccess(c *check.C) {
 	err = chg.Err()
 	c.Assert(err, check.IsNil)
 
-	// sanity check
+	// validity check
 	var snapst snapstate.SnapState
 	err = snapstate.Get(st, "alias-snap", &snapst)
 	c.Assert(err, check.IsNil)
@@ -373,7 +373,7 @@ func (s *aliasesSuite) TestUnaliasAliasSuccess(c *check.C) {
 	err = chg.Err()
 	c.Assert(err, check.IsNil)
 
-	// sanity check
+	// validity check
 	c.Check(osutil.FileExists(filepath.Join(dirs.SnapBinariesDir, "alias1")), check.Equals, false)
 }
 
@@ -456,7 +456,7 @@ func (s *aliasesSuite) TestUnaliasDWIMAliasSuccess(c *check.C) {
 	err = chg.Err()
 	c.Assert(err, check.IsNil)
 
-	// sanity check
+	// validity check
 	c.Check(osutil.FileExists(filepath.Join(dirs.SnapBinariesDir, "alias1")), check.Equals, false)
 }
 
@@ -507,7 +507,7 @@ func (s *aliasesSuite) TestPreferSuccess(c *check.C) {
 	err = chg.Err()
 	c.Assert(err, check.IsNil)
 
-	// sanity check
+	// validity check
 	var snapst snapstate.SnapState
 	err = snapstate.Get(st, "alias-snap", &snapst)
 	c.Assert(err, check.IsNil)

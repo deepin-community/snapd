@@ -21,11 +21,13 @@ package assertstate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/snapasserts"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
@@ -43,14 +45,14 @@ const storeGroup = "store assertion"
 // that. Most systems should be done in one request anyway.
 var maxGroups = 256
 
-func bulkRefreshSnapDeclarations(s *state.State, snapStates map[string]*snapstate.SnapState, userID int, deviceCtx snapstate.DeviceContext) error {
+func bulkRefreshSnapDeclarations(s *state.State, snapStates map[string]*snapstate.SnapState, userID int, deviceCtx snapstate.DeviceContext, opts *RefreshAssertionsOptions) error {
 	db := cachedDB(s)
 
 	pool := asserts.NewPool(db, maxGroups)
 
 	var mergedRPErr *resolvePoolError
 	tryResolvePool := func() error {
-		err := resolvePool(s, pool, userID, deviceCtx)
+		err := resolvePool(s, pool, nil, userID, deviceCtx, opts)
 		if rpe, ok := err.(*resolvePoolError); ok {
 			if mergedRPErr == nil {
 				mergedRPErr = rpe
@@ -104,7 +106,7 @@ func bulkRefreshSnapDeclarations(s *state.State, snapStates map[string]*snapstat
 			PrimaryKey: []string{modelAs.Store()},
 		}
 		if err := pool.AddToUpdate(&storeRef, storeGroup); err != nil {
-			if !asserts.IsNotFound(err) {
+			if !errors.Is(err, &asserts.NotFoundError{}) {
 				return fmt.Errorf("cannot prepare store assertion refresh: %v", err)
 			}
 			// assertion is not present in the db yet,
@@ -125,7 +127,7 @@ func bulkRefreshSnapDeclarations(s *state.State, snapStates map[string]*snapstat
 	}
 
 	if mergedRPErr != nil {
-		if e := mergedRPErr.errors[storeGroup]; asserts.IsNotFound(e) || e == asserts.ErrUnresolved {
+		if e := mergedRPErr.errors[storeGroup]; errors.Is(e, &asserts.NotFoundError{}) || e == asserts.ErrUnresolved {
 			// ignore
 			delete(mergedRPErr.errors, storeGroup)
 		}
@@ -139,7 +141,7 @@ func bulkRefreshSnapDeclarations(s *state.State, snapStates map[string]*snapstat
 	return nil
 }
 
-func bulkRefreshValidationSetAsserts(s *state.State, vsets map[string]*ValidationSetTracking, userID int, deviceCtx snapstate.DeviceContext) error {
+func bulkRefreshValidationSetAsserts(s *state.State, vsets map[string]*ValidationSetTracking, beforeCommitChecker func(*asserts.Database, asserts.Backstore) error, userID int, deviceCtx snapstate.DeviceContext, opts *RefreshAssertionsOptions) error {
 	db := cachedDB(s)
 	pool := asserts.NewPool(db, maxGroups)
 
@@ -174,16 +176,23 @@ func bulkRefreshValidationSetAsserts(s *state.State, vsets map[string]*Validatio
 		}
 	}
 
-	err := resolvePoolNoFallback(s, pool, userID, deviceCtx)
+	err := resolvePoolNoFallback(s, pool, beforeCommitChecker, userID, deviceCtx, opts)
 	if err == nil {
 		return nil
+	}
+
+	if _, ok := err.(*snapasserts.ValidationSetsConflictError); ok {
+		return err
+	}
+	if _, ok := err.(*snapasserts.ValidationSetsValidationError); ok {
+		return err
 	}
 
 	if rerr, ok := err.(*resolvePoolError); ok {
 		// ignore resolving errors for validation sets that are local only (no
 		// assertion in the store).
 		for group := range ignoreNotFound {
-			if e := rerr.errors[group]; asserts.IsNotFound(e) || e == asserts.ErrUnresolved {
+			if e := rerr.errors[group]; errors.Is(e, &asserts.NotFoundError{}) || e == asserts.ErrUnresolved {
 				delete(rerr.errors, group)
 			}
 		}
@@ -237,7 +246,7 @@ func (rpe *resolvePoolError) Error() string {
 	return strings.Join(s, "\n")
 }
 
-func resolvePool(s *state.State, pool *asserts.Pool, userID int, deviceCtx snapstate.DeviceContext) error {
+func resolvePool(s *state.State, pool *asserts.Pool, checkBeforeCommit func(*asserts.Database, asserts.Backstore) error, userID int, deviceCtx snapstate.DeviceContext, opts *RefreshAssertionsOptions) error {
 	user, err := userFromUserID(s, userID)
 	if err != nil {
 		return err
@@ -247,9 +256,9 @@ func resolvePool(s *state.State, pool *asserts.Pool, userID int, deviceCtx snaps
 	unsupported := handleUnsupported(db)
 
 	for {
-		// TODO: pass refresh options?
+		storeOpts := &store.RefreshOptions{IsAutoRefresh: opts.IsAutoRefresh}
 		s.Unlock()
-		_, aresults, err := sto.SnapAction(context.TODO(), nil, nil, pool, user, nil)
+		_, aresults, err := sto.SnapAction(context.TODO(), nil, nil, pool, user, storeOpts)
 		s.Lock()
 		if err != nil {
 			// request fallback on
@@ -293,6 +302,11 @@ func resolvePool(s *state.State, pool *asserts.Pool, userID int, deviceCtx snaps
 		}
 	}
 
+	if checkBeforeCommit != nil {
+		if err := checkBeforeCommit(db, pool.Backstore()); err != nil {
+			return err
+		}
+	}
 	pool.CommitTo(db)
 
 	errors := pool.Errors()
@@ -303,8 +317,8 @@ func resolvePool(s *state.State, pool *asserts.Pool, userID int, deviceCtx snaps
 	return nil
 }
 
-func resolvePoolNoFallback(s *state.State, pool *asserts.Pool, userID int, deviceCtx snapstate.DeviceContext) error {
-	err := resolvePool(s, pool, userID, deviceCtx)
+func resolvePoolNoFallback(s *state.State, pool *asserts.Pool, checkBeforeCommit func(*asserts.Database, asserts.Backstore) error, userID int, deviceCtx snapstate.DeviceContext, opts *RefreshAssertionsOptions) error {
+	err := resolvePool(s, pool, checkBeforeCommit, userID, deviceCtx, opts)
 	if err != nil {
 		// no fallback, report inner error.
 		if ferr, ok := err.(*bulkAssertionFallbackError); ok {

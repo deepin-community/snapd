@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2020 Canonical Ltd
+ * Copyright (C) 2016-2023 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -32,6 +32,7 @@ import (
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/image"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/store/tooling"
 )
 
 type cmdDownload struct {
@@ -57,7 +58,7 @@ func init() {
 		return &cmdDownload{}
 	}, channelDescs.also(map[string]string{
 		// TRANSLATORS: This should not start with a lowercase letter.
-		"revision": i18n.G("Download the given revision of a snap, to which you must have developer access"),
+		"revision": i18n.G("Download the given revision of a snap"),
 		// TRANSLATORS: This should not start with a lowercase letter.
 		"cohort": i18n.G("Download from the given cohort"),
 		// TRANSLATORS: This should not start with a lowercase letter.
@@ -71,7 +72,7 @@ func init() {
 	}})
 }
 
-func fetchSnapAssertionsDirect(tsto *image.ToolingStore, snapPath string, snapInfo *snap.Info) (string, error) {
+func fetchSnapAssertionsDirect(tsto *tooling.ToolingStore, snapPath string, snapInfo *snap.Info) (string, error) {
 	db, err := asserts.OpenDatabase(&asserts.DatabaseConfig{
 		Backstore: asserts.NewMemoryBackstore(),
 		Trusted:   sysdb.Trusted(),
@@ -93,7 +94,7 @@ func fetchSnapAssertionsDirect(tsto *image.ToolingStore, snapPath string, snapIn
 	}
 	f := tsto.AssertionFetcher(db, save)
 
-	_, err = image.FetchAndCheckSnapAssertions(snapPath, snapInfo, f, db)
+	_, err = image.FetchAndCheckSnapAssertions(snapPath, snapInfo, nil, f, db)
 	return assertPath, err
 }
 
@@ -116,29 +117,30 @@ func printInstallHint(assertPath, snapPath string) {
 // for testing
 var downloadDirect = downloadDirectImpl
 
-func downloadDirectImpl(snapName string, revision snap.Revision, dlOpts image.DownloadOptions) error {
-	tsto, err := image.NewToolingStore()
+func downloadDirectImpl(snapName string, revision snap.Revision, dlOpts tooling.DownloadSnapOptions) error {
+	tsto, err := tooling.NewToolingStore()
 	if err != nil {
 		return err
 	}
+	tsto.Stdout = Stdout
 
 	fmt.Fprintf(Stdout, i18n.G("Fetching snap %q\n"), snapName)
-	snapPath, snapInfo, _, err := tsto.DownloadSnap(snapName, dlOpts)
+	dlSnap, err := tsto.DownloadSnap(snapName, dlOpts)
 	if err != nil {
 		return err
 	}
 
 	fmt.Fprintf(Stdout, i18n.G("Fetching assertions for %q\n"), snapName)
-	assertPath, err := fetchSnapAssertionsDirect(tsto, snapPath, snapInfo)
+	assertPath, err := fetchSnapAssertionsDirect(tsto, dlSnap.Path, dlSnap.Info)
 	if err != nil {
 		return err
 	}
-	printInstallHint(assertPath, snapPath)
+	printInstallHint(assertPath, dlSnap.Path)
 	return nil
 }
 
 func (x *cmdDownload) downloadFromStore(snapName string, revision snap.Revision) error {
-	dlOpts := image.DownloadOptions{
+	dlOpts := tooling.DownloadSnapOptions{
 		TargetDir: x.TargetDir,
 		Basename:  x.Basename,
 		Channel:   x.Channel,

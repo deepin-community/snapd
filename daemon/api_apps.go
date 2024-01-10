@@ -34,7 +34,6 @@ import (
 	"github.com/snapcore/snapd/progress"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/strutil"
-	"github.com/snapcore/snapd/systemd"
 )
 
 var (
@@ -66,9 +65,9 @@ func getAppsInfo(c *Command, r *http.Request, user *auth.UserState) Response {
 		return BadRequest("invalid select parameter: %q", sel)
 	}
 
-	appInfos, rsp := appInfosFor(c.d.overlord.State(), strutil.CommaSeparatedList(query.Get("names")), opts)
-	if rsp != nil {
-		return rsp
+	appInfos, rspe := appInfosFor(c.d.overlord.State(), strutil.CommaSeparatedList(query.Get("names")), opts)
+	if rspe != nil {
+		return rspe
 	}
 
 	sd := servicestate.NewStatusDecorator(progress.Null)
@@ -78,7 +77,7 @@ func getAppsInfo(c *Command, r *http.Request, user *auth.UserState) Response {
 		return InternalError("%v", err)
 	}
 
-	return SyncResponse(clientAppInfos, nil)
+	return SyncResponse(clientAppInfos)
 }
 
 type appInfoOptions struct {
@@ -95,20 +94,21 @@ func (opts appInfoOptions) String() string {
 
 // appInfosFor returns a sorted list apps described by names.
 //
-// * If names is empty, returns all apps of the wanted kinds (which
-//   could be an empty list).
-// * An element of names can be a snap name, in which case all apps
-//   from the snap of the wanted kind are included in the result (and
-//   it's an error if the snap has no apps of the wanted kind).
-// * An element of names can instead be snap.app, in which case that app is
-//   included in the result (and it's an error if the snap and app don't
-//   both exist, or if the app is not a wanted kind)
-// On error an appropriate error Response is returned; a nil Response means
+//   - If names is empty, returns all apps of the wanted kinds (which
+//     could be an empty list).
+//   - An element of names can be a snap name, in which case all apps
+//     from the snap of the wanted kind are included in the result (and
+//     it's an error if the snap has no apps of the wanted kind).
+//   - An element of names can instead be snap.app, in which case that app is
+//     included in the result (and it's an error if the snap and app don't
+//     both exist, or if the app is not a wanted kind)
+//
+// On error an appropriate *apiError is returned; a nil *apiError means
 // no error.
 //
 // It's a programming error to call this with wanted having neither
 // services nor commands set.
-func appInfosFor(st *state.State, names []string, opts appInfoOptions) ([]*snap.AppInfo, Response) {
+func appInfosFor(st *state.State, names []string, opts appInfoOptions) ([]*snap.AppInfo, *apiError) {
 	snapNames := make(map[string]bool)
 	requested := make(map[string]bool)
 	for _, name := range names {
@@ -170,8 +170,9 @@ func appInfosFor(st *state.State, names []string, opts appInfoOptions) ([]*snap.
 
 // this differs from snap.SplitSnapApp in the handling of the
 // snap-only case:
-//   snap.SplitSnapApp("foo") is ("foo", "foo"),
-//   splitAppName("foo") is ("foo", "").
+//
+//	snap.SplitSnapApp("foo") is ("foo", "foo"),
+//	splitAppName("foo") is ("foo", "").
 func splitAppName(s string) (snap, app string) {
 	if idx := strings.IndexByte(s, '.'); idx > -1 {
 		return s[:idx], s[idx+1:]
@@ -201,21 +202,15 @@ func getLogs(c *Command, r *http.Request, user *auth.UserState) Response {
 
 	// only services have logs for now
 	opts := appInfoOptions{service: true}
-	appInfos, rsp := appInfosFor(c.d.overlord.State(), strutil.CommaSeparatedList(query.Get("names")), opts)
-	if rsp != nil {
-		return rsp
+	appInfos, rspe := appInfosFor(c.d.overlord.State(), strutil.CommaSeparatedList(query.Get("names")), opts)
+	if rspe != nil {
+		return rspe
 	}
 	if len(appInfos) == 0 {
 		return AppNotFound("no matching services")
 	}
 
-	serviceNames := make([]string, len(appInfos))
-	for i, appInfo := range appInfos {
-		serviceNames[i] = appInfo.ServiceName()
-	}
-
-	sysd := systemd.New(systemd.SystemMode, progress.Null)
-	reader, err := sysd.LogReader(serviceNames, n, follow)
+	reader, err := servicestate.LogReader(appInfos, n, follow)
 	if err != nil {
 		return InternalError("cannot get logs: %v", err)
 	}
@@ -241,9 +236,9 @@ func postApps(c *Command, r *http.Request, user *auth.UserState) Response {
 	}
 
 	st := c.d.overlord.State()
-	appInfos, rsp := appInfosFor(st, inst.Names, appInfoOptions{service: true})
-	if rsp != nil {
-		return rsp
+	appInfos, rspe := appInfosFor(st, inst.Names, appInfoOptions{service: true})
+	if rspe != nil {
+		return rspe
 	}
 	if len(appInfos) == 0 {
 		// can't happen: appInfosFor with a non-empty list of services
@@ -268,7 +263,7 @@ func postApps(c *Command, r *http.Request, user *auth.UserState) Response {
 	// extract the actual snap names before associating them with a change
 	chg := newChange(st, "service-control", "Running service command", tss, namesToSnapNames(&inst))
 	st.EnsureBefore(0)
-	return AsyncResponse(nil, &Meta{Change: chg.ID()})
+	return AsyncResponse(nil, chg.ID())
 }
 
 func namesToSnapNames(inst *servicestate.Instruction) []string {

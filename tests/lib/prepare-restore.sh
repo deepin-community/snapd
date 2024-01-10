@@ -5,9 +5,6 @@ set -x
 # handle errors in general.
 set -e
 
-# shellcheck source=tests/lib/quiet.sh
-. "$TESTSLIB/quiet.sh"
-
 # shellcheck source=tests/lib/pkgdb.sh
 . "$TESTSLIB/pkgdb.sh"
 
@@ -70,14 +67,20 @@ build_deb(){
     # Use fake version to ensure we are always bigger than anything else
     dch --newversion "1337.$(dpkg-parsechangelog --show-field Version)" "testing build"
 
-    if os.query is-debian-sid; then
+    if os.query is-debian sid; then
         # ensure we really build without vendored packages
-        rm -rf vendor/*/*
+        mv ./vendor /tmp
     fi
 
-    su -l -c "cd $PWD && DEB_BUILD_OPTIONS='nocheck testkeys' dpkg-buildpackage -tc -b -Zgzip" test
+    unshare -n -- \
+            su -l -c "cd $PWD && DEB_BUILD_OPTIONS='nocheck testkeys' dpkg-buildpackage -tc -b -Zgzip -uc -us" test
     # put our debs to a safe place
     cp ../*.deb "$GOHOME"
+
+    if os.query is-debian sid; then
+        # restore vendor dir, it's needed by e.g. fakestore
+        mv /tmp/vendor ./
+    fi
 }
 
 build_rpm() {
@@ -117,25 +120,19 @@ build_rpm() {
     rm -rf "$rpm_dir"/BUILD/*
 
     # Build our source package
-    rpmbuild --with testkeys -bs "$packaging_path/snapd.spec"
+    unshare -n -- \
+            rpmbuild --with testkeys -bs "$rpm_dir/SOURCES/snapd.spec"
 
     # .. and we need all necessary build dependencies available
-    deps=()
-    IFS=$'\n'
-    for dep in $(rpm -qpR "$rpm_dir"/SRPMS/snapd-1337.*.src.rpm); do
-      if [[ "$dep" = rpmlib* ]]; then
-         continue
-      fi
-      deps+=("$dep")
-    done
-    distro_install_package "${deps[@]}"
+    install_snapd_rpm_dependencies "$rpm_dir"/SRPMS/snapd-1337.*.src.rpm
 
     # And now build our binary package
-    rpmbuild \
-        --with testkeys \
-        --nocheck \
-        -ba \
-        "$packaging_path/snapd.spec"
+    unshare -n -- \
+            rpmbuild \
+            --with testkeys \
+            --nocheck \
+            -ba \
+            "$rpm_dir/SOURCES/snapd.spec"
 
     find "$rpm_dir"/RPMS -name '*.rpm' -exec cp -v {} "${GOPATH%%:*}" \;
 }
@@ -177,7 +174,8 @@ build_arch_pkg() {
     mv /tmp/pkg/PKGBUILD.tmp /tmp/pkg/PKGBUILD
 
     chown -R test:test /tmp/pkg
-    su -l -c "cd /tmp/pkg && WITH_TEST_KEYS=1 makepkg -f --nocheck" test
+    unshare -n -- \
+            su -l -c "cd /tmp/pkg && WITH_TEST_KEYS=1 makepkg -f --nocheck" test
 
     # /etc/makepkg.conf defines PKGEXT which drives the compression alg and sets
     # the package file name extension, keep it simple and try a glob instead
@@ -199,12 +197,47 @@ download_from_published(){
     done
 }
 
+download_from_gce_bucket(){
+    curl -o "${SPREAD_SYSTEM}.tar" "https://storage.googleapis.com/snapd-spread-tests/snapd-tests/packages/${SPREAD_SYSTEM}.tar"
+    tar -xf "${SPREAD_SYSTEM}.tar" -C "$PROJECT_PATH"/..
+}
+
 install_dependencies_from_published(){
     local published_version="$1"
 
     for dep in snap-confine ubuntu-core-launcher; do
         dpkg -i "$GOHOME/${dep}_${published_version}_$(dpkg --print-architecture).deb"
     done
+}
+
+install_snapd_rpm_dependencies(){
+    SRC_PATH=$1
+    deps=()
+    IFS=$'\n'
+    for dep in $(rpm -qpR "$SRC_PATH"); do
+        if [[ "$dep" = rpmlib* ]]; then
+            continue
+        fi
+        deps+=("$dep")
+    done
+    distro_install_package "${deps[@]}"
+}
+
+install_dependencies_gce_bucket(){
+    case "$SPREAD_SYSTEM" in
+        ubuntu-*|debian-*)
+            cp "$PROJECT_PATH"/../*.deb "$GOHOME"
+            ;;
+        fedora-*|opensuse-*|amazon-*|centos-*)
+            install_snapd_rpm_dependencies "$PROJECT_PATH"/../snapd-1337.*.src.rpm
+            # sources are not needed to run the tests
+            rm "$PROJECT_PATH"/../snapd-1337.*.src.rpm
+            find "$PROJECT_PATH"/.. -name '*.rpm' -exec cp -v {} "${GOPATH%%:*}" \;
+            ;;
+        arch-*)
+            cp "$PROJECT_PATH"/../snapd*.pkg.tar.* "${GOPATH%%:*}"
+            ;;
+    esac
 }
 
 ###
@@ -304,7 +337,7 @@ prepare_project() {
     fi
 
     # debian-sid packaging is special
-    if os.query is-debian-sid; then
+    if os.query is-debian sid; then
         if [ ! -d packaging/debian-sid ]; then
             echo "no packaging/debian-sid/ directory "
             echo "broken test setup"
@@ -330,7 +363,7 @@ prepare_project() {
         tar -c -z -f ../snapd_"$(dpkg-parsechangelog --show-field Version|cut -d- -f1)".orig.tar.gz --exclude=./debian --exclude=./.git .
 
         # and build a source package - this will be used during the sbuild test
-        dpkg-buildpackage -S --no-sign
+        dpkg-buildpackage -S -uc -us
     fi
 
     # so is ubuntu-14.04
@@ -355,6 +388,14 @@ prepare_project() {
 
         quiet eatmydata apt-get install -y --install-recommends linux-generic-lts-xenial
         quiet eatmydata apt-get install -y --force-yes apparmor libapparmor1 seccomp libseccomp2 systemd cgroup-lite util-linux
+    fi
+
+    # ubuntu-16.04 is EOL so the updated go-1.18 is only available via
+    # the ppa:snappy-dev/image ppa for now. if needed the package could
+    # be copied from the PPA to the ESM archive.
+    if os.query is-xenial; then
+        quiet add-apt-repository ppa:snappy-dev/image
+        quiet eatmydata apt-get update
     fi
 
     # WORKAROUND for older postrm scripts that did not do
@@ -419,26 +460,11 @@ prepare_project() {
     esac
 
     restart_logind=
-    restart_networkd=
     if [ "$(systemctl --version | awk '/systemd [0-9]+/ { print $2 }')" -lt 246 ]; then
         restart_logind=maybe
-        restart_networkd=maybe
     fi
 
-
-    # Try installing package dependencies. Because we pull in some systemd
-    # development packages we can easily pull in a whole systemd upgrade. Most
-    # of the time that's okay but, well, not always.
-    if ! install_pkg_dependencies; then
-        # If this failed, maybe systemd-networkd got busted during the 245-246
-        # upgrade? If so we can just restart it and try again.
-        # This is related to https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=966612
-        if [ "$restart_networkd" = maybe ]; then
-            systemctl reset-failed systemd-networkd.service
-            systemctl try-restart systemd-networkd.service
-            install_pkg_dependencies
-        fi
-    fi
+    install_pkg_dependencies
 
     if [ "$restart_logind" = maybe ]; then
         if [ "$(systemctl --version | awk '/systemd [0-9]+/ { print $2 }')" -ge 246 ]; then
@@ -494,40 +520,52 @@ prepare_project() {
     # base on the packaging. In Fedora/Suse this is handled via mock/osc
     case "$SPREAD_SYSTEM" in
         debian-*|ubuntu-*)
-            # in 16.04: apt build-dep -y ./
-            if [[ "$SPREAD_SYSTEM" == debian-9-* ]]; then
-                best_golang="$(python3 ./tests/lib/best_golang.py)"
-                test -n "$best_golang"
-                sed -i -e "s/golang-1.10/$best_golang/" ./debian/control
-            else
-                best_golang=golang-1.10
+            best_golang=golang-1.18
+            if [[ "$SPREAD_SYSTEM" == debian-10-* ]]; then
+                # debian-10 needs backports for dh-golang
+		# TODO: drop when we drop debian-10 support fully
+		echo "deb http://deb.debian.org/debian buster-backports-sloppy main" >> /etc/apt/sources.list
+                # debian-10 needs backports for golang-1.18, there is no
+		# buser-backports anymore so we can only use a PPA
+                echo "deb https://ppa.launchpadcontent.net/snappy-dev/image/ubuntu xenial main" >> /etc/apt/sources.list
+		curl 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x78e1918602959b9c59103100f1831ddafc42e99d' | apt-key add -
+                apt update
+                # dh-golang must come from backports, gdebi/apt cannot
+                # resolve this on their own
+                apt install -y -t buster-backports-sloppy dh-golang
+                sed -i -e "s/golang-go (>=2:1.18~).*,/${best_golang},/" ./debian/control
             fi
-            gdebi --quiet --apt-line ./debian/control | quiet xargs -r eatmydata apt-get install -y
-            # The go 1.10 backport is not using alternatives or anything else so
+            # in 16.04: "apt build-dep -y ./" would also work but not on 14.04
+            gdebi --quiet --apt-line ./debian/control >deps.txt
+            quiet xargs -r eatmydata apt-get install -y < deps.txt
+            # The go 1.18 backport is not using alternatives or anything else so
             # we need to get it on path somehow. This is not perfect but simple.
             if [ -z "$(command -v go)" ]; then
-                # the path filesystem path is: /usr/lib/go-1.10/bin
+                # the path filesystem path is: /usr/lib/go-1.18/bin
                 ln -s "/usr/lib/${best_golang/lang/}/bin/go" /usr/bin/go
             fi
             ;;
     esac
 
-    # update vendoring
-    if [ -z "$(command -v govendor)" ]; then
-        rm -rf "${GOPATH%%:*}/src/github.com/kardianos/govendor"
-        go get -u github.com/kardianos/govendor
-    fi
-    # Retry govendor sync to minimize the number of connection errors during the sync
+    # Retry go mod vendor to minimize the number of connection errors during the sync
     for _ in $(seq 10); do
-        if quiet govendor sync; then
+        if quiet go mod vendor; then
             break
         fi
         sleep 1
     done
-    # govendor runs as root and will leave strange permissions
+    # Update C dependencies
+    for _ in $(seq 10); do
+        if (cd c-vendor && ./vendor.sh); then
+            break
+        fi
+        sleep 1
+    done
+
+    # go mod runs as root and will leave strange permissions
     chown test.test -R "$SPREAD_PATH"
 
-    if [ -z "$SNAPD_PUBLISHED_VERSION" ]; then
+    if [ "$BUILD_SNAPD_FROM_CURRENT" = true ]; then
         case "$SPREAD_SYSTEM" in
             ubuntu-*|debian-*)
                 build_deb
@@ -543,9 +581,12 @@ prepare_project() {
                 exit 1
                 ;;
         esac
-    else
+    elif [ -n "$SNAPD_PUBLISHED_VERSION" ]; then
         download_from_published "$SNAPD_PUBLISHED_VERSION"
         install_dependencies_from_published "$SNAPD_PUBLISHED_VERSION"
+    else
+        download_from_gce_bucket
+        install_dependencies_gce_bucket
     fi
 
     # Build fakestore.
@@ -555,14 +596,17 @@ prepare_project() {
     fi
 
     # eval to prevent expansion errors on opensuse (the variable keeps quotes)
-    eval "go get $fakestore_tags ./tests/lib/fakestore/cmd/fakestore"
+    eval "go install $fakestore_tags ./tests/lib/fakestore/cmd/fakestore"
 
     # Build additional utilities we need for testing
-    go get ./tests/lib/fakedevicesvc
-    go get ./tests/lib/systemd-escape
+    go install ./tests/lib/fakedevicesvc
+    go install ./tests/lib/systemd-escape
 
     # Build the tool for signing model assertions
-    go get ./tests/lib/gendeveloper1model
+    go install ./tests/lib/gendeveloper1
+
+    # and the U20 create partitions wrapper
+    go install ./tests/lib/uc20-create-partitions
 
     # On core systems, the journal service is configured once the final core system
     # is created and booted what is done during the first test suite preparation
@@ -598,6 +642,23 @@ prepare_suite() {
 prepare_suite_each() {
     local variant="$1"
 
+    # Create runtime files in case those don't exist
+    # This is for the first test of the suite. We cannot perform these operations in prepare_suite
+    # because not all suites are triggering it (for example the tools suite doesn't).
+    touch "$RUNTIME_STATE_PATH/runs"
+    touch "$RUNTIME_STATE_PATH/journalctl_cursor"
+
+    # Clean the dmesg log
+    dmesg --read-clear
+
+    # Start fs monitor
+    "$TESTSTOOLS"/fs-state start-monitor
+
+    # Save all the installed packages
+    if os.query is-classic; then
+        tests.pkgs list-installed > installed-initial.pkgs
+    fi
+
     # back test directory to be restored during the restore
     tests.backup prepare
 
@@ -613,15 +674,21 @@ prepare_suite_each() {
     fi
     "$TESTSTOOLS"/journal-state start-new-log
 
+    # Check if journalctl is ready to run the test
+    "$TESTSTOOLS"/journal-state check-log-started
+
+    # In case of nested tests the next checks and changes are not needed
+    if tests.nested is-nested; then
+        return 0
+    fi
+
     if [[ "$variant" = full ]]; then
-        # shellcheck source=tests/lib/prepare.sh
-        . "$TESTSLIB"/prepare.sh
         if os.query is-classic; then
+            # shellcheck source=tests/lib/prepare.sh
+            . "$TESTSLIB"/prepare.sh
             prepare_each_classic
         fi
     fi
-    # Check if journalctl is ready to run the test
-    "$TESTSTOOLS"/journal-state check-log-started
 
     case "$SPREAD_SYSTEM" in
         fedora-*|centos-*|amazon-*)
@@ -646,6 +713,33 @@ restore_suite_each() {
 
     # restore test directory saved during prepare
     tests.backup restore
+
+    # Save all the installed packages and remove the new packages installed 
+    if os.query is-classic; then
+        tests.pkgs list-installed > installed-final.pkgs
+        diff -u installed-initial.pkgs installed-final.pkgs | grep -E "^\+" | tail -n+2 | cut -c 2- > installed-in-test.pkgs
+        diff -u installed-initial.pkgs installed-final.pkgs | grep -E "^\-" | tail -n+2 | cut -c 2- > removed-in-test.pkgs
+
+        # shellcheck disable=SC2002
+        packages="$(cat installed-in-test.pkgs | tr "\n" " ")"
+        if [ -n "$packages" ]; then
+            # shellcheck disable=SC2086
+            tests.pkgs remove $packages
+        fi
+        # shellcheck disable=SC2002
+        packages="$(cat removed-in-test.pkgs | tr "\n" " ")"
+        if [ -n "$packages" ]; then
+            # shellcheck disable=SC2086
+            tests.pkgs install $packages
+        fi
+    fi
+
+    # In case of nested tests the next checks and changes are not needed
+    # Just is needed to cleanup the snaps installed
+    if tests.nested is-nested; then
+        "$TESTSTOOLS"/snaps.cleanup
+        return 0
+    fi
 
     # On Arch it seems that using sudo / su for working with the test user
     # spawns the /run/user/12345 tmpfs for XDG_RUNTIME_DIR which asynchronously
@@ -675,14 +769,14 @@ restore_suite_each() {
         "$TESTSTOOLS"/cleanup-state pre-invariant
     fi
     tests.invariant check
+
+    "$TESTSTOOLS"/fs-state check-monitor
 }
 
 restore_suite() {
     # shellcheck source=tests/lib/reset.sh
     if [ "$REMOTE_STORE" = staging ]; then
-        # shellcheck source=tests/lib/store.sh
-        . "$TESTSLIB"/store.sh
-        teardown_staging_store
+        "$TESTSTOOLS"/store-state teardown-staging-store
     fi
 
     if os.query is-classic; then
@@ -720,6 +814,8 @@ restore_project_each() {
     # will most likely not function correctly anymore. It looks like this
     # happens with: https://forum.snapcraft.io/t/4101 and is a source of
     # failure in the autopkgtest environment.
+    # Also catch a scenario when snapd service hits the MemoryMax limit set while
+    # preparing the tests.
     if dmesg|grep "oom-killer"; then
         echo "oom-killer got invoked during the tests, this should not happen."
         echo "Dmesg debug output:"

@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2016 Canonical Ltd
+ * Copyright (C) 2014-2021 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -20,6 +20,7 @@
 package snap_test
 
 import (
+	"fmt"
 	"regexp"
 	"testing"
 	"time"
@@ -27,10 +28,10 @@ import (
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/strutil"
-	"github.com/snapcore/snapd/timeout"
-
 	"github.com/snapcore/snapd/testutil"
+	"github.com/snapcore/snapd/timeout"
 )
 
 // Hook up check.v1 into the "go test" runner
@@ -63,6 +64,8 @@ func (s *InfoSnapYamlTestSuite) TestSimple(c *C) {
 	c.Assert(info.Version, Equals, "1.0")
 	c.Assert(info.Type(), Equals, snap.TypeApp)
 	c.Assert(info.Epoch, DeepEquals, snap.E("0"))
+	c.Assert(info.SnapProvenance, Equals, "")
+	c.Check(info.Provenance(), Equals, naming.DefaultProvenance)
 }
 
 func (s *InfoSnapYamlTestSuite) TestSnapdTypeAddedByMagic(c *C) {
@@ -72,6 +75,15 @@ version: 1.0`))
 	c.Assert(info.InstanceName(), Equals, "snapd")
 	c.Assert(info.Version, Equals, "1.0")
 	c.Assert(info.Type(), Equals, snap.TypeSnapd)
+}
+
+func (s *InfoSnapYamlTestSuite) TestNonDefaultProvenance(c *C) {
+	info, err := snap.InfoFromSnapYaml([]byte(`name: foo
+provenance: delegated-prov
+version: 1.0`))
+	c.Assert(err, IsNil)
+	c.Check(info.Provenance(), Equals, "delegated-prov")
+	c.Check(info.SnapProvenance, Equals, "delegated-prov")
 }
 
 func (s *InfoSnapYamlTestSuite) TestFail(c *C) {
@@ -2085,4 +2097,66 @@ system-usernames:
 `)
 	_, err := snap.InfoFromSnapYaml(y)
 	c.Assert(err, ErrorMatches, `scope on system username "foo" is not a string \(found int\)`)
+}
+
+func (s *YamlSuite) TestSnapYamlLinks(c *C) {
+	yLinks := []byte(`name: my-snap
+version: 1.0
+
+links:
+ donations:
+   - https://donate.me
+ contact:
+   - mailto:me@toto.space
+   - https://toto.space
+ bug-url:
+   - https://github.com/webteam-space/toto.space/issues
+ website:
+   - https://toto.space
+ source-code:
+   - https://github.com/webteam-space/toto.space
+`)
+	info, err := snap.InfoFromSnapYaml(yLinks)
+	c.Assert(err, IsNil)
+	c.Check(info.Links(), DeepEquals, map[string][]string{
+		"bug-url":     {"https://github.com/webteam-space/toto.space/issues"},
+		"contact":     {"mailto:me@toto.space", "https://toto.space"},
+		"donations":   {"https://donate.me"},
+		"source-code": {"https://github.com/webteam-space/toto.space"},
+		"website":     {"https://toto.space"},
+	})
+	c.Check(info.Contact(), Equals, "mailto:me@toto.space")
+}
+
+func (s *YamlSuite) TestSnapYamlEmptyLinksKey(c *C) {
+	yLinks := []byte(`name: my-snap
+version: 1.0
+
+links:
+ "":
+   - htps://toto.space
+`)
+	_, err := snap.InfoFromSnapYaml(yLinks)
+	c.Check(err, ErrorMatches, `links key cannot be empty`)
+}
+
+func (s *YamlSuite) TestSnapYamlInvalidLinksKey(c *C) {
+	yLinks := `name: my-snap
+version: 1.0
+
+links:
+ %s:
+    - link.website
+`
+
+	invalid := []string{
+		"--",
+		"1-2",
+		"aa-",
+	}
+
+	for _, k := range invalid {
+		_, err := snap.InfoFromSnapYaml([]byte(fmt.Sprintf(yLinks, k)))
+		c.Check(err, ErrorMatches, fmt.Sprintf(`links key is invalid: %s`, k))
+	}
 }

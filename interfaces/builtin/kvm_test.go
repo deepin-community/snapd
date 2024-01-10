@@ -109,6 +109,15 @@ func (s *kvmInterfaceSuite) TestAppArmorSpec(c *C) {
 # See 'man kvm' for details.
 
 /dev/kvm rw,
+
+# Allow nested virtualization checks for different CPU models and architectures (where it is supported).
+/sys/module/kvm_intel/parameters/nested r,
+/sys/module/kvm_amd/parameters/nested r,
+/sys/module/kvm_hv/parameters/nested r, # PPC64.
+/sys/module/kvm/parameters/nested r, # S390.
+
+# Allow AMD SEV checks for AMD CPU's.
+/sys/module/kvm_amd/parameters/sev r,
 `)
 }
 
@@ -118,7 +127,7 @@ func (s *kvmInterfaceSuite) TestUDevSpec(c *C) {
 	c.Assert(spec.Snippets(), HasLen, 2)
 	c.Assert(spec.Snippets()[0], Equals, `# kvm
 KERNEL=="kvm", TAG+="snap_consumer_app"`)
-	c.Assert(spec.Snippets(), testutil.Contains, fmt.Sprintf(`TAG=="snap_consumer_app", RUN+="%s/snap-device-helper $env{ACTION} snap_consumer_app $devpath $major:$minor"`, dirs.DistroLibExecDir))
+	c.Assert(spec.Snippets(), testutil.Contains, fmt.Sprintf(`TAG=="snap_consumer_app", SUBSYSTEM!="module", SUBSYSTEM!="subsystem", RUN+="%s/snap-device-helper $env{ACTION} snap_consumer_app $devpath $major:$minor"`, dirs.DistroLibExecDir))
 }
 
 func (s *kvmInterfaceSuite) TestStaticInfo(c *C) {

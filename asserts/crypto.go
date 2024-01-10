@@ -24,9 +24,14 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
-	_ "crypto/sha256" // be explicit about supporting SHA256
-	_ "crypto/sha512" // be explicit about needing SHA512
+
+	// be explicit about supporting SHA256
+	_ "crypto/sha256"
+
+	// be explicit about needing SHA512
+	_ "crypto/sha512"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -301,14 +306,14 @@ func encodePrivateKey(privKey PrivateKey) ([]byte, error) {
 // externally held key pairs
 
 type extPGPPrivateKey struct {
-	pubKey         PublicKey
-	from           string
-	pgpFingerprint string
-	bitLen         int
-	doSign         func(content []byte) ([]byte, error)
+	pubKey     PublicKey
+	from       string
+	externalID string
+	bitLen     int
+	doSign     func(content []byte) (*packet.Signature, error)
 }
 
-func newExtPGPPrivateKey(exportedPubKeyStream io.Reader, from string, sign func(content []byte) ([]byte, error)) (*extPGPPrivateKey, error) {
+func newExtPGPPrivateKey(exportedPubKeyStream io.Reader, from string, sign func(content []byte) (*packet.Signature, error)) (*extPGPPrivateKey, error) {
 	var pubKey *packet.PublicKey
 
 	rd := packet.NewReader(exportedPubKeyStream)
@@ -343,16 +348,12 @@ func newExtPGPPrivateKey(exportedPubKeyStream io.Reader, from string, sign func(
 	}
 
 	return &extPGPPrivateKey{
-		pubKey:         RSAPublicKey(rsaPubKey),
-		from:           from,
-		pgpFingerprint: fmt.Sprintf("%X", pubKey.Fingerprint),
-		bitLen:         rsaPubKey.N.BitLen(),
-		doSign:         sign,
+		pubKey:     RSAPublicKey(rsaPubKey),
+		from:       from,
+		externalID: fmt.Sprintf("%X", pubKey.Fingerprint),
+		bitLen:     rsaPubKey.N.BitLen(),
+		doSign:     sign,
 	}, nil
-}
-
-func (expk *extPGPPrivateKey) fingerprint() string {
-	return expk.pgpFingerprint
 }
 
 func (expk *extPGPPrivateKey) PublicKey() PublicKey {
@@ -368,30 +369,20 @@ func (expk *extPGPPrivateKey) sign(content []byte) (*packet.Signature, error) {
 		return nil, fmt.Errorf("signing needs at least a 4096 bits key, got %d", expk.bitLen)
 	}
 
-	out, err := expk.doSign(content)
+	sig, err := expk.doSign(content)
 	if err != nil {
 		return nil, err
 	}
 
 	badSig := fmt.Sprintf("bad %s produced signature: ", expk.from)
 
-	sigpkt, err := packet.Read(bytes.NewBuffer(out))
-	if err != nil {
-		return nil, fmt.Errorf(badSig+"%v", err)
-	}
-
-	sig, ok := sigpkt.(*packet.Signature)
-	if !ok {
-		return nil, fmt.Errorf(badSig+"got %T", sigpkt)
-	}
-
 	if sig.Hash != crypto.SHA512 {
-		return nil, fmt.Errorf(badSig + "expected SHA512 digest")
+		return nil, errors.New(badSig + "expected SHA512 digest")
 	}
 
 	err = expk.pubKey.verify(content, sig)
 	if err != nil {
-		return nil, fmt.Errorf(badSig+"it does not verify: %v", err)
+		return nil, fmt.Errorf("%sit does not verify: %v", badSig, err)
 	}
 
 	return sig, nil

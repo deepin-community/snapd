@@ -32,8 +32,10 @@ import (
 	"github.com/snapcore/snapd/asserts/assertstest"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord"
 	"github.com/snapcore/snapd/overlord/configstate/config"
+	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/servicestate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
@@ -54,7 +56,7 @@ type baseServiceMgrTestSuite struct {
 	se    *overlord.StateEngine
 	state *state.State
 
-	restartRequests []state.RestartType
+	restartRequests []restart.RestartType
 	restartObserve  func()
 
 	uc18Model *asserts.Model
@@ -73,24 +75,24 @@ func (s *baseServiceMgrTestSuite) SetUpTest(c *C) {
 	s.restartRequests = nil
 
 	s.restartObserve = nil
-	s.o = overlord.MockWithStateAndRestartHandler(nil, func(req state.RestartType) {
+	s.o = overlord.Mock()
+	s.state = s.o.State()
+	s.state.Lock()
+	_, err := restart.Manager(s.state, "boot-id-0", snapstatetest.MockRestartHandler(func(req restart.RestartType) {
 		s.restartRequests = append(s.restartRequests, req)
 		if s.restartObserve != nil {
 			s.restartObserve()
 		}
-	})
-
-	s.state = s.o.State()
-	s.state.Lock()
-	s.state.VerifyReboot("boot-id-0")
+	}))
 	s.state.Unlock()
+	c.Assert(err, IsNil)
 	s.se = s.o.StateEngine()
 
 	s.mgr = servicestate.Manager(s.state, s.o.TaskRunner())
 	s.o.AddManager(s.mgr)
 	s.o.AddManager(s.o.TaskRunner())
 
-	err := s.o.StartUp()
+	err = s.o.StartUp()
 	c.Assert(err, IsNil)
 
 	// by default we are seeded
@@ -134,6 +136,8 @@ func (s *baseServiceMgrTestSuite) SetUpTest(c *C) {
 		Active:   true,
 		SnapType: "app",
 	}
+
+	s.AddCleanup(osutil.MockMountInfo(""))
 }
 
 type expectedSystemctl struct {
@@ -193,7 +197,7 @@ type unitOptions struct {
 	oomScore             string
 }
 
-func mkUnitFile(c *C, opts *unitOptions) string {
+func mkUnitFile(opts *unitOptions) string {
 	if opts == nil {
 		opts = &unitOptions{}
 	}
@@ -309,7 +313,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesSimpleWritesServicesFiles
 	c.Assert(err, IsNil)
 
 	// we wrote a service unit file
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		snapName: "test-snap",
 		snapRev:  "42",
 	})
@@ -381,7 +385,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesUC18(c
 	c.Assert(err, IsNil)
 
 	// we wrote the service unit file
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -424,7 +428,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesVitali
 	c.Assert(err, IsNil)
 
 	// we wrote the service unit file
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -487,7 +491,7 @@ echo %[1]q
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -506,7 +510,7 @@ echo %[1]q
 	c.Assert(err, IsNil)
 
 	// we wrote the service unit file
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -558,7 +562,7 @@ exit 1
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -583,7 +587,7 @@ exit 1
 	c.Assert(err, IsNil)
 
 	// we wrote the service unit file
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -622,7 +626,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesAndRes
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -663,7 +667,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesAndRes
 	c.Assert(err, IsNil)
 
 	// we wrote the service unit file
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -702,7 +706,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesButDoe
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -743,7 +747,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesButDoe
 	c.Assert(err, IsNil)
 
 	// we wrote the service unit file
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -776,7 +780,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesDoesNotRestartServicesKil
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -809,7 +813,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesDoesNotRestartServicesKil
 	c.Assert(err, IsNil)
 
 	// we wrote the service unit file
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -842,7 +846,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesDoesNotRestartServicesKil
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -875,7 +879,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesDoesNotRestartServicesKil
 	c.Assert(err, IsNil)
 
 	// we wrote the service unit file
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -925,7 +929,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesSimpleRewritesServicesFil
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -962,7 +966,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesSimpleRewritesServicesFil
 	c.Assert(err, IsNil)
 
 	// the file was rewritten to use Wants instead now
-	wantsContent := mkUnitFile(c, &unitOptions{
+	wantsContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1012,7 +1016,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesSimpleRewritesServicesFil
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1049,7 +1053,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesSimpleRewritesServicesFil
 	c.Assert(err, IsNil)
 
 	// the file was rewritten to use Wants instead now
-	wantsContent := mkUnitFile(c, &unitOptions{
+	wantsContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1085,7 +1089,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesSimpleRewritesServicesFil
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1122,7 +1126,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesSimpleRewritesServicesFil
 	c.Assert(err, IsNil)
 
 	// the file was rewritten to use Wants instead now
-	wantsContent := mkUnitFile(c, &unitOptions{
+	wantsContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1155,7 +1159,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesNoChangeServiceFileDoesNo
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Wants
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1198,7 +1202,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesDoesNotRestartServicesWhe
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1222,7 +1226,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesDoesNotRestartServicesWhe
 	err = s.mgr.Ensure()
 	c.Assert(err, IsNil)
 
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1255,7 +1259,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesAndRes
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1294,6 +1298,9 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesAndRes
 			expArgs: []string{"stop", "snap.test-snap.svc1.service"},
 			err:     fmt.Errorf("this service is still having a bad day"),
 		},
+		{
+			expArgs: []string{"show", "--property=ActiveState", "snap.test-snap.svc1.service"},
+		},
 	})
 	defer r()
 
@@ -1301,7 +1308,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesAndRes
 	c.Assert(err, ErrorMatches, "error trying to restart killed services, immediately rebooting: this service is having a bad day")
 
 	// we did write the service unit file
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1309,7 +1316,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesAndRes
 	c.Assert(svcFile, testutil.FileEquals, content)
 
 	// we requested a restart
-	c.Assert(s.restartRequests, DeepEquals, []state.RestartType{state.RestartSystemNow})
+	c.Assert(s.restartRequests, DeepEquals, []restart.RestartType{restart.RestartSystemNow})
 }
 
 func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesAndTriesRestartButFailsButThenFallsbackToReboot(c *C) {
@@ -1334,7 +1341,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesAndTri
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.test-snap.svc1.service")
 
 	// add the initial state of the service file using Requires
-	requiresContent := mkUnitFile(c, &unitOptions{
+	requiresContent := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Requires",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1372,7 +1379,7 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesAndTri
 	c.Assert(err, ErrorMatches, "error trying to restart killed services, immediately rebooting: systemd is having a bad day")
 
 	// we did write the service unit file
-	content := mkUnitFile(c, &unitOptions{
+	content := mkUnitFile(&unitOptions{
 		usrLibSnapdOrderVerb: "Wants",
 		snapName:             "test-snap",
 		snapRev:              "42",
@@ -1380,5 +1387,5 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesWritesServicesFilesAndTri
 	c.Assert(svcFile, testutil.FileEquals, content)
 
 	// we requested a restart
-	c.Assert(s.restartRequests, DeepEquals, []state.RestartType{state.RestartSystemNow})
+	c.Assert(s.restartRequests, DeepEquals, []restart.RestartType{restart.RestartSystemNow})
 }

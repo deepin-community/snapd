@@ -51,6 +51,8 @@ type Specification struct {
 // SetControlsDeviceCgroup marks a specification as needing to control
 // its own device cgroup which prevents generation of any udev tagging rules
 // for this snap name
+// TODO: this setting should also imply setting Delegates=true in the
+// ServicePermanentPlug somehow, perhaps just for the commonInterface
 func (spec *Specification) SetControlsDeviceCgroup() {
 	spec.controlsDeviceCgroup = true
 }
@@ -92,7 +94,11 @@ func (spec *Specification) TagDevice(snippet string) {
 	for _, securityTag := range spec.securityTags {
 		tag := udevTag(securityTag)
 		spec.addEntry(fmt.Sprintf("# %s\n%s, TAG+=\"%s\"", spec.iface, snippet, tag), tag)
-		spec.addEntry(fmt.Sprintf("TAG==\"%s\", RUN+=\"%s/snap-device-helper $env{ACTION} %s $devpath $major:$minor\"",
+		// SUBSYSTEM=="module" is for kernel modules not devices.
+		// SUBSYSTEM=="subsystem" is for subsystems (the top directories in /sys/class). Not for devices.
+		// When loaded, they send an ADD event
+		// snap-device-helper expects devices only, not modules nor subsystems
+		spec.addEntry(fmt.Sprintf("TAG==\"%s\", SUBSYSTEM!=\"module\", SUBSYSTEM!=\"subsystem\", RUN+=\"%s/snap-device-helper $env{ACTION} %s $devpath $major:$minor\"",
 			tag, dirs.DistroLibExecDir, tag), tag)
 	}
 }

@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2019-2020 Canonical Ltd
+ * Copyright (C) 2019-2022 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/bootloader"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/logger"
@@ -32,7 +31,7 @@ import (
 	"github.com/snapcore/snapd/strutil"
 )
 
-func newBootState20(typ snap.Type, dev Device) bootState {
+func newBootState20(typ snap.Type, dev snap.Device) bootState {
 	switch typ {
 	case snap.TypeBase:
 		return &bootState20Base{}
@@ -40,6 +39,8 @@ func newBootState20(typ snap.Type, dev Device) bootState {
 		return &bootState20Kernel{
 			dev: dev,
 		}
+	case snap.TypeGadget:
+		return &bootState20Gadget{}
 	default:
 		panic(fmt.Sprintf("cannot make a bootState20 for snap type %q", typ))
 	}
@@ -51,6 +52,26 @@ func loadModeenv() (*Modeenv, error) {
 		return nil, fmt.Errorf("cannot get snap revision: unable to read modeenv: %v", err)
 	}
 	return modeenv, nil
+}
+
+// selectGadgetSnap finds the currently active gadget snap
+func selectGadgetSnap(modeenv *Modeenv, rootfsDir string) (snap.PlaceInfo, error) {
+	gadgetInfo, err := snap.ParsePlaceInfoFromSnapFileName(modeenv.Gadget)
+	if err != nil {
+		return nil, fmt.Errorf("cannot get snap revision: modeenv gadget boot variable is invalid: %v", err)
+	}
+
+	// check that the current snap actually exists
+	file := modeenv.Gadget
+	snapPath := filepath.Join(dirs.SnapBlobDirUnder(rootfsDir), file)
+	if !osutil.FileExists(snapPath) {
+		// somehow the gadget snap doesn't exist in ubuntu-data
+		// this could happen if the modeenv is manipulated
+		// out-of-band from snapd
+		return nil, fmt.Errorf("gadget snap %q does not exist on ubuntu-data", file)
+	}
+
+	return gadgetInfo, nil
 }
 
 //
@@ -74,6 +95,12 @@ type bootloaderKernelState20 interface {
 	// markSuccessfulKernel marks the specified kernel as having booted
 	// successfully, whether that kernel is the current kernel or the try-kernel
 	markSuccessfulKernel(sn snap.PlaceInfo) error
+	// setNextKernelNoTry changes boot configuration so the specified kernel will
+	// be the one used in next boot, without the "try" logic. This shall be
+	// used only when we have already booted to a new kernel but for some
+	// reason we need to revert to the previous kernel (for instance, in a
+	// transactional update when the failing snap is not the kernel).
+	setNextKernelNoTry(sn snap.PlaceInfo) error
 }
 
 //
@@ -96,9 +123,6 @@ type bootStateUpdate20 struct {
 
 	// tasks to run after the modeenv has been written
 	postModeenvTasks []bootCommitTask
-
-	// model set if a reseal might be necessary
-	resealModel *asserts.Model
 }
 
 func (u20 *bootStateUpdate20) preModeenv(task bootCommitTask) {
@@ -107,10 +131,6 @@ func (u20 *bootStateUpdate20) preModeenv(task bootCommitTask) {
 
 func (u20 *bootStateUpdate20) postModeenv(task bootCommitTask) {
 	u20.postModeenvTasks = append(u20.postModeenvTasks, task)
-}
-
-func (u20 *bootStateUpdate20) resealForModel(model *asserts.Model) {
-	u20.resealModel = model
 }
 
 func newBootStateUpdate20(m *Modeenv) (*bootStateUpdate20, error) {
@@ -153,28 +173,26 @@ func (u20 *bootStateUpdate20) commit() error {
 		}
 	}
 
-	modeenvRewritten := false
+	expectReseal := false
 	// next write the modeenv if it changed
 	if !u20.writeModeenv.deepEqual(u20.modeenv) {
 		if err := u20.writeModeenv.Write(); err != nil {
 			return err
 		}
-		modeenvRewritten = true
+		expectReseal = resealExpectedByModeenvChange(u20.writeModeenv, u20.modeenv)
 	}
 
 	// next reseal using the modeenv values, we do this before any
 	// post-modeenv tasks so if we are rebooted at any point after
 	// the reseal even before the post tasks are completed, we
 	// still boot properly
-	if u20.resealModel != nil {
-		// if there is ambiguity whether the boot chains have
-		// changed because of unasserted kernels, then pass a
-		// flag as hint whether to reseal based on whether we
-		// wrote the modeenv
-		expectReseal := modeenvRewritten
-		if err := resealKeyToModeenv(dirs.GlobalRootDir, u20.resealModel, u20.writeModeenv, expectReseal); err != nil {
-			return err
-		}
+
+	// if there is ambiguity whether the boot chains have
+	// changed because of unasserted kernels, then pass a
+	// flag as hint whether to reseal based on whether we
+	// wrote the modeenv
+	if err := resealKeyToModeenv(dirs.GlobalRootDir, u20.writeModeenv, expectReseal); err != nil {
+		return err
 	}
 
 	// finally handle any post-modeenv writing tasks
@@ -196,12 +214,13 @@ func (u20 *bootStateUpdate20) commit() error {
 // methods returning bootStateUpdate20 to be used with bootStateUpdate.
 type bootState20Kernel struct {
 	bks bootloaderKernelState20
+	rbl bootloader.RebootBootloader
 
 	// used to find the bootloader to manipulate the enabled kernel, etc.
 	blOpts *bootloader.Options
 	blDir  string
 
-	dev Device
+	dev snap.Device
 }
 
 func (ks20 *bootState20Kernel) loadBootenv() error {
@@ -232,12 +251,24 @@ func (ks20 *bootState20Kernel) loadBootenv() error {
 		ks20.bks = &envRefExtractedKernelBootloaderKernelState{bl: bl}
 	}
 
+	rbl, ok := bl.(bootloader.RebootBootloader)
+	if ok {
+		ks20.rbl = rbl
+	}
+
 	// setup the bootloaderKernelState20
 	if err := ks20.bks.load(); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (ks20 *bootState20Kernel) getRebootBootloader() (bootloader.RebootBootloader, error) {
+	if err := ks20.loadBootenv(); err != nil {
+		return nil, err
+	}
+	return ks20.rbl, nil
 }
 
 func (ks20 *bootState20Kernel) revisions() (curSnap, trySnap snap.PlaceInfo, tryingStatus string, err error) {
@@ -253,7 +284,7 @@ func (ks20 *bootState20Kernel) revisions() (curSnap, trySnap snap.PlaceInfo, try
 	tryKernel, err := ks20.bks.tryKernel()
 	// if err is ErrNoTryKernelRef, then we will just return nil as the trySnap
 	if err != nil && err != bootloader.ErrNoTryKernelRef {
-		return kern, nil, "", newTrySnapErrorf("cannot identify try kernel snap: %v", err)
+		return kern, nil, status, newTrySnapErrorf("cannot identify try kernel snap: %v", err)
 	}
 
 	if err == nil {
@@ -290,33 +321,56 @@ func (ks20 *bootState20Kernel) markSuccessful(update bootStateUpdate) (bootState
 		// On commit, set CurrentKernels as just this kernel because that is the
 		// successful kernel we booted
 		u20.writeModeenv.CurrentKernels = []string{sn.Filename()}
-
-		// keep track of the model for resealing
-		u20.resealForModel(ks20.dev.Model())
 	}
 
 	return u20, nil
 }
 
-func (ks20 *bootState20Kernel) setNext(next snap.PlaceInfo) (rebootRequired bool, u bootStateUpdate, err error) {
-	u20, nextStatus, err := genericSetNext(ks20, next)
+func (ks20 *bootState20Kernel) setNext(next snap.PlaceInfo, bootCtx NextBootContext) (rbi RebootInfo, u bootStateUpdate, err error) {
+	u20, rebootRequired, err := genericSetNext(ks20, next)
 	if err != nil {
-		return false, nil, err
+		return RebootInfo{RebootRequired: false}, nil, err
 	}
 
-	// if we are setting a snap as a try snap, then we need to reboot
-	rebootRequired = false
-	if nextStatus == TryStatus {
-		rebootRequired = true
+	nextStatus := DefaultStatus
+	rbi.RebootRequired = rebootRequired
+	if rbi.RebootRequired {
+		// if we need to reboot and we are not undoing, we set the try status
+		if !bootCtx.BootWithoutTry {
+			nextStatus = TryStatus
+		}
+		// kernels are usually loaded directly by the bootloader, for
+		// which we may need to pass additional data to make 'try'
+		// operation more robust - that might be provided by the
+		// RebootBootloader interface
+		if rbi.RebootBootloader, err = ks20.getRebootBootloader(); err != nil {
+			return RebootInfo{RebootRequired: false}, nil, err
+		}
 	}
 
 	currentKernel := ks20.bks.kernel()
-	if next.Filename() != currentKernel.Filename() {
-		// on commit, add this kernel to the modeenv
+	if bootCtx.BootWithoutTry {
+		// When undoing, only next kernel will be available (which will
+		// be actually the old kernel). Depending on when the undo
+		// happens (before or after the reboot triggered by the update),
+		// current will be the same as next or different, so in both
+		// cases we need this.
+		u20.writeModeenv.CurrentKernels = []string{next.Filename()}
+	} else if next.Filename() != currentKernel.Filename() {
+		// We are trying a new kernel, add to the modeenv
 		u20.writeModeenv.CurrentKernels = append(
 			u20.writeModeenv.CurrentKernels,
 			next.Filename(),
 		)
+	}
+	logger.Debugf("available kernels (BootWithoutTry: %t): %v",
+		bootCtx.BootWithoutTry, u20.writeModeenv.CurrentKernels)
+
+	bootTask := func() error { return ks20.bks.setNextKernel(next, nextStatus) }
+	if bootCtx.BootWithoutTry {
+		// force revert to "next" kernel (actually it is the old one)
+		// and ignore the try status, that will be empty in this case.
+		bootTask = func() error { return ks20.bks.setNextKernelNoTry(next) }
 	}
 
 	// On commit, if we are about to try an update, and need to set the next
@@ -325,12 +379,9 @@ func (ks20 *bootState20Kernel) setNext(next snap.PlaceInfo) (rebootRequired bool
 	// kernel and updating the modeenv, the initramfs would fail the boot
 	// because the modeenv doesn't "trust" or expect the new kernel that booted.
 	// As such, set the next kernel as a post modeenv task.
-	u20.postModeenv(func() error { return ks20.bks.setNextKernel(next, nextStatus) })
+	u20.postModeenv(bootTask)
 
-	// keep track of the model for resealing
-	u20.resealForModel(ks20.dev.Model())
-
-	return rebootRequired, u20, nil
+	return rbi, u20, nil
 }
 
 // selectAndCommitSnapInitramfsMount chooses which snap should be mounted
@@ -338,13 +389,16 @@ func (ks20 *bootState20Kernel) setNext(next snap.PlaceInfo) (rebootRequired bool
 // Choosing to boot/mount the base snap needs to be committed to the
 // modeenv, but no state needs to be committed when choosing to mount a
 // kernel snap.
-func (ks20 *bootState20Kernel) selectAndCommitSnapInitramfsMount(modeenv *Modeenv) (sn snap.PlaceInfo, err error) {
+func (ks20 *bootState20Kernel) selectAndCommitSnapInitramfsMount(modeenv *Modeenv, rootfsDir string) (sn snap.PlaceInfo, err error) {
 	// first do the generic choice of which snap to use
-	first, second, err := genericInitramfsSelectSnap(ks20, modeenv, TryingStatus, "kernel")
+	first, second, err := genericInitramfsSelectSnap(ks20, modeenv, rootfsDir, TryingStatus, "kernel")
 	if err != nil && err != errTrySnapFallback {
 		return nil, err
 	}
 
+	// If errTrySnapFallback it means that we are trying a new kernel
+	// but somewhat the status does not look correct of we cannot find
+	// the snap. Reboot so bootloader reverts to using the old kernel.
 	if err == errTrySnapFallback {
 		// this should not actually return, it should immediately reboot
 		return nil, initramfsReboot()
@@ -361,7 +415,6 @@ func (ks20 *bootState20Kernel) selectAndCommitSnapInitramfsMount(modeenv *Modeen
 	// but we need to fallback to the second kernel, but we can't do that in the
 	// initramfs, we need to reboot so the bootloader boots the fallback kernel
 	// for us
-
 	if second != nil {
 		// this should not actually return, it should immediately reboot
 		return nil, initramfsReboot()
@@ -373,6 +426,35 @@ func (ks20 *bootState20Kernel) selectAndCommitSnapInitramfsMount(modeenv *Modeen
 	// instead just fail the systemd unit in the initramfs for an operator to
 	// debug/fix
 	return nil, fmt.Errorf("fallback kernel snap %q is not trusted in the modeenv", first.Filename())
+}
+
+//
+// gadget snap methods
+//
+
+// bootState20Gadget implements the bootState interface for gadget
+// snaps on UC20+. It is used for both setNext() and markSuccessful(),
+// with both of those methods returning bootStateUpdate20 to be used
+// with bootStateUpdate.
+type bootState20Gadget struct{}
+
+func (bs20 *bootState20Gadget) revisions() (curSnap, trySnap snap.PlaceInfo, tryingStatus string, err error) {
+	return nil, nil, "", fmt.Errorf("internal error, revisions not implemented for gadget")
+}
+
+func (bs20 *bootState20Gadget) setNext(next snap.PlaceInfo, bootCtx NextBootContext) (rbi RebootInfo, u bootStateUpdate, err error) {
+	u20, err := newBootStateUpdate20(nil)
+	if err != nil {
+		return RebootInfo{RebootRequired: false}, nil, err
+	}
+
+	u20.writeModeenv.Gadget = next.Filename()
+
+	return RebootInfo{RebootRequired: false}, u20, err
+}
+
+func (bs20 *bootState20Gadget) markSuccessful(bootStateUpdate) (bootStateUpdate, error) {
+	return nil, fmt.Errorf("internal error, markSuccessful not implemented for gadget")
 }
 
 //
@@ -436,24 +518,34 @@ func (bs20 *bootState20Base) markSuccessful(update bootStateUpdate) (bootStateUp
 	return u20, nil
 }
 
-func (bs20 *bootState20Base) setNext(next snap.PlaceInfo) (rebootRequired bool, u bootStateUpdate, err error) {
-	u20, nextStatus, err := genericSetNext(bs20, next)
+func (bs20 *bootState20Base) setNext(next snap.PlaceInfo, bootCtx NextBootContext) (rbi RebootInfo, u bootStateUpdate, err error) {
+	// bases are handled by snap-bootstrap, hence we are not interested in
+	// the bootloader's opinion (no need for rbi.RebootBootloader, so it is
+	// not filled anywhere in this method).
+	u20, rebootRequired, err := genericSetNext(bs20, next)
 	if err != nil {
-		return false, nil, err
+		return RebootInfo{RebootRequired: false}, nil, err
 	}
 
-	// if we are setting a snap as a try snap, then we need to reboot
-	rebootRequired = false
-	if nextStatus == TryStatus {
-		// only update the try base if we are actually in try status
-		u20.writeModeenv.TryBase = next.Filename()
-		rebootRequired = true
+	nextStatus := DefaultStatus
+	rbi.RebootRequired = rebootRequired
+	if rbi.RebootRequired {
+		if bootCtx.BootWithoutTry {
+			// we must make sure we boot with the base we revert to
+			u20.writeModeenv.Base = next.Filename()
+			u20.writeModeenv.TryBase = ""
+		} else {
+			// if we need to reboot and we are not undoing, we set the try status
+			// and set appropriately the base we want to try
+			nextStatus = TryStatus
+			u20.writeModeenv.TryBase = next.Filename()
+		}
 	}
 
 	// always update the base status
 	u20.writeModeenv.BaseStatus = nextStatus
 
-	return rebootRequired, u20, nil
+	return rbi, u20, nil
 }
 
 // selectAndCommitSnapInitramfsMount chooses which snap should be mounted
@@ -462,13 +554,14 @@ func (bs20 *bootState20Base) setNext(next snap.PlaceInfo) (rebootRequired bool, 
 // Choosing to boot/mount the base snap needs to be committed to the
 // modeenv, but no state needs to be committed when choosing to mount a
 // kernel snap.
-func (bs20 *bootState20Base) selectAndCommitSnapInitramfsMount(modeenv *Modeenv) (sn snap.PlaceInfo, err error) {
+func (bs20 *bootState20Base) selectAndCommitSnapInitramfsMount(modeenv *Modeenv, rootfsDir string) (sn snap.PlaceInfo, err error) {
 	// first do the generic choice of which snap to use
 	// the logic in that function is sufficient to pick the base snap entirely,
 	// so we don't ever need to look at the fallback snap, we just need to know
 	// whether the chosen snap is a try snap or not, if it is then we process
 	// the modeenv in the "try" -> "trying" case
-	first, second, err := genericInitramfsSelectSnap(bs20, modeenv, TryStatus, "base")
+	first, second, err :=
+		genericInitramfsSelectSnap(bs20, modeenv, rootfsDir, TryStatus, "base")
 	// errTrySnapFallback is handled manually by inspecting second below
 	if err != nil && err != errTrySnapFallback {
 		return nil, err
@@ -522,16 +615,16 @@ type bootState20 interface {
 // genericSetNext implements the generic logic for setting up a snap to be tried
 // for boot and works for both kernel and base snaps (though not
 // simultaneously).
-func genericSetNext(b bootState20, next snap.PlaceInfo) (u20 *bootStateUpdate20, setStatus string, err error) {
+func genericSetNext(b bootState20, next snap.PlaceInfo) (u20 *bootStateUpdate20, rebootRequired bool, err error) {
 	u20, err = newBootStateUpdate20(nil)
 	if err != nil {
-		return nil, "", err
+		return nil, false, err
 	}
 
 	// get the current snap
 	current, _, _, err := b.revisionsFromModeenv(u20.modeenv)
 	if err != nil {
-		return nil, "", err
+		return nil, false, err
 	}
 
 	// check if the next snap is really the same as the current snap, in which
@@ -539,12 +632,11 @@ func genericSetNext(b bootState20, next snap.PlaceInfo) (u20 *bootStateUpdate20,
 	if current.SnapName() == next.SnapName() && next.SnapRevision() == current.SnapRevision() {
 		// if we are setting the next snap as the current snap, don't need to
 		// change any snaps, just reset the status to default
-		return u20, DefaultStatus, nil
+		return u20, false, nil
 	}
 
-	// by default we will set the status as "try" to prepare for an update,
-	// which also by default will require a reboot
-	return u20, TryStatus, nil
+	// next != current so we need to reboot
+	return u20, true, nil
 }
 
 func toBootStateUpdate20(update bootStateUpdate) (u20 *bootStateUpdate20, err error) {
@@ -552,7 +644,7 @@ func toBootStateUpdate20(update bootStateUpdate) (u20 *bootStateUpdate20, err er
 	if update != nil {
 		var ok bool
 		if u20, ok = update.(*bootStateUpdate20); !ok {
-			return nil, fmt.Errorf("internal error, cannot thread %T with update for UC20", update)
+			return nil, fmt.Errorf("internal error, cannot thread %T with update for UC20+", update)
 		}
 	}
 	if u20 == nil {
@@ -604,20 +696,33 @@ func selectSuccessfulBootSnap(b bootState20, update bootStateUpdate) (
 // the first and second choice for what snaps to mount. If there is a second
 // snap, then that snap is the fallback or non-trying snap and the first snap is
 // the try snap.
-func genericInitramfsSelectSnap(bs bootState20, modeenv *Modeenv, expectedTryStatus, typeString string) (
+func genericInitramfsSelectSnap(bs bootState20, modeenv *Modeenv, rootfsDir string, expectedTryStatus, typeString string) (
 	firstChoice, secondChoice snap.PlaceInfo,
 	err error,
 ) {
 	curSnap, trySnap, snapTryStatus, err := bs.revisionsFromModeenv(modeenv)
-
-	if err != nil && !isTrySnapError(err) {
-		// we have no fallback snap!
-		return nil, nil, fmt.Errorf("fallback %s snap unusable: %v", typeString, err)
+	if err != nil {
+		if isTrySnapError(err) {
+			// We just log the error, if we are here and this is a
+			// kernel is either because try-kernel.efi is a dangling
+			// link or because it points to a bad file. Most
+			// possibly the try kernel has not been used to start
+			// the system, so we just go on and wait to see what the
+			// try_status says - otherwise we could enter a boot
+			// loop. If it is a base, we have bad format in the
+			// modeenv for it, log and move on, we still want to
+			// boot.
+			logger.Noticef("unable to process try %s snap: %v", typeString, err)
+		} else {
+			// No current snap information found in modeenv for base,
+			// or cannot get information from bootloader for kernel.
+			return nil, nil, fmt.Errorf("no currently usable %s snaps: %v", typeString, err)
+		}
 	}
 
 	// check that the current snap actually exists
 	file := curSnap.Filename()
-	snapPath := filepath.Join(dirs.SnapBlobDirUnder(InitramfsWritableDir), file)
+	snapPath := filepath.Join(dirs.SnapBlobDirUnder(rootfsDir), file)
 	if !osutil.FileExists(snapPath) {
 		// somehow the boot snap doesn't exist in ubuntu-data
 		// for a kernel, this could happen if we have some bug where ubuntu-boot
@@ -629,21 +734,20 @@ func genericInitramfsSelectSnap(bs bootState20, modeenv *Modeenv, expectedTrySta
 		return nil, nil, fmt.Errorf("%s snap %q does not exist on ubuntu-data", typeString, file)
 	}
 
-	if err != nil && isTrySnapError(err) {
-		// just log that we had issues with the try snap and continue with
-		// using the normal snap
-		logger.Noticef("unable to process try %s snap: %v", typeString, err)
-		return curSnap, nil, errTrySnapFallback
-	}
 	if snapTryStatus != expectedTryStatus {
-		// the status is unexpected, log if its value is invalid and continue
-		// with the normal snap
+		// status does not match what we would have if we were trying a
+		// snap (which is the normal path when no update is happening),
+		// log if its value is invalid and continue with the normal snap
 		fallbackErr := errTrySnapFallback
 		switch snapTryStatus {
 		case DefaultStatus:
+			// all good, no update is happening in this boot
 			fallbackErr = nil
 		case TryStatus, TryingStatus:
 		default:
+			// something is wrong, status is neither the default nor
+			// what we would see from the initramfs if we were
+			// trying a snap
 			logger.Noticef("\"%s_status\" has an invalid setting: %q", typeString, snapTryStatus)
 		}
 		return curSnap, nil, fallbackErr
@@ -654,7 +758,7 @@ func genericInitramfsSelectSnap(bs bootState20, modeenv *Modeenv, expectedTrySta
 		logger.Noticef("try-%[1]s snap is empty, but \"%[1]s_status\" is \"trying\"", typeString)
 		return curSnap, nil, errTrySnapFallback
 	}
-	trySnapPath := filepath.Join(dirs.SnapBlobDirUnder(InitramfsWritableDir), trySnap.Filename())
+	trySnapPath := filepath.Join(dirs.SnapBlobDirUnder(rootfsDir), trySnap.Filename())
 	if !osutil.FileExists(trySnapPath) {
 		// or when the snap file does not exist
 		logger.Noticef("try-%s snap %q does not exist", typeString, trySnap.Filename())
@@ -672,7 +776,7 @@ func genericInitramfsSelectSnap(bs bootState20, modeenv *Modeenv, expectedTrySta
 // bootState20BootAssets implements the successfulBootState interface for trusted
 // boot assets UC20.
 type bootState20BootAssets struct {
-	dev Device
+	dev snap.Device
 }
 
 func (ba20 *bootState20BootAssets) markSuccessful(update bootStateUpdate) (bootStateUpdate, error) {
@@ -692,8 +796,6 @@ func (ba20 *bootState20BootAssets) markSuccessful(update bootStateUpdate) (bootS
 	}
 	// update modeenv
 	u20.writeModeenv = newM
-	// keep track of the model for resealing
-	u20.resealForModel(ba20.dev.Model())
 
 	if len(dropAssets) == 0 {
 		// nothing to drop, we're done
@@ -715,7 +817,7 @@ func (ba20 *bootState20BootAssets) markSuccessful(update bootStateUpdate) (bootS
 	return u20, nil
 }
 
-func trustedAssetsBootState(dev Device) *bootState20BootAssets {
+func trustedAssetsBootState(dev snap.Device) *bootState20BootAssets {
 	return &bootState20BootAssets{
 		dev: dev,
 	}
@@ -724,7 +826,7 @@ func trustedAssetsBootState(dev Device) *bootState20BootAssets {
 // bootState20CommandLine implements the successfulBootState interface for
 // kernel command line
 type bootState20CommandLine struct {
-	dev Device
+	dev snap.Device
 }
 
 func (bcl20 *bootState20CommandLine) markSuccessful(update bootStateUpdate) (bootStateUpdate, error) {
@@ -740,7 +842,7 @@ func (bcl20 *bootState20CommandLine) markSuccessful(update bootStateUpdate) (boo
 	return u20, nil
 }
 
-func trustedCommandLineBootState(dev Device) *bootState20CommandLine {
+func trustedCommandLineBootState(dev snap.Device) *bootState20CommandLine {
 	return &bootState20CommandLine{
 		dev: dev,
 	}
@@ -749,7 +851,7 @@ func trustedCommandLineBootState(dev Device) *bootState20CommandLine {
 // bootState20RecoverySystem implements the successfulBootState interface for
 // tried recovery systems
 type bootState20RecoverySystem struct {
-	dev Device
+	dev snap.Device
 }
 
 func (brs20 *bootState20RecoverySystem) markSuccessful(update bootStateUpdate) (bootStateUpdate, error) {
@@ -758,7 +860,7 @@ func (brs20 *bootState20RecoverySystem) markSuccessful(update bootStateUpdate) (
 		return nil, err
 	}
 
-	newM, err := observeSuccessfulSystems(brs20.dev.Model(), u20.writeModeenv)
+	newM, err := observeSuccessfulSystems(u20.writeModeenv)
 	if err != nil {
 		return nil, fmt.Errorf("cannot mark successful recovery system: %v", err)
 	}
@@ -766,6 +868,33 @@ func (brs20 *bootState20RecoverySystem) markSuccessful(update bootStateUpdate) (
 	return u20, nil
 }
 
-func recoverySystemsBootState(dev Device) *bootState20RecoverySystem {
+func recoverySystemsBootState(dev snap.Device) *bootState20RecoverySystem {
 	return &bootState20RecoverySystem{dev: dev}
+}
+
+// bootState20Model implements the successfulBootState interface for device
+// model related bookkeeping
+type bootState20Model struct {
+	dev snap.Device
+}
+
+func (brs20 *bootState20Model) markSuccessful(update bootStateUpdate) (bootStateUpdate, error) {
+	u20, err := toBootStateUpdate20(update)
+	if err != nil {
+		return nil, err
+	}
+
+	// sign key ID was not being populated in earlier versions of snapd, try
+	// to remedy that
+	if u20.modeenv.ModelSignKeyID == "" {
+		if err != nil {
+			return nil, err
+		}
+		u20.writeModeenv.ModelSignKeyID = brs20.dev.Model().SignKeyID()
+	}
+	return u20, nil
+}
+
+func modelBootState(dev snap.Device) *bootState20Model {
+	return &bootState20Model{dev: dev}
 }

@@ -103,7 +103,9 @@ clock_gettime64
 clock_nanosleep
 clock_nanosleep_time64
 clone
+clone3
 close
+close_range
 
 # needed by ls -l
 connect
@@ -145,6 +147,7 @@ fork
 ftime
 futex
 futex_time64
+futex_waitv
 get_mempolicy
 get_robust_list
 get_thread_area
@@ -197,7 +200,18 @@ inotify_rm_watch
 # input (man tty_ioctl), so we disallow it to prevent snaps plugging interfaces
 # with 'capability sys_admin' from interfering with other snaps or the
 # unconfined user's terminal.
+# similarly, TIOCLINUX allows to fake input as well (man ioctl_console) so
+# disallow that too
 # TODO: this should be scaled back even more
+~ioctl - TIOCSTI
+~ioctl - TIOCLINUX
+# restrict argument otherwise will match all uses of ioctl() and allow the rules
+# that were disallowed above
+# TODO: Fix the need to keep TIOCLINUX here - the issue is a unrestricted
+#       allow for "ioctl" here makes libseccomp "optimize" the deny rules
+#       above away and the generated bpf becomes just "allow ioctl".
+#       We should fix this by creating a way to make "AND" rules, so
+#       this becomes "ioctl - !TIOCSTI&&!TIOCLINUX" and remove the "~" again.
 ioctl - !TIOCSTI
 
 io_cancel
@@ -214,6 +228,10 @@ ioprio_get
 
 ipc
 kill
+# kcmp is guarded in the kernel via ptrace with PTRACE_MODE_READ_REALCREDS
+# such that the calling process must already be able to ptrace the target
+# processes and so this is safe.
+kcmp - - KCMP_FILE
 link
 linkat
 
@@ -255,16 +273,6 @@ mknodat - - |S_IFSOCK -
 
 modify_ldt
 mprotect
-
-# LP: #1448184 - these aren't currently mediated by AppArmor. Deny for now
-#mq_getsetattr
-#mq_notify
-#mq_open
-#mq_timedreceive
-#mq_timedreceive_time64
-#mq_timedsend
-#mq_timedsend_time64
-#mq_unlink
 
 mremap
 msgctl
@@ -342,6 +350,10 @@ renameat2
 restart_syscall
 
 rmdir
+
+# glibc 2.35 unconditionally calls rseq for all threads
+rseq
+
 rt_sigaction
 rt_sigpending
 rt_sigprocmask
@@ -447,6 +459,7 @@ socket AF_LOCAL
 socket AF_INET
 socket AF_INET6
 socket AF_IPX
+socket AF_XDP
 socket AF_X25
 socket AF_AX25
 socket AF_ATMPVC
@@ -480,6 +493,7 @@ socket AF_NFC
 socket AF_VSOCK
 socket AF_MPLS
 socket AF_IB
+socket AF_QIPCRTR
 
 # For usrsctp, AppArmor doesn't support 'network conn,' since AF_CONN is
 # userspace and encapsulated in other domains that are mediated. As such, do
@@ -697,14 +711,19 @@ setresuid32 u:root u:root -1
 // Template for privilege drop and chown operations. This intentionally does
 // not support all combinations of users or obscure combinations (we can add
 // combinations as users dictate). Eg, these are supported:
-//   chown foo:foo
-//   chown foo
-//   chgrp foo
+//
+//	chown foo:foo
+//	chown foo
+//	chgrp foo
+//
 // but these are not:
-//   chown foo:bar
-//   chown bar:foo
+//
+//	chown foo:bar
+//	chown bar:foo
+//
 // For now, users who want 'foo:bar' can do:
-//   chown foo ; chgrp bar
+//
+//	chown foo ; chgrp bar
 var privDropAndChownSyscalls = `
 # allow setgid to ###GROUP###
 setgid g:###GROUP###

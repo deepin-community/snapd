@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2015-2021 Canonical Ltd
+ * Copyright (C) 2015-2023 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -27,11 +27,16 @@ import (
 	"time"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
+	"github.com/snapcore/snapd/osutil/disks"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/timings"
 )
 
@@ -51,6 +56,7 @@ type debugAction struct {
 
 		RecoverySystemLabel string `json:"recovery-system-label"`
 	} `json:"params"`
+	Snaps []string `json:"snaps"`
 }
 
 type connectivityStatus struct {
@@ -65,7 +71,8 @@ func getBaseDeclaration(st *state.State) Response {
 	}
 	return SyncResponse(map[string]interface{}{
 		"base-declaration": string(asserts.Encode(bd)),
-	}, nil)
+	})
+
 }
 
 func checkConnectivity(st *state.State) Response {
@@ -85,7 +92,7 @@ func checkConnectivity(st *state.State) Response {
 	}
 	sort.Strings(status.Unreachable)
 
-	return SyncResponse(status, nil)
+	return SyncResponse(status)
 }
 
 type changeTimings struct {
@@ -240,7 +247,7 @@ func getChangeTimings(st *state.State, changeID, ensureTag, startupTag string, a
 		if err != nil {
 			return BadRequest(err.Error())
 		}
-		return SyncResponse(responseData, nil)
+		return SyncResponse(responseData)
 	}
 
 	if startupTag != "" {
@@ -248,7 +255,7 @@ func getChangeTimings(st *state.State, changeID, ensureTag, startupTag string, a
 		if err != nil {
 			return BadRequest(err.Error())
 		}
-		return SyncResponse(responseData, nil)
+		return SyncResponse(responseData)
 	}
 
 	// timings for single change ID
@@ -263,7 +270,90 @@ func getChangeTimings(st *state.State, changeID, ensureTag, startupTag string, a
 			ChangeTimings: changeTimings,
 		},
 	}
-	return SyncResponse(responseData, nil)
+	return SyncResponse(responseData)
+}
+
+func getGadgetDiskMapping(st *state.State) Response {
+	deviceCtx, err := devicestate.DeviceCtx(st, nil, nil)
+	if err != nil {
+		return InternalError("cannot get device context: %v", err)
+	}
+	gadgetInfo, err := snapstate.GadgetInfo(st, deviceCtx)
+	if err != nil {
+		return InternalError("cannot get gadget info: %v", err)
+	}
+	gadgetDir := gadgetInfo.MountDir()
+
+	kernelInfo, err := snapstate.KernelInfo(st, deviceCtx)
+	if err != nil {
+		return InternalError("cannot get kernel info: %v", err)
+	}
+	kernelDir := kernelInfo.MountDir()
+
+	mod := deviceCtx.Model()
+
+	// Find out if we are encrypted
+	encType := secboot.EncryptionTypeNone
+	sealingMethod, err := device.SealedKeysMethod(dirs.GlobalRootDir)
+	if err != nil {
+		if err != device.ErrNoSealedKeys {
+			return InternalError("cannot find out crypto state: %v", err)
+		}
+		// no sealed keys, so no encryption
+	} else {
+		// TODO: is there a better way to find the encType
+		// than indirectly via the sealedKeyMethods? does not
+		// matter right now because there really is only one
+		// encryption type
+		switch sealingMethod {
+		case device.SealingMethodLegacyTPM, device.SealingMethodTPM, device.SealingMethodFDESetupHook:
+			// LUKS and LUKS-with-ICE are the same for what is
+			// required here
+			encType = secboot.EncryptionTypeLUKS
+		default:
+			return InternalError("unknown sealing method: %s", sealingMethod)
+		}
+	}
+
+	_, allLaidOutVols, err := gadget.LaidOutVolumesFromGadget(gadgetDir, kernelDir, mod, encType)
+	if err != nil {
+		return InternalError("cannot get all disk volume device traits: cannot layout volumes: %v", err)
+	}
+
+	// TODO: allow passing in encrypted options info here
+
+	// allow implicit system-data on pre-uc20 only
+	optsMap := map[string]*gadget.DiskVolumeValidationOptions{}
+	for vol := range allLaidOutVols {
+		optsMap[vol] = &gadget.DiskVolumeValidationOptions{
+			AllowImplicitSystemData: mod.Grade() == asserts.ModelGradeUnset,
+		}
+	}
+
+	res, err := gadget.AllDiskVolumeDeviceTraits(allLaidOutVols, optsMap)
+	if err != nil {
+		return InternalError("cannot get all disk volume device traits: %v", err)
+	}
+
+	return SyncResponse(res)
+}
+
+func getDisks(st *state.State) Response {
+
+	disks, err := disks.AllPhysicalDisks()
+	if err != nil {
+		return InternalError("cannot get all physical disks: %v", err)
+	}
+	vols := make([]*gadget.OnDiskVolume, 0, len(disks))
+	for _, d := range disks {
+		vol, err := gadget.OnDiskVolumeFromDisk(d)
+		if err != nil {
+			return InternalError("cannot get on disk volume for device %s: %v", d.KernelDeviceNode(), err)
+		}
+		vols = append(vols, vol)
+	}
+
+	return SyncResponse(vols)
 }
 
 func createRecovery(st *state.State, label string) Response {
@@ -275,7 +365,7 @@ func createRecovery(st *state.State, label string) Response {
 		return InternalError("cannot create recovery system %q: %v", label, err)
 	}
 	ensureStateSoon(st)
-	return AsyncResponse(nil, &Meta{Change: chg.ID()})
+	return AsyncResponse(nil, chg.ID())
 }
 
 func getDebug(c *Command, r *http.Request, user *auth.UserState) Response {
@@ -296,7 +386,8 @@ func getDebug(c *Command, r *http.Request, user *auth.UserState) Response {
 		}
 		return SyncResponse(map[string]interface{}{
 			"model": string(asserts.Encode(model)),
-		}, nil)
+		})
+
 	case "change-timings":
 		chgID := query.Get("change-id")
 		ensureTag := query.Get("ensure")
@@ -305,6 +396,10 @@ func getDebug(c *Command, r *http.Request, user *auth.UserState) Response {
 		return getChangeTimings(st, chgID, ensureTag, startupTag, all == "true")
 	case "seeding":
 		return getSeedingInfo(st)
+	case "gadget-disk-mapping":
+		return getGadgetDiskMapping(st)
+	case "disks":
+		return getDisks(st)
 	default:
 		return BadRequest("unknown debug aspect %q", aspect)
 	}
@@ -324,26 +419,28 @@ func postDebug(c *Command, r *http.Request, user *auth.UserState) Response {
 	switch a.Action {
 	case "add-warning":
 		st.Warnf("%v", a.Message)
-		return SyncResponse(true, nil)
+		return SyncResponse(true)
 	case "unshow-warnings":
 		st.UnshowAllWarnings()
-		return SyncResponse(true, nil)
+		return SyncResponse(true)
 	case "ensure-state-soon":
 		ensureStateSoon(st)
-		return SyncResponse(true, nil)
+		return SyncResponse(true)
 	case "can-manage-refreshes":
-		return SyncResponse(devicestate.CanManageRefreshes(st), nil)
+		return SyncResponse(devicestate.CanManageRefreshes(st))
 	case "prune":
 		opTime, err := c.d.overlord.DeviceManager().StartOfOperationTime()
 		if err != nil {
 			return BadRequest("cannot get start of operation time: %s", err)
 		}
 		st.Prune(opTime, 0, 0, 0)
-		return SyncResponse(true, nil)
+		return SyncResponse(true)
 	case "stacktraces":
 		return getStacktraces()
 	case "create-recovery-system":
 		return createRecovery(st, a.Params.RecoverySystemLabel)
+	case "migrate-home":
+		return migrateHome(st, a.Snaps)
 	default:
 		return BadRequest("unknown debug action: %v", a.Action)
 	}

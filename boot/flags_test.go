@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2021 Canonical Ltd
+ * Copyright (C) 2022 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -25,13 +25,15 @@ import (
 	"os"
 	"path/filepath"
 
+	. "gopkg.in/check.v1"
+
 	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/boot/boottest"
 	"github.com/snapcore/snapd/bootloader"
 	"github.com/snapcore/snapd/bootloader/grubenv"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/testutil"
-	. "gopkg.in/check.v1"
 )
 
 type bootFlagsSuite struct {
@@ -48,13 +50,13 @@ func (s *bootFlagsSuite) TestBootFlagsFamilyClassic(c *C) {
 	defer bootloader.ForceError(nil)
 
 	_, err := boot.NextBootFlags(classicDev)
-	c.Assert(err, ErrorMatches, "cannot get boot flags on non-UC20 device")
+	c.Assert(err, ErrorMatches, `cannot get boot flags on pre-UC20 device`)
 
 	err = boot.SetNextBootFlags(classicDev, "", []string{"foo"})
-	c.Assert(err, ErrorMatches, "cannot get boot flags on non-UC20 device")
+	c.Assert(err, ErrorMatches, `cannot get boot flags on pre-UC20 device`)
 
 	_, err = boot.BootFlags(classicDev)
-	c.Assert(err, ErrorMatches, "cannot get boot flags on non-UC20 device")
+	c.Assert(err, ErrorMatches, `cannot get boot flags on pre-UC20 device`)
 }
 
 func (s *bootFlagsSuite) TestBootFlagsFamilyUC16(c *C) {
@@ -65,13 +67,13 @@ func (s *bootFlagsSuite) TestBootFlagsFamilyUC16(c *C) {
 	defer bootloader.ForceError(nil)
 
 	_, err := boot.NextBootFlags(coreDev)
-	c.Assert(err, ErrorMatches, "cannot get boot flags on non-UC20 device")
+	c.Assert(err, ErrorMatches, `cannot get boot flags on pre-UC20 device`)
 
 	err = boot.SetNextBootFlags(coreDev, "", []string{"foo"})
-	c.Assert(err, ErrorMatches, "cannot get boot flags on non-UC20 device")
+	c.Assert(err, ErrorMatches, `cannot get boot flags on pre-UC20 device`)
 
 	_, err = boot.BootFlags(coreDev)
-	c.Assert(err, ErrorMatches, "cannot get boot flags on non-UC20 device")
+	c.Assert(err, ErrorMatches, `cannot get boot flags on pre-UC20 device`)
 }
 
 func setupRealGrub(c *C, rootDir, baseDir string, opts *bootloader.Options) bootloader.Bootloader {
@@ -106,7 +108,7 @@ func (s *bootFlagsSuite) TestInitramfsActiveBootFlagsUC20InstallModeHappy(c *C) 
 
 	setupRealGrub(c, blDir, "EFI/ubuntu", &bootloader.Options{Role: bootloader.RoleRecovery})
 
-	flags, err := boot.InitramfsActiveBootFlags(boot.ModeInstall)
+	flags, err := boot.InitramfsActiveBootFlags(boot.ModeInstall, filepath.Join(dirs.GlobalRootDir, "/run/mnt/data/system-data"))
 	c.Assert(err, IsNil)
 	c.Assert(flags, HasLen, 0)
 
@@ -116,7 +118,35 @@ func (s *bootFlagsSuite) TestInitramfsActiveBootFlagsUC20InstallModeHappy(c *C) 
 	err = boot.SetBootFlagsInBootloader([]string{"factory"}, blDir)
 	c.Assert(err, IsNil)
 
-	flags, err = boot.InitramfsActiveBootFlags(boot.ModeInstall)
+	flags, err = boot.InitramfsActiveBootFlags(boot.ModeInstall, filepath.Join(dirs.GlobalRootDir, "/run/mnt/data/system-data"))
+	c.Assert(err, IsNil)
+	c.Assert(flags, DeepEquals, []string{"factory"})
+}
+
+func (s *bootFlagsSuite) TestInitramfsActiveBootFlagsUC20FactoryResetModeHappy(c *C) {
+	// FactoryReset and Install run identical code, as their condition match pretty closely
+	// so this unit test is to reconfirm that we expect same behavior as we see in the unit
+	// test for install mode.
+	dir := c.MkDir()
+
+	dirs.SetRootDir(dir)
+	defer func() { dirs.SetRootDir("") }()
+
+	blDir := boot.InitramfsUbuntuSeedDir
+
+	setupRealGrub(c, blDir, "EFI/ubuntu", &bootloader.Options{Role: bootloader.RoleRecovery})
+
+	flags, err := boot.InitramfsActiveBootFlags(boot.ModeFactoryReset, filepath.Join(dirs.GlobalRootDir, "/run/mnt/data/system-data"))
+	c.Assert(err, IsNil)
+	c.Assert(flags, HasLen, 0)
+
+	// if we set some flags via ubuntu-image customizations then we get them
+	// back
+
+	err = boot.SetBootFlagsInBootloader([]string{"factory"}, blDir)
+	c.Assert(err, IsNil)
+
+	flags, err = boot.InitramfsActiveBootFlags(boot.ModeFactoryReset, filepath.Join(dirs.GlobalRootDir, "/run/mnt/data/system-data"))
 	c.Assert(err, IsNil)
 	c.Assert(flags, DeepEquals, []string{"factory"})
 }
@@ -156,13 +186,13 @@ func (s *bootFlagsSuite) TestInitramfsActiveBootFlagsUC20RecoverModeNoop(c *C) {
 		BootFlags: []string{},
 	}
 
-	err := os.MkdirAll(boot.InitramfsWritableDir, 0755)
+	err := os.MkdirAll(filepath.Join(dirs.GlobalRootDir, "/run/mnt/data/system-data"), 0755)
 	c.Assert(err, IsNil)
 
-	err = m.WriteTo(boot.InitramfsWritableDir)
+	err = m.WriteTo(filepath.Join(dirs.GlobalRootDir, "/run/mnt/data/system-data"))
 	c.Assert(err, IsNil)
 
-	flags, err := boot.InitramfsActiveBootFlags(boot.ModeRecover)
+	flags, err := boot.InitramfsActiveBootFlags(boot.ModeRecover, filepath.Join(dirs.GlobalRootDir, "/run/mnt/data/system-data"))
 	c.Assert(err, IsNil)
 	c.Assert(flags, HasLen, 0)
 
@@ -170,16 +200,16 @@ func (s *bootFlagsSuite) TestInitramfsActiveBootFlagsUC20RecoverModeNoop(c *C) {
 	c.Assert(err, IsNil)
 
 	m.BootFlags = []string{"modeenv-boot-flag"}
-	err = m.WriteTo(boot.InitramfsWritableDir)
+	err = m.WriteTo(filepath.Join(dirs.GlobalRootDir, "/run/mnt/data/system-data"))
 	c.Assert(err, IsNil)
 
 	// still no flags since we are in recovery mode
-	flags, err = boot.InitramfsActiveBootFlags(boot.ModeRecover)
+	flags, err = boot.InitramfsActiveBootFlags(boot.ModeRecover, filepath.Join(dirs.GlobalRootDir, "/run/mnt/data/system-data"))
 	c.Assert(err, IsNil)
 	c.Assert(flags, HasLen, 0)
 }
 
-func (s *bootFlagsSuite) TestInitramfsActiveBootFlagsUC20RRunModeHappy(c *C) {
+func (s *bootFlagsSuite) testInitramfsActiveBootFlagsUC20RRunModeHappy(c *C, flagsDir string) {
 	dir := c.MkDir()
 
 	dirs.SetRootDir(dir)
@@ -191,24 +221,29 @@ func (s *bootFlagsSuite) TestInitramfsActiveBootFlagsUC20RRunModeHappy(c *C) {
 		BootFlags: []string{},
 	}
 
-	err := os.MkdirAll(boot.InitramfsWritableDir, 0755)
+	err := os.MkdirAll(flagsDir, 0755)
 	c.Assert(err, IsNil)
 
-	err = m.WriteTo(boot.InitramfsWritableDir)
+	err = m.WriteTo(flagsDir)
 	c.Assert(err, IsNil)
 
-	flags, err := boot.InitramfsActiveBootFlags(boot.ModeRun)
+	flags, err := boot.InitramfsActiveBootFlags(boot.ModeRun, flagsDir)
 	c.Assert(err, IsNil)
 	c.Assert(flags, HasLen, 0)
 
 	m.BootFlags = []string{"factory", "other-flag"}
-	err = m.WriteTo(boot.InitramfsWritableDir)
+	err = m.WriteTo(flagsDir)
 	c.Assert(err, IsNil)
 
 	// now some flags after we set them in the modeenv
-	flags, err = boot.InitramfsActiveBootFlags(boot.ModeRun)
+	flags, err = boot.InitramfsActiveBootFlags(boot.ModeRun, flagsDir)
 	c.Assert(err, IsNil)
 	c.Assert(flags, DeepEquals, []string{"factory", "other-flag"})
+}
+
+func (s *bootFlagsSuite) TestInitramfsActiveBootFlagsUC20RRunModeHappy(c *C) {
+	s.testInitramfsActiveBootFlagsUC20RRunModeHappy(c, filepath.Join(dirs.GlobalRootDir, "/run/mnt/data/system-data"))
+	s.testInitramfsActiveBootFlagsUC20RRunModeHappy(c, c.MkDir())
 }
 
 func (s *bootFlagsSuite) TestInitramfsSetBootFlags(c *C) {
@@ -331,8 +366,12 @@ func (s *bootFlagsSuite) TestUserspaceBootFlagsUC20(c *C) {
 }
 
 func (s *bootFlagsSuite) TestRunModeRootfs(c *C) {
+	uc20Dev := boottest.MockUC20Device("run", nil)
+	classicModesDev := boottest.MockClassicWithModesDevice("run", nil)
+
 	tt := []struct {
 		mode               string
+		dev                snap.Device
 		createExpDirs      bool
 		expDirs            []string
 		noExpDirRootPrefix bool
@@ -342,21 +381,67 @@ func (s *bootFlagsSuite) TestRunModeRootfs(c *C) {
 	}{
 		{
 			mode:    boot.ModeRun,
+			dev:     uc20Dev,
 			expDirs: []string{"/run/mnt/data", ""},
 			comment: "run mode",
 		},
 		{
+			mode:    boot.ModeRun,
+			dev:     classicModesDev,
+			expDirs: []string{"/run/mnt/data", ""},
+			comment: "run mode (classic)",
+		},
+		{
 			mode:    boot.ModeInstall,
+			dev:     uc20Dev,
 			comment: "install mode before partition creation",
 		},
 		{
+			mode:    boot.ModeInstall,
+			dev:     classicModesDev,
+			comment: "install mode before partition creation (classic)",
+		},
+		{
+			mode:    boot.ModeFactoryReset,
+			dev:     uc20Dev,
+			comment: "factory-reset mode before partition is recreated",
+		},
+		{
+			mode:    boot.ModeFactoryReset,
+			dev:     uc20Dev,
+			comment: "factory-reset mode before partition is recreated (classic)",
+		},
+		{
 			mode:          boot.ModeInstall,
+			dev:           uc20Dev,
 			expDirs:       []string{"/run/mnt/ubuntu-data"},
 			createExpDirs: true,
 			comment:       "install mode after partition creation",
 		},
 		{
+			mode:          boot.ModeInstall,
+			dev:           classicModesDev,
+			expDirs:       []string{"/run/mnt/ubuntu-data"},
+			createExpDirs: true,
+			comment:       "install mode after partition creation (classic)",
+		},
+		{
+			mode:          boot.ModeFactoryReset,
+			dev:           uc20Dev,
+			expDirs:       []string{"/run/mnt/ubuntu-data"},
+			createExpDirs: true,
+			comment:       "factory-reset mode after partition creation",
+		},
+		{
+			mode:          boot.ModeFactoryReset,
+			dev:           classicModesDev,
+			expDirs:       []string{"/run/mnt/ubuntu-data"},
+			createExpDirs: true,
+			comment:       "factory-reset mode after partition creation (classic)",
+		},
+		{
 			mode: boot.ModeRecover,
+			dev:  uc20Dev,
 			degradedJSON: `
 			{
 				"ubuntu-data": {
@@ -371,6 +456,7 @@ func (s *bootFlagsSuite) TestRunModeRootfs(c *C) {
 		},
 		{
 			mode: boot.ModeRecover,
+			dev:  uc20Dev,
 			degradedJSON: `
 			{
 				"ubuntu-data": {
@@ -385,6 +471,7 @@ func (s *bootFlagsSuite) TestRunModeRootfs(c *C) {
 		},
 		{
 			mode: boot.ModeRecover,
+			dev:  uc20Dev,
 			degradedJSON: `
 			{
 				"ubuntu-data": {
@@ -396,6 +483,7 @@ func (s *bootFlagsSuite) TestRunModeRootfs(c *C) {
 		},
 		{
 			mode: boot.ModeRecover,
+			dev:  uc20Dev,
 			degradedJSON: `
 			{
 				"ubuntu-data": {
@@ -407,6 +495,7 @@ func (s *bootFlagsSuite) TestRunModeRootfs(c *C) {
 		},
 		{
 			mode: boot.ModeRecover,
+			dev:  uc20Dev,
 			degradedJSON: `
 			{
 				"ubuntu-data": {
@@ -418,6 +507,7 @@ func (s *bootFlagsSuite) TestRunModeRootfs(c *C) {
 		},
 		{
 			mode: boot.ModeRecover,
+			dev:  uc20Dev,
 			degradedJSON: `
 			{
 				"ubuntu-data": {
@@ -429,6 +519,7 @@ func (s *bootFlagsSuite) TestRunModeRootfs(c *C) {
 		},
 		{
 			mode:    "",
+			dev:     uc20Dev,
 			err:     "system mode is unsupported",
 			comment: "unsupported system mode",
 		},
@@ -455,7 +546,7 @@ func (s *bootFlagsSuite) TestRunModeRootfs(c *C) {
 			}
 		}
 
-		dataMountDirs, err := boot.HostUbuntuDataForMode(t.mode)
+		dataMountDirs, err := boot.HostUbuntuDataForMode(t.mode, t.dev.Model())
 		if t.err != "" {
 			c.Assert(err, ErrorMatches, t.err, comment)
 			c.Assert(dataMountDirs, IsNil)

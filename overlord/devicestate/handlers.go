@@ -19,6 +19,7 @@
 package devicestate
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"time"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 )
@@ -53,7 +55,7 @@ func (m *DeviceManager) doMarkPreseeded(t *state.Task, _ *tomb.Tomb) error {
 		// EnsureBefore(0) done somewhere else.
 		// XXX: we should probably drop the flag from the task now that we have
 		// one on the state.
-		if err := t.Get("preseeded", &preseeded); err != nil && err != state.ErrNoState {
+		if err := t.Get("preseeded", &preseeded); err != nil && !errors.Is(err, state.ErrNoState) {
 			return err
 		}
 		if !preseeded {
@@ -78,7 +80,7 @@ func (m *DeviceManager) doMarkPreseeded(t *state.Task, _ *tomb.Tomb) error {
 
 			// do not mark this task done as this makes it racy against taskrunner tear down (the next task
 			// could start). Let this task finish after snapd restart when preseed mode is off.
-			st.RequestRestart(state.StopDaemon)
+			restart.Request(st, restart.StopDaemon, nil)
 		}
 
 		return &state.Retry{Reason: "mark-preseeded will be marked done when snapd is executed in normal mode"}
@@ -109,11 +111,29 @@ type seededSystem struct {
 	SeedTime time.Time `json:"seed-time"`
 }
 
+func (s *seededSystem) sameAs(other *seededSystem) bool {
+	// in theory the system labels are unique, however be extra paranoid and
+	// check all model related fields too
+	return s.System == other.System &&
+		s.Model == other.Model &&
+		s.BrandID == other.BrandID &&
+		s.Revision == other.Revision
+}
+
 func (m *DeviceManager) recordSeededSystem(st *state.State, whatSeeded *seededSystem) error {
 	var seeded []seededSystem
-	if err := st.Get("seeded-systems", &seeded); err != nil && err != state.ErrNoState {
+	if err := st.Get("seeded-systems", &seeded); err != nil && !errors.Is(err, state.ErrNoState) {
 		return err
 	}
+	for _, sys := range seeded {
+		if sys.sameAs(whatSeeded) {
+			return nil
+		}
+	}
+	// contrary to the usual approach of appending new entries to the list
+	// like we do with modeenv, the recently seeded system is added at the
+	// front, as it is not considered candidate like for the other entries,
+	// but rather it describes the currently existing
 	seeded = append([]seededSystem{*whatSeeded}, seeded...)
 	st.Set("seeded-systems", seeded)
 	return nil
@@ -151,14 +171,12 @@ func (m *DeviceManager) doMarkSeeded(t *state.Task, _ *tomb.Tomb) error {
 
 	now := time.Now()
 	var whatSeeded *seededSystem
-	if err := t.Get("seed-system", &whatSeeded); err != nil && err != state.ErrNoState {
+	if err := t.Get("seed-system", &whatSeeded); err != nil && !errors.Is(err, state.ErrNoState) {
 		return err
 	}
 	if whatSeeded != nil && deviceCtx.RunMode() {
 		// record what seeded in the state only when in run mode
-
 		whatSeeded.SeedTime = now
-		// TODO:UC20 what about remodels?
 		if err := m.recordSeededSystem(st, whatSeeded); err != nil {
 			return fmt.Errorf("cannot record the seeded system: %v", err)
 		}

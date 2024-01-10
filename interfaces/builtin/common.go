@@ -33,11 +33,11 @@ import (
 	"github.com/snapcore/snapd/snap"
 )
 
-// evalSymlinks is either filepath.EvalSymlinks or a mocked function for
+// evalSymlinks is either filepath.EvalSymlinks or a mocked function
 // applicable for testing.
 var evalSymlinks = filepath.EvalSymlinks
 
-// readDir is either ioutil.ReadDir or a mocked function for applicable for
+// readDir is either ioutil.ReadDir or a mocked function applicable for
 // testing.
 var readDir = ioutil.ReadDir
 
@@ -48,6 +48,8 @@ type commonInterface struct {
 
 	implicitOnCore    bool
 	implicitOnClassic bool
+
+	affectsPlugOnRefresh bool
 
 	baseDeclarationPlugs string
 	baseDeclarationSlots string
@@ -65,9 +67,12 @@ type commonInterface struct {
 	permanentPlugKModModules []string
 	permanentSlotKModModules []string
 
-	usesPtraceTrace      bool
-	suppressPtraceTrace  bool
-	suppressHomeIx       bool
+	usesPtraceTrace             bool
+	suppressPtraceTrace         bool
+	suppressHomeIx              bool
+	usesSysModuleCapability     bool
+	suppressSysModuleCapability bool
+
 	controlsDeviceCgroup bool
 
 	serviceSnippets []string
@@ -87,6 +92,8 @@ func (iface *commonInterface) StaticInfo() interfaces.StaticInfo {
 		ImplicitOnClassic:    iface.implicitOnClassic,
 		BaseDeclarationPlugs: iface.baseDeclarationPlugs,
 		BaseDeclarationSlots: iface.baseDeclarationSlots,
+		// affects the plug snap because of mount backend
+		AffectsPlugOnRefresh: iface.affectsPlugOnRefresh,
 	}
 }
 
@@ -103,6 +110,11 @@ func (iface *commonInterface) AppArmorConnectedPlug(spec *apparmor.Specification
 	if iface.suppressHomeIx {
 		spec.SetSuppressHomeIx()
 	}
+	if iface.usesSysModuleCapability {
+		spec.SetUsesSysModuleCapability()
+	} else if iface.suppressSysModuleCapability {
+		spec.SetSuppressSysModuleCapability()
+	}
 	if snippet := iface.connectedPlugAppArmor; snippet != "" {
 		spec.AddSnippet(snippet)
 	}
@@ -113,7 +125,7 @@ func (iface *commonInterface) AppArmorConnectedPlug(spec *apparmor.Specification
 }
 
 // AutoConnect returns whether plug and slot should be implicitly
-// auto-connected assuming they will be an unambiguous connection
+// auto-connected assuming there will be an unambiguous connection
 // candidate and declaration-based checks allow.
 //
 // By default we allow what declarations allowed.
@@ -174,7 +186,7 @@ func (iface *commonInterface) SecCompConnectedPlug(spec *seccomp.Specification, 
 }
 
 func (iface *commonInterface) UDevConnectedPlug(spec *udev.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
-	// don't tag devices if the interface controls it's own device cgroup
+	// don't tag devices if the interface controls its own device cgroup
 	if iface.controlsDeviceCgroup {
 		spec.SetControlsDeviceCgroup()
 	} else {

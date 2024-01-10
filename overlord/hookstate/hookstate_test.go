@@ -37,6 +37,7 @@ import (
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/hookstate/hooktest"
+	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
@@ -60,6 +61,10 @@ type baseHookManagerSuite struct {
 	command     *testutil.MockCmd
 }
 
+var (
+	settleTimeout = testutil.HostScaledTimeout(15 * time.Second)
+)
+
 func (s *baseHookManagerSuite) commonSetUpTest(c *C) {
 	s.BaseTest.SetUpTest(c)
 
@@ -70,6 +75,10 @@ func (s *baseHookManagerSuite) commonSetUpTest(c *C) {
 	dirs.SetRootDir(c.MkDir())
 	s.o = overlord.Mock()
 	s.state = s.o.State()
+	s.state.Lock()
+	_, err := restart.Manager(s.state, "boot-id-0", nil)
+	s.state.Unlock()
+	c.Assert(err, IsNil)
 	manager, err := hookstate.Manager(s.state, s.o.TaskRunner())
 	c.Assert(err, IsNil)
 	s.manager = manager
@@ -174,7 +183,7 @@ func (s *hookManagerSuite) TearDownTest(c *C) {
 }
 
 func (s *hookManagerSuite) settle(c *C) {
-	err := s.o.Settle(5 * time.Second)
+	err := s.o.Settle(settleTimeout)
 	c.Assert(err, IsNil)
 }
 
@@ -265,7 +274,9 @@ func (s *hookManagerSuite) TestHookTaskEnsure(c *C) {
 
 func (s *hookManagerSuite) TestHookTaskEnsureRestarting(c *C) {
 	// we do no start new hooks runs if we are restarting
-	s.state.RequestRestart(state.RestartDaemon)
+	s.state.Lock()
+	restart.MockPending(s.state, restart.RestartDaemon)
+	s.state.Unlock()
 
 	s.se.Ensure()
 	s.se.Wait()
@@ -434,6 +445,33 @@ func (s *hookManagerSuite) TestHookTaskHandleIgnoreErrorWorks(c *C) {
 	c.Check(s.task.Status(), Equals, state.DoneStatus)
 	c.Check(s.change.Status(), Equals, state.DoneStatus)
 	checkTaskLogContains(c, s.task, ".*ignoring failure in hook.*")
+}
+
+func (s *hookManagerSuite) TestHookTaskHandlesHookErrorAndIgnoresIt(c *C) {
+	// tell the mock handler to return 'true' from its Error() handler,
+	// indicating to the hookmgr to ignore the original hook error.
+	s.mockHandler.IgnoreOriginalErr = true
+
+	// Simulate hook error
+	cmd := testutil.MockCommand(
+		c, "snap", ">&2 echo 'hook failed at user request'; exit 1")
+	defer cmd.Restore()
+
+	s.se.Ensure()
+	s.se.Wait()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	c.Check(s.mockHandler.BeforeCalled, Equals, true)
+	c.Check(s.mockHandler.DoneCalled, Equals, false)
+	c.Check(s.mockHandler.ErrorCalled, Equals, true)
+
+	c.Check(s.task.Kind(), Equals, "run-hook")
+	c.Check(s.task.Status(), Equals, state.DoneStatus)
+	c.Check(s.change.Status(), Equals, state.DoneStatus)
+
+	c.Check(s.manager.NumRunningHooks(), Equals, 0)
 }
 
 func (s *hookManagerSuite) TestHookTaskEnforcesTimeout(c *C) {
@@ -1016,8 +1054,8 @@ func (h *MockConcurrentHandler) Done() error {
 	return nil
 }
 
-func (h *MockConcurrentHandler) Error(err error) error {
-	return nil
+func (h *MockConcurrentHandler) Error(err error) (bool, error) {
+	return false, nil
 }
 
 func NewMockConcurrentHandler(onDone func()) *MockConcurrentHandler {

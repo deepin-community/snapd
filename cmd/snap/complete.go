@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016 Canonical Ltd
+ * Copyright (C) 2016-2021 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -28,7 +28,7 @@ import (
 
 	"github.com/jessevdk/go-flags"
 
-	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/signtool"
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/i18n"
@@ -185,18 +185,25 @@ func (n assertTypeName) Complete(match string) []flags.Completion {
 type keyName string
 
 func (s keyName) Complete(match string) []flags.Completion {
-	var res []flags.Completion
-	asserts.NewGPGKeypairManager().Walk(func(_ asserts.PrivateKey, _ string, uid string) error {
-		if strings.HasPrefix(uid, match) {
-			res = append(res, flags.Completion{Item: uid})
-		}
+	keypairManager, err := signtool.GetKeypairManager()
+	if err != nil {
 		return nil
-	})
+	}
+	keys, err := keypairManager.List()
+	if err != nil {
+		return nil
+	}
+	var res []flags.Completion
+	for _, k := range keys {
+		if strings.HasPrefix(k.Name, match) {
+			res = append(res, flags.Completion{Item: k.Name})
+		}
+	}
 	return res
 }
 
 type disconnectSlotOrPlugSpec struct {
-	SnapAndName
+	SnapAndNameStrict
 }
 
 func (dps disconnectSlotOrPlugSpec) Complete(match string) []flags.Completion {
@@ -211,7 +218,7 @@ func (dps disconnectSlotOrPlugSpec) Complete(match string) []flags.Completion {
 }
 
 type disconnectSlotSpec struct {
-	SnapAndName
+	SnapAndNameStrict
 }
 
 // TODO: look at what the previous arg is, and filter accordingly
@@ -431,6 +438,15 @@ func (s appName) Complete(match string) []flags.Completion {
 }
 
 type serviceName string
+
+func serviceNames(services []serviceName) []string {
+	names := make([]string, len(services))
+	for i, name := range services {
+		names[i] = string(name)
+	}
+
+	return names
+}
 
 func (s serviceName) Complete(match string) []flags.Completion {
 	cli := mkClient()

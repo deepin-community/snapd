@@ -30,10 +30,9 @@ import (
 //
 // Existing hooks (i.e. ones defined in the YAML) are not changed; only missing
 // hooks are added.
-func addImplicitHooks(snapInfo *Info) error {
+func addImplicitHooks(snapInfo *Info, hooksDir string) error {
 	// First of all, check to ensure the hooks directory exists. If it doesn't,
 	// it's not an error-- there's just nothing to do.
-	hooksDir := snapInfo.HooksDir()
 	if !osutil.IsDirectory(hooksDir) {
 		return nil
 	}
@@ -54,20 +53,18 @@ func addImplicitHooks(snapInfo *Info) error {
 //
 // Existing hooks (i.e. ones defined in the YAML) are not changed; only missing
 // hooks are added.
-func addImplicitHooksFromContainer(snapInfo *Info, snapf Container) error {
+func addImplicitHooksFromContainer(snapInfo *Info, snapf Container) {
 	// Read the hooks directory. If this fails we assume the hooks directory
 	// doesn't exist, which means there are no implicit hooks to load (not an
 	// error).
 	fileNames, err := snapf.ListDir("meta/hooks")
 	if err != nil {
-		return nil
+		return
 	}
 
 	for _, fileName := range fileNames {
 		addHookIfValid(snapInfo, fileName)
 	}
-
-	return nil
 }
 
 func addHookIfValid(snapInfo *Info, hookName string) {

@@ -30,6 +30,7 @@
 #include <sys/capability.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "../libsnap-confine-private/apparmor-support.h"
@@ -182,8 +183,8 @@ static void sc_restore_process_state(const sc_preserved_process_state *
 	 **/
 
 	/* Read the target of symlink at /proc/self/fd/<fd-of-orig-cwd> */
-	char fd_path[PATH_MAX];
-	char orig_cwd[PATH_MAX];
+	char fd_path[PATH_MAX] = {0};
+	char orig_cwd[PATH_MAX] = {0};
 	ssize_t nread;
 	/* If the original working directory cannot be used for whatever reason then
 	 * move the process to a special void directory. */
@@ -199,6 +200,7 @@ static void sc_restore_process_state(const sc_preserved_process_state *
 	if (nread == sizeof orig_cwd) {
 		die("cannot fit symbolic link target %s", fd_path);
 	}
+	orig_cwd[nread] = 0;
 
 	/* Open path corresponding to the original working directory in the
 	 * execution environment. This may normally fail if the path no longer
@@ -286,6 +288,17 @@ static void sc_restore_process_state(const sc_preserved_process_state *
 	debug("the process has been placed in the special void directory");
 }
 
+static void log_startup_stage(const char *stage)
+{
+	if (!sc_is_debug_enabled()) {
+		return;
+	}
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	debug("-- snap startup {\"stage\":\"%s\", \"time\":\"%lu.%06lu\"}",
+	      stage, tv.tv_sec, tv.tv_usec);
+}
+
 /**
  *  sc_cleanup_preserved_process_state releases system resources.
 **/
@@ -306,6 +319,7 @@ static void enter_non_classic_execution_environment(sc_invocation * inv,
 
 int main(int argc, char **argv)
 {
+	log_startup_stage("snap-confine enter");
 	// Use our super-defensive parser to figure out what we've been asked to do.
 	sc_error *err = NULL;
 	struct sc_args *args SC_CLEANUP(sc_cleanup_args) = NULL;
@@ -380,10 +394,14 @@ int main(int argc, char **argv)
 		// id is non-root.  This protects against, for example, unprivileged
 		// users trying to leverage the snap-confine in the core snap to
 		// escalate privileges.
+		errno = 0; // errno is insignificant here
 		die("snap-confine has elevated permissions and is not confined"
 		    " but should be. Refusing to continue to avoid"
-		    " permission escalation attacks");
+		    " permission escalation attacks\n"
+		    "Please make sure that the snapd.apparmor service is enabled and started.");
 	}
+
+	log_startup_stage("snap-confine mount namespace start");
 
 	/* perform global initialization of mount namespace support for non-classic
 	 * snaps or both classic and non-classic when parallel-instances feature is
@@ -427,6 +445,9 @@ int main(int argc, char **argv)
 							real_uid,
 							real_gid, saved_gid);
 	}
+
+	log_startup_stage("snap-confine mount namespace finish");
+
 	// Temporarily drop privileges back to the calling user until we can
 	// permanently drop (which we can't do just yet due to seccomp, see
 	// below).
@@ -539,6 +560,7 @@ int main(int argc, char **argv)
 	}
 	// Restore process state that was recorded earlier.
 	sc_restore_process_state(&proc_state);
+	log_startup_stage("snap-confine to snap-exec");
 	execv(invocation.executable, (char *const *)&argv[0]);
 	perror("execv failed");
 	return 1;
@@ -659,6 +681,12 @@ static void enter_non_classic_execution_environment(sc_invocation * inv,
 	inv->is_normal_mode = distro != SC_DISTRO_CORE16 ||
 	    !sc_streq(inv->orig_base_snap_name, "core");
 
+	/* Read the homedirs configuration: this information is needed both by our
+	 * namespace helper (in order to detect if the homedirs are mounted) and by
+	 * snap-confine itself to mount the homedirs.
+	 */
+	sc_invocation_init_homedirs(inv);
+
 	/* Stale mount namespace discarded or no mount namespace to
 	   join. We need to construct a new mount namespace ourselves.
 	   To capture it we will need a helper process so make one. */
@@ -713,14 +741,19 @@ static void enter_non_classic_execution_environment(sc_invocation * inv,
 			}
 		}
 	}
-	// Associate each snap process with a dedicated snap freezer cgroup and
-	// snap pids cgroup. All snap processes belonging to one snap share the
-	// freezer cgroup. All snap processes belonging to one app or one hook
-	// share the pids cgroup.
+	// With cgroups v1, associate each snap process with a dedicated
+	// snap freezer cgroup and snap pids cgroup. All snap processes
+	// belonging to one snap share the freezer cgroup. All snap
+	// processes belonging to one app or one hook share the pids cgroup.
 	//
 	// This simplifies testing if any processes belonging to a given snap are
 	// still alive as well as to properly account for each application and
 	// service.
+	//
+	// Note that with cgroups v2 there is no separate freeezer controller,
+	// but the freezer is associated with each group. The call chain when
+	// starting the snap application has already ensure that the process has
+	// been put in a dedicated group.
 	if (!sc_cgroup_is_v2()) {
 		sc_cgroup_freezer_join(inv->snap_instance, getpid());
 	}

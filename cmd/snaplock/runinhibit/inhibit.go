@@ -50,16 +50,22 @@ type Hint string
 const (
 	// HintNotInhibited is used when "snap run" is not inhibited.
 	HintNotInhibited Hint = ""
+	// HintInhibitedGateRefresh represents inhibition of a "snap run" while gate-auto-refresh hook is run.
+	HintInhibitedGateRefresh Hint = "gate-refresh"
 	// HintInhibitedForRefresh represents inhibition of a "snap run" while a refresh change is being performed.
 	HintInhibitedForRefresh Hint = "refresh"
+	// HintInhibitedForPreDownload represents inhibition of a "snap run" while a
+	// pre-download is triggering a refresh.
+	HintInhibitedForPreDownload Hint = "pre-download"
 )
 
-func hintFile(snapName string) string {
+// HintFile returns the full path of the run inhibition lock file for the given snap.
+func HintFile(snapName string) string {
 	return filepath.Join(InhibitDir, snapName+".lock")
 }
 
 func openHintFileLock(snapName string) (*osutil.FileLock, error) {
-	return osutil.NewFileLockWithMode(hintFile(snapName), 0644)
+	return osutil.NewFileLockWithMode(HintFile(snapName), 0644)
 }
 
 // LockWithHint sets a persistent "snap run" inhibition lock, for the given snap, with a given hint.
@@ -113,11 +119,10 @@ func Unlock(snapName string) error {
 
 // IsLocked returns the state of the run inhibition lock for the given snap.
 //
-// It returns the current, non-empty hit if inhibition is in place. Otherwise
+// It returns the current, non-empty hint if inhibition is in place. Otherwise
 // it returns an empty hint.
 func IsLocked(snapName string) (Hint, error) {
-	fname := filepath.Join(InhibitDir, snapName+".lock")
-	flock, err := osutil.OpenExistingLockForReading(fname)
+	flock, err := osutil.OpenExistingLockForReading(HintFile(snapName))
 	if os.IsNotExist(err) {
 		return "", nil
 	}
@@ -146,7 +151,7 @@ func IsLocked(snapName string) (Hint, error) {
 //
 // The function does not fail if the inhibition lock does not exist.
 func RemoveLockFile(snapName string) error {
-	err := os.Remove(hintFile(snapName))
+	err := os.Remove(HintFile(snapName))
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}

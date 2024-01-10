@@ -39,7 +39,10 @@ var _ = Suite(&timezoneSuite{})
 func (s *timezoneSuite) SetUpTest(c *C) {
 	s.configcoreSuite.SetUpTest(c)
 
-	err := os.MkdirAll(filepath.Join(dirs.GlobalRootDir, "/etc/"), 0755)
+	err := os.MkdirAll(filepath.Join(dirs.GlobalRootDir, "/etc/writable"), 0755)
+	c.Assert(err, IsNil)
+	localtimePath := filepath.Join(dirs.GlobalRootDir, "/etc/writable/localtime")
+	err = os.Symlink("/usr/share/zoneinfo/WET", localtimePath)
 	c.Assert(err, IsNil)
 }
 
@@ -49,7 +52,7 @@ func (s *timezoneSuite) TestConfigureTimezoneInvalid(c *C) {
 	}
 
 	for _, tz := range invalidTimezones {
-		err := configcore.Run(coreDev, &mockConf{
+		err := configcore.FilesystemOnlyRun(coreDev, &mockConf{
 			state: s.state,
 			conf: map[string]interface{}{
 				"system.timezone": tz,
@@ -70,7 +73,7 @@ func (s *timezoneSuite) TestConfigureTimezoneIntegration(c *C) {
 	}
 
 	for _, tz := range validTimezones {
-		err := configcore.Run(coreDev, &mockConf{
+		err := configcore.FilesystemOnlyRun(coreDev, &mockConf{
 			state: s.state,
 			conf: map[string]interface{}{
 				"system.timezone": tz,
@@ -79,7 +82,7 @@ func (s *timezoneSuite) TestConfigureTimezoneIntegration(c *C) {
 		c.Assert(err, IsNil)
 		c.Check(mockedTimedatectl.Calls(), DeepEquals, [][]string{
 			{"timedatectl", "set-timezone", tz},
-		})
+		}, Commentf("tested timezone: %v", tz))
 		mockedTimedatectl.ForgetCalls()
 	}
 }

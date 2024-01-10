@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016 Canonical Ltd
+ * Copyright (C) 2022 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -22,6 +22,7 @@ package snap
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -31,6 +32,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/sandbox/apparmor"
 	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/spdx"
 	"github.com/snapcore/snapd/strutil"
@@ -248,17 +250,17 @@ func validateSocketAddrAbstract(socket *SocketInfo, fieldName string, path strin
 func validateSocketAddrNet(socket *SocketInfo, fieldName string, address string) error {
 	lastIndex := strings.LastIndex(address, ":")
 	if lastIndex >= 0 {
-		if err := validateSocketAddrNetHost(socket, fieldName, address[:lastIndex]); err != nil {
+		if err := validateSocketAddrNetHost(fieldName, address[:lastIndex]); err != nil {
 			return err
 		}
-		return validateSocketAddrNetPort(socket, fieldName, address[lastIndex+1:])
+		return validateSocketAddrNetPort(fieldName, address[lastIndex+1:])
 	}
 
 	// Address only contains a port
-	return validateSocketAddrNetPort(socket, fieldName, address)
+	return validateSocketAddrNetPort(fieldName, address)
 }
 
-func validateSocketAddrNetHost(socket *SocketInfo, fieldName string, address string) error {
+func validateSocketAddrNetHost(fieldName string, address string) error {
 	validAddresses := []string{"127.0.0.1", "[::1]", "[::]"}
 	for _, valid := range validAddresses {
 		if address == valid {
@@ -269,7 +271,7 @@ func validateSocketAddrNetHost(socket *SocketInfo, fieldName string, address str
 	return fmt.Errorf("invalid %q address %q, must be one of: %s", fieldName, address, strings.Join(validAddresses, ", "))
 }
 
-func validateSocketAddrNetPort(socket *SocketInfo, fieldName string, port string) error {
+func validateSocketAddrNetPort(fieldName string, port string) error {
 	var val uint64
 	var err error
 	retErr := fmt.Errorf("invalid %q port number %q", fieldName, port)
@@ -296,11 +298,26 @@ func validateTitle(title string) error {
 	return nil
 }
 
+func validateProvenance(prov string) error {
+	if prov == "" {
+		// empty means default
+		return nil
+	}
+	if prov == naming.DefaultProvenance {
+		return fmt.Errorf("provenance cannot be set to default (global-upload) explicitly")
+	}
+	return naming.ValidateProvenance(prov)
+}
+
 // Validate verifies the content in the info.
 func Validate(info *Info) error {
 	name := info.InstanceName()
 	if name == "" {
 		return errors.New("snap name cannot be empty")
+	}
+
+	if err := validateProvenance(info.SnapProvenance); err != nil {
+		return err
 	}
 
 	if err := ValidateName(info.SnapName()); err != nil {
@@ -378,6 +395,11 @@ func Validate(info *Info) error {
 		return err
 	}
 
+	// Ensure links are valid
+	if err := ValidateLinks(info.OriginalLinks); err != nil {
+		return err
+	}
+
 	// ensure that common-id(s) are unique
 	if err := ValidateCommonIDs(info); err != nil {
 		return err
@@ -422,6 +444,9 @@ func ValidateLayoutAll(info *Info) error {
 	// Validate that each source path is not a new top-level directory
 	for _, layout := range info.Layout {
 		cleanPathSrc := info.ExpandSnapVariables(filepath.Clean(layout.Path))
+		if err := apparmor.ValidateNoAppArmorRegexp(layout.Path); err != nil {
+			return fmt.Errorf("invalid layout path: %v", err)
+		}
 		elems := strings.SplitN(cleanPathSrc, string(os.PathSeparator), 3)
 		switch len(elems) {
 		// len(1) is either relative path or empty string, will be validated
@@ -778,7 +803,7 @@ func ValidateApp(app *AppInfo) error {
 	}
 	// validate refresh-mode
 	switch app.RefreshMode {
-	case "", "endure", "restart":
+	case "", "endure", "restart", "ignore-running":
 		// valid
 	default:
 		return fmt.Errorf(`"refresh-mode" field contains invalid value %q`, app.RefreshMode)
@@ -793,8 +818,12 @@ func ValidateApp(app *AppInfo) error {
 	if app.StopMode != "" && app.Daemon == "" {
 		return fmt.Errorf(`"stop-mode" cannot be used for %q, only for services`, app.Name)
 	}
-	if app.RefreshMode != "" && app.Daemon == "" {
-		return fmt.Errorf(`"refresh-mode" cannot be used for %q, only for services`, app.Name)
+	if app.RefreshMode != "" {
+		if app.Daemon != "" && app.RefreshMode == "ignore-running" {
+			return errors.New(`"refresh-mode" cannot be set to "ignore-running" for services`)
+		} else if app.Daemon == "" && app.RefreshMode != "ignore-running" {
+			return fmt.Errorf(`"refresh-mode" for app %q can only have value "ignore-running"`, app.Name)
+		}
 	}
 	if app.InstallMode != "" && app.Daemon == "" {
 		return fmt.Errorf(`"install-mode" cannot be used for %q, only for services`, app.Name)
@@ -895,6 +924,7 @@ var layoutRejectionList = []string{
 	// snap applications to be integrated with the rest of the system and
 	// therefore snaps should not be allowed to replace it.
 	"/run",
+	"/var/run",
 	// The /tmp directory contains a private, per-snap, view of /tmp and
 	// there's no valid reason to allow snaps to replace it.
 	"/tmp",
@@ -910,9 +940,11 @@ var layoutRejectionList = []string{
 	// firmware. Therefore firmware must not be replaceable to prevent
 	// malicious firmware from attacking the host.
 	"/lib/firmware",
+	"/usr/lib/firmware",
 	// Similarly the kernel will load modules and the modules should not be
 	// something that snaps can tamper with.
 	"/lib/modules",
+	"/usr/lib/modules",
 
 	// Locations that store essential data:
 
@@ -1005,6 +1037,10 @@ func ValidateLayout(layout *Layout, constraints []LayoutConstraint) error {
 			!strings.HasPrefix(mountSource, si.ExpandSnapVariables("$SNAP_COMMON")) {
 			return fmt.Errorf("layout %q uses invalid bind mount source %q: must start with $SNAP, $SNAP_DATA or $SNAP_COMMON", layout.Path, mountSource)
 		}
+		// Ensure that the path does not express an AppArmor pattern
+		if err := apparmor.ValidateNoAppArmorRegexp(mountSource); err != nil {
+			return fmt.Errorf("layout %q uses invalid mount source: %s", layout.Path, err)
+		}
 	}
 
 	switch layout.Type {
@@ -1031,6 +1067,10 @@ func ValidateLayout(layout *Layout, constraints []LayoutConstraint) error {
 			!strings.HasPrefix(oldname, si.ExpandSnapVariables("$SNAP_DATA")) &&
 			!strings.HasPrefix(oldname, si.ExpandSnapVariables("$SNAP_COMMON")) {
 			return fmt.Errorf("layout %q uses invalid symlink old name %q: must start with $SNAP, $SNAP_DATA or $SNAP_COMMON", layout.Path, oldname)
+		}
+		// Ensure that the path does not express an AppArmor pattern
+		if err := apparmor.ValidateNoAppArmorRegexp(oldname); err != nil {
+			return fmt.Errorf("layout %q uses invalid symlink: %s", layout.Path, err)
 		}
 	}
 
@@ -1118,4 +1158,40 @@ func ValidateBasesAndProviders(snapInfos []*Info) []error {
 		}
 	}
 	return errs
+}
+
+var isValidLinksKey = regexp.MustCompile("^[a-zA-Z](?:-?[a-zA-Z0-9])*$").MatchString
+var validLinkSchemes = []string{"http", "https"}
+
+// ValidateLinks checks that links entries have valid keys and values that can be parsed as URLs or are email addresses possibly prefixed with mailto:.
+func ValidateLinks(links map[string][]string) error {
+	for linksKey, linksValues := range links {
+		if linksKey == "" {
+			return fmt.Errorf("links key cannot be empty")
+		}
+		if !isValidLinksKey(linksKey) {
+			return fmt.Errorf("links key is invalid: %s", linksKey)
+		}
+		if len(linksValues) == 0 {
+			return fmt.Errorf("%q links cannot be specified and empty", linksKey)
+		}
+		for _, link := range linksValues {
+			if link == "" {
+				return fmt.Errorf("empty %q link", linksKey)
+			}
+			u, err := url.Parse(link)
+			if err != nil {
+				return fmt.Errorf("invalid %q link %q", linksKey, link)
+			}
+			if u.Scheme == "" || u.Scheme == "mailto" {
+				// minimal check
+				if !strings.Contains(link, "@") {
+					return fmt.Errorf("invalid %q email address %q", linksKey, link)
+				}
+			} else if !strutil.ListContains(validLinkSchemes, u.Scheme) {
+				return fmt.Errorf("%q link must have one of http|https schemes or it must be an email address: %q", linksKey, link)
+			}
+		}
+	}
+	return nil
 }

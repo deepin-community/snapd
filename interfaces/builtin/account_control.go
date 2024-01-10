@@ -39,6 +39,39 @@ const accountControlBaseDeclarationSlots = `
 `
 
 const accountControlConnectedPlugAppArmor = `
+#include <abstractions/dbus-strict>
+# Introspection of org.freedesktop.Accounts
+dbus (send)
+    bus=system
+    path=/org/freedesktop/Accounts{,/User[0-9]*}
+    interface=org.freedesktop.DBus.Introspectable
+    member=Introspect
+    peer=(label=unconfined),
+dbus (send)
+    bus=system
+    path=/org/freedesktop/Accounts
+    interface=org.freedesktop.Accounts
+    peer=(label=unconfined),
+dbus (send)
+    bus=system
+    path=/org/freedesktop/Accounts/User[0-9]*
+    interface=org.freedesktop.Accounts.User
+    peer=(label=unconfined),
+# Read all properties from Accounts
+dbus (send)
+    bus=system
+    path=/org/freedesktop/Accounts{,/User[0-9]*}
+    interface=org.freedesktop.DBus.Properties
+    member=Get{,All}
+    peer=(label=unconfined),
+# Receive Accounts property changed events
+dbus (receive)
+    bus=system
+    path=/org/freedesktop/Accounts{,/User[0-9]*}
+    interface=org.freedesktop.DBus.Properties
+    member=PropertiesChanged
+    peer=(label=unconfined),
+
 /{,usr/}sbin/chpasswd ixr,
 /{,usr/}sbin/user{add,del} ixr,
 
@@ -53,6 +86,7 @@ const accountControlConnectedPlugAppArmor = `
 /etc/default/useradd r,
 /etc/default/nss r,
 /etc/pam.d/{,*} r,
+/{,usr/}sbin/pam_tally2 ixr,
 
 # Needed by chpasswd
 /{,usr/}lib/@{multiarch}/security/* ixr,
@@ -66,8 +100,13 @@ capability chown,
 capability fsetid,
 
 # useradd writes the result in the log
+# faillog tracks failed events, lastlog maintain records of the last
+# time a user successfully logged in, tallylog maintains records of
+# failures.
 #include <abstractions/wutmp>
 /var/log/faillog rwk,
+/var/log/lastlog rwk,
+/var/log/tallylog rwk,
 `
 
 // Needed because useradd uses a netlink socket, {{group}} is used as a

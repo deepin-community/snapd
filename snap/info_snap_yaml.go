@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2016 Canonical Ltd
+ * Copyright (C) 2014-2021 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -42,6 +42,7 @@ type snapYaml struct {
 	Title           string                 `yaml:"title"`
 	Description     string                 `yaml:"description"`
 	Summary         string                 `yaml:"summary"`
+	Provenance      string                 `yaml:"provenance"`
 	License         string                 `yaml:"license,omitempty"`
 	Epoch           Epoch                  `yaml:"epoch,omitempty"`
 	Base            string                 `yaml:"base,omitempty"`
@@ -53,6 +54,7 @@ type snapYaml struct {
 	Hooks           map[string]hookYaml    `yaml:"hooks,omitempty"`
 	Layout          map[string]layoutYaml  `yaml:"layout,omitempty"`
 	SystemUsernames map[string]interface{} `yaml:"system-usernames,omitempty"`
+	Links           map[string][]string    `yaml:"links,omitempty"`
 
 	// TypoLayouts is used to detect the use of the incorrect plural form of "layout"
 	TypoLayouts typoDetector `yaml:"layouts,omitempty"`
@@ -232,6 +234,10 @@ func infoFromSnapYaml(yamlData []byte, strk *scopedTracker) (*Info, error) {
 		return nil, err
 	}
 
+	if err := setLinksFromSnapYaml(y, snap); err != nil {
+		return nil, err
+	}
+
 	// FIXME: validation of the fields
 	return snap, nil
 }
@@ -275,6 +281,7 @@ func infoSkeletonFromSnapYaml(y snapYaml) *Info {
 		OriginalTitle:       y.Title,
 		OriginalDescription: y.Description,
 		OriginalSummary:     y.Summary,
+		SnapProvenance:      y.Provenance,
 		License:             y.License,
 		Epoch:               y.Epoch,
 		Confinement:         confinement,
@@ -286,6 +293,7 @@ func infoSkeletonFromSnapYaml(y snapYaml) *Info {
 		Slots:               make(map[string]*SlotInfo),
 		Environment:         y.Environment,
 		SystemUsernames:     make(map[string]*SystemUsernameInfo),
+		OriginalLinks:       make(map[string][]string),
 	}
 
 	sort.Strings(snap.Assumes)
@@ -550,6 +558,19 @@ func setSystemUsernamesFromSnapYaml(y snapYaml, snap *Info) error {
 	return nil
 }
 
+func setLinksFromSnapYaml(y snapYaml, snap *Info) error {
+	for linksKey, links := range y.Links {
+		if linksKey == "" {
+			return fmt.Errorf("links key cannot be empty")
+		}
+		if !isValidLinksKey(linksKey) {
+			return fmt.Errorf("links key is invalid: %s", linksKey)
+		}
+		snap.OriginalLinks[linksKey] = links
+	}
+	return nil
+}
+
 func bindUnscopedPlugs(snap *Info, strk *scopedTracker) {
 	for plugName, plug := range snap.Plugs {
 		if strk.plug(plug) {
@@ -675,16 +696,19 @@ func convertToSlotOrPlugData(plugOrSlot, name string, data interface{}) (iface, 
 }
 
 // Short form:
-//   system-usernames:
-//     snap_daemon: shared  # 'scope' is 'shared'
-//     lxd: external        # currently unsupported
-//     foo: private         # currently unsupported
+//
+//	system-usernames:
+//	  snap_daemon: shared  # 'scope' is 'shared'
+//	  lxd: external        # currently unsupported
+//	  foo: private         # currently unsupported
+//
 // Attributes form:
-//   system-usernames:
-//     snap_daemon:
-//       scope: shared
-//       attrib1: ...
-//       attrib2: ...
+//
+//	system-usernames:
+//	  snap_daemon:
+//	    scope: shared
+//	    attrib1: ...
+//	    attrib2: ...
 func convertToUsernamesData(user string, data interface{}) (scope string, attrs map[string]interface{}, err error) {
 	switch data.(type) {
 	case string:

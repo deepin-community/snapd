@@ -1,8 +1,8 @@
 summary: "regression test for LP: #1813963"
 
-systems: [ubuntu-16.04-64, ubuntu-18.04-64]
-
 backends: [-external]
+
+systems: [ubuntu-16.04-64, ubuntu-18.04-64]
 
 prepare: |
     # Install the versatile test snap.
@@ -81,9 +81,6 @@ restore: |
 debug: |
     echo "Status of the test service"
     systemctl status snap.test-snapd-simple-service.test-snapd-simple-service.service || true
-    echo "Apparmor denials"
-    dmesg | grep DENIED || true
-
 
 execute: |
     # When snap-update-ns is artificially slowed down so that snap-confine

@@ -22,6 +22,8 @@ package ctlcmd_test
 import (
 	"fmt"
 
+	. "gopkg.in/check.v1"
+
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/hookstate/ctlcmd"
@@ -31,8 +33,6 @@ import (
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/testutil"
-
-	. "gopkg.in/check.v1"
 )
 
 type isConnectedSuite struct {
@@ -57,7 +57,7 @@ var isConnectedTests = []struct {
 	exitCode            int
 }{{
 	args: []string{"is-connected"},
-	err:  "the required argument `<plug|slot>` was not provided",
+	err:  "must specify either a plug/slot name or --list",
 }, {
 	args: []string{"is-connected", "plug1"},
 }, {
@@ -134,7 +134,7 @@ var isConnectedTests = []struct {
 	exitCode: ctlcmd.ClassicSnapCode,
 }}
 
-func mockInstalledSnap(c *C, st *state.State, snapYaml string) {
+func mockInstalledSnap(c *C, st *state.State, snapYaml, cohortKey string) {
 	info := snaptest.MockSnapCurrent(c, snapYaml, &snap.SideInfo{Revision: snap.R(1)})
 	snapstate.Set(st, info.InstanceName(), &snapstate.SnapState{
 		Active: true,
@@ -145,7 +145,9 @@ func mockInstalledSnap(c *C, st *state.State, snapYaml string) {
 				SnapID:   info.InstanceName() + "-id",
 			},
 		},
-		Current: info.Revision,
+		Current:         info.Revision,
+		TrackingChannel: "stable",
+		CohortKey:       cohortKey,
 	})
 }
 
@@ -164,11 +166,11 @@ slots:
   cc:
     interface: cups-control
   audio-record:
-    interface: audio-record`)
+    interface: audio-record`, "")
 	mockInstalledSnap(c, s.st, `name: snap2
 slots:
   slot2:
-    interface: x11`)
+    interface: x11`, "")
 	mockInstalledSnap(c, s.st, `name: snap3
 plugs:
   plug4:
@@ -177,16 +179,16 @@ plugs:
     interface: cups-control
 slots:
   slot3:
-    interface: x11`)
+    interface: x11`, "")
 	mockInstalledSnap(c, s.st, `name: snap4
 slots:
   slot4:
-    interface: x11`)
+    interface: x11`, "")
 	mockInstalledSnap(c, s.st, `name: snap5
 confinement: classic
 plugs:
   cc:
-    interface: cups-control`)
+    interface: cups-control`, "")
 	restore := ctlcmd.MockCgroupSnapNameFromPid(func(pid int) (string, error) {
 		switch {
 		case 1000 < pid && pid < 1100:
@@ -249,7 +251,7 @@ func (s *isConnectedSuite) TestIsConnectedFromApp(c *C) {
 	mockContext, err := hookstate.NewContext(nil, s.st, setup, s.mockHandler, "")
 	c.Check(err, IsNil)
 
-	// sanity
+	// validity
 	c.Assert(mockContext.IsEphemeral(), Equals, true)
 
 	s.testIsConnected(c, mockContext)
@@ -257,7 +259,7 @@ func (s *isConnectedSuite) TestIsConnectedFromApp(c *C) {
 
 func (s *isConnectedSuite) TestNoContextError(c *C) {
 	stdout, stderr, err := ctlcmd.Run(nil, []string{"is-connected", "foo"}, 0)
-	c.Check(err, ErrorMatches, `cannot check connection status without a context`)
+	c.Check(err, ErrorMatches, `cannot invoke snapctl operation commands \(here "is-connected"\) from outside of a snap`)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
 }
@@ -268,7 +270,7 @@ func (s *isConnectedSuite) TestGetRegularUser(c *C) {
 	mockInstalledSnap(c, s.st, `name: snap1
 plugs:
   plug1:
-    interface: x11`)
+    interface: x11`, "")
 
 	s.st.Set("conns", map[string]interface{}{
 		"snap1:plug1 snap2:slot2": map[string]interface{}{},
@@ -283,5 +285,68 @@ plugs:
 	stdout, stderr, err := ctlcmd.Run(mockContext, []string{"is-connected", "plug1"}, 1000)
 	c.Check(err, IsNil)
 	c.Check(string(stdout), Equals, "")
+	c.Check(string(stderr), Equals, "")
+}
+
+func (s *isConnectedSuite) TestIsConnectedList(c *C) {
+	s.st.Lock()
+	defer s.st.Unlock()
+
+	task := s.st.NewTask("test-task", "my test task")
+	setup := &hookstate.HookSetup{Snap: "snap1", Revision: snap.R(1), Hook: "test-hook"}
+
+	mockContext, err := hookstate.NewContext(task, s.st, setup, s.mockHandler, "")
+	c.Check(err, IsNil)
+
+	mockInstalledSnap(c, s.st, `name: snap1
+plugs:
+  plug1a:
+    interface: x11
+  plug1b:
+    interface: x11
+  plug1c:
+    interface: x11
+  plug1d:
+    interface: x11
+slots:
+  slot1a:
+    interface: x11
+  slot1b:
+    interface: x11`, "")
+	mockInstalledSnap(c, s.st, `name: snap2
+plugs:
+  plug2a:
+    interface: x11
+  plug2b:
+    interface: x11
+slots:
+  slot2a:
+    interface: x11
+  slot2b:
+    interface: x11`, "")
+	mockInstalledSnap(c, s.st, `name: snap3
+plugs:
+  plug3a:
+    interface: x11
+slots:
+  slot3a:
+    interface: x11
+  slot3b:
+    interface: x11`, "")
+	s.st.Set("conns", map[string]interface{}{
+		"snap1:plug1a snap2:slot2a": map[string]interface{}{},
+		"snap2:plug2a snap1:slot1a": map[string]interface{}{},
+		"snap3:plug3a snap1:slot1a": map[string]interface{}{},
+		"snap1:plug1c snap3:slot3a": map[string]interface{}{"undesired": true},
+		"snap1:plug1d snap3:slot3b": map[string]interface{}{"hotplug-gone": true},
+	})
+
+	s.st.Unlock()
+	defer s.st.Lock()
+
+	stdout, stderr, err := ctlcmd.Run(mockContext, []string{"is-connected", "--list"}, 0)
+	c.Check(err, IsNil)
+
+	c.Check(string(stdout), Equals, "plug1a\nslot1a\n")
 	c.Check(string(stderr), Equals, "")
 }
