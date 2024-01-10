@@ -1,7 +1,5 @@
 summary: Check that snap disconnect works
 
-systems: [-ubuntu-core-16-64]
-
 environment:
     SNAP_FILE: "home-consumer_1.0_all.snap"
 
@@ -54,6 +52,10 @@ execute: |
     echo "Disconnecting again using abbreviated form is handled"
     snap disconnect home-consumer:home | MATCH "No connections to disconnect"
 
+    echo "Disconnecting without specifying the slot/plug fails"
+    snap disconnect home-consumer: 2>&1 | MATCH '.*invalid value: "home-consumer:" \(want snap:name or :name\)'
+    snap disconnect home-consumer 2>&1 | MATCH '.*invalid value: "home-consumer" \(want snap:name or :name\)'
+    snap disconnect home-consumer:home core 2>&1 | MATCH '.*invalid value: "core" \(want snap:name or :name\)'
 
     # these checks rely on automatic connection of home on non-core systems
     if ! os.query is-core; then
@@ -85,8 +87,8 @@ execute: |
     snap connections test-snap-consumer | MATCH "content\[mylib\] *test-snap-consumer:shared-content-plug *test-snap-producer:shared-content-slot"
     # refresh to a newer version without content plug
     "$TESTSTOOLS"/snaps-state install-local test-snap-consumer.v2
-    snap connections test-snap-consumer | not MATCH "content\[mylib\] *test-snap-consumer:shared-content-plug *test-snap-producer:shared-content-slot"
+    snap connections test-snap-consumer | NOMATCH "content\[mylib\] *test-snap-consumer:shared-content-plug *test-snap-producer:shared-content-slot"
     inspect_connection "test-snap-consumer:shared-content-plug test-snap-producer:shared-content-slot" | MATCH "true"
     snap disconnect --forget test-snap-consumer:shared-content-plug test-snap-producer:shared-content-slot
-    snap connections test-snap-consumer | not MATCH "content\[mylib\] *test-snap-consumer:shared-content-plug *test-snap-producer:shared-content-slot"
+    snap connections test-snap-consumer | NOMATCH "content\[mylib\] *test-snap-consumer:shared-content-plug *test-snap-producer:shared-content-slot"
     inspect_connection "test-snap-consumer:shared-content-plug test-snap-producer:shared-content-slot" | MATCH "false"

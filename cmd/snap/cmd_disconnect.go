@@ -22,10 +22,10 @@ package main
 import (
 	"fmt"
 
+	"github.com/jessevdk/go-flags"
+
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/i18n"
-
-	"github.com/jessevdk/go-flags"
 )
 
 type cmdDisconnect struct {
@@ -73,17 +73,14 @@ func (x *cmdDisconnect) Execute(args []string) error {
 		return ErrExtraArgs
 	}
 
-	offer := x.Positionals.Offer.SnapAndName
-	use := x.Positionals.Use.SnapAndName
+	offer := x.Positionals.Offer.SnapAndNameStrict
+	use := x.Positionals.Use.SnapAndNameStrict
 
 	// snap disconnect <snap>:<slot>
 	// snap disconnect <snap>
 	if use.Snap == "" && use.Name == "" {
 		// Swap Offer and Use around
 		offer, use = use, offer
-	}
-	if use.Name == "" {
-		return fmt.Errorf("please provide the plug or slot name to disconnect from snap %q", use.Snap)
 	}
 
 	opts := &client.DisconnectOptions{Forget: x.Forget}

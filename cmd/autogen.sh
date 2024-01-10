@@ -14,7 +14,7 @@ if [ ! -e VERSION ]; then
 	( cd .. && ./mkversion.sh )
 fi
 
-# Sanity check, are we in the right directory?
+# Precondition check, are we in the right directory?
 test -f configure.ac
 
 # Regenerate the build system
@@ -44,11 +44,17 @@ case "$ID" in
 	fedora|centos|rhel)
 		extra_opts="--libexecdir=/usr/libexec/snapd --with-snap-mount-dir=/var/lib/snapd/snap --enable-merged-usr --disable-apparmor --enable-selinux"
 		;;
-	opensuse|opensuse-tumbleweed)
+	opensuse-tumbleweed)
+		  extra_opts="--libexecdir=/usr/libexec/snapd --enable-nvidia-biarch --with-32bit-libdir=/usr/lib --enable-merged-usr"
+		  ;;
+	opensuse)
 		extra_opts="--libexecdir=/usr/lib/snapd --enable-nvidia-biarch --with-32bit-libdir=/usr/lib --enable-merged-usr"
 		;;
 	solus)
 		extra_opts="--enable-nvidia-biarch"
+		;;
+	altlinux)
+		extra_opts="--libexecdir=/usr/lib/snapd --with-snap-mount-dir=/var/lib/snapd/snap --disable-apparmor --enable-selinux --enable-nvidia-biarch --with-32bit-libdir=/usr/lib"
 		;;
 esac
 

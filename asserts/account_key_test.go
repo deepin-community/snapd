@@ -622,7 +622,7 @@ func (aks *accountKeySuite) TestPublicKeyIsValidAssumingCurTimeWithinWithUntilPu
 	}
 
 	for _, t := range tests {
-		c.Check(asserts.AccountKeyIsKeyValidAssumingCurTimeWithin(accKey, t.timePt, t.timePt), Equals, t.valid)
+		c.Check(asserts.IsValidAssumingCurTimeWithin(accKey, t.timePt, t.timePt), Equals, t.valid)
 	}
 }
 
@@ -657,7 +657,7 @@ func (aks *accountKeySuite) TestPublicKeyIsValidAssumingCurTimeWithinNoUntilPunc
 	}
 
 	for _, t := range tests {
-		c.Check(asserts.AccountKeyIsKeyValidAssumingCurTimeWithin(accKey, t.timePt, t.timePt), Equals, t.valid)
+		c.Check(asserts.IsValidAssumingCurTimeWithin(accKey, t.timePt, t.timePt), Equals, t.valid)
 	}
 }
 
@@ -711,7 +711,7 @@ func (aks *accountKeySuite) TestPublicKeyIsValidAssumingCurTimeWithinWithUntilIn
 	}
 
 	for _, t := range tests {
-		c.Check(asserts.AccountKeyIsKeyValidAssumingCurTimeWithin(accKey, t.earliest, t.latest), Equals, t.valid)
+		c.Check(asserts.IsValidAssumingCurTimeWithin(accKey, t.earliest, t.latest), Equals, t.valid)
 	}
 
 }
@@ -766,7 +766,7 @@ func (aks *accountKeySuite) TestPublicKeyIsValidAssumingCurTimeWithinNoUntilInte
 	}
 
 	for _, t := range tests {
-		c.Check(asserts.AccountKeyIsKeyValidAssumingCurTimeWithin(accKey, t.earliest, t.latest), Equals, t.valid)
+		c.Check(asserts.IsValidAssumingCurTimeWithin(accKey, t.earliest, t.latest), Equals, t.valid)
 	}
 
 }
@@ -831,7 +831,7 @@ func (aks *accountKeySuite) TestAccountKeyRequestUntil(c *C) {
 		untilHeader string
 		until       time.Time
 	}{
-		{"", time.Time{}},                           // zero time default
+		{"", time.Time{}}, // zero time default
 		{aks.until.Format(time.RFC3339), aks.until}, // in the future
 		{aks.since.Format(time.RFC3339), aks.since}, // same as since
 	}

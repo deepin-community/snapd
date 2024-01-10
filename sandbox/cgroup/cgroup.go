@@ -29,6 +29,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/strutil"
 )
 
@@ -61,7 +62,21 @@ var (
 )
 
 func init() {
+	dirs.AddRootDirCallback(func(root string) {
+		rootPath = root
+	})
 	probeVersion, probeErr = probeCgroupVersion()
+	// handles error case gracefully
+	pickVersionSpecificImpl()
+}
+
+func pickVersionSpecificImpl() {
+	switch probeVersion {
+	case V1:
+		pickFreezerV1Impl()
+	case V2:
+		pickFreezerV2Impl()
+	}
 }
 
 var fsTypeForPath = fsTypeForPathImpl
@@ -86,7 +101,7 @@ func probeCgroupVersion() (version int, err error) {
 	cgroupMount := filepath.Join(rootPath, cgroupMountPoint)
 	typ, err := fsTypeForPath(cgroupMount)
 	if err != nil {
-		return Unknown, fmt.Errorf("cannot determine filesystem type: %v", err)
+		return Unknown, fmt.Errorf("cannot determine cgroup version: %v", err)
 	}
 	if typ == cgroup2SuperMagic {
 		return V2, nil
@@ -206,6 +221,7 @@ func ProcGroup(pid int, matcher GroupMatcher) (string, error) {
 func MockVersion(mockVersion int, mockErr error) (restore func()) {
 	oldVersion, oldErr := probeVersion, probeErr
 	probeVersion, probeErr = mockVersion, mockErr
+	pickVersionSpecificImpl()
 	return func() {
 		probeVersion, probeErr = oldVersion, oldErr
 	}
@@ -243,22 +259,27 @@ func ProcessPathInTrackingCgroup(pid int) (string, error) {
 	// 1:name=systemd:/user.slice/user-1000.slice/user@1000.service/tmux.slice/tmux@default.service
 	// 0::/user.slice/user-1000.slice/user@1000.service/tmux.slice/tmux@default.service
 
-	// It seems cgroupv2 can be "dangling" after being mounted and unmounted.
-	// It will forever stay present in the kernel but will not be present in
-	// the file-system. As such, allow v2 to register only if it is really
-	// mounted on the system.
-	var allowV2 bool
+	// A cgroup hierarchy (both v1 and v2) can be "dangling" after being
+	// mounted and unmounted.
+	// It will stay present in the kernel (and therefore its paths may appear
+	// in the /proc/<pid>/cgroup file) as long as there are some processes in
+	// it, but it will not be present in the file-system. As such, use v2
+	// if it is really mounted on the filesystem, otherwise try v1.
+	var useV2 bool
 	if ver, err := Version(); err != nil {
 		return "", err
 	} else if ver == V2 {
-		allowV2 = true
+		useV2 = true
 	}
 	entry, err := scanProcCgroupFile(fname, func(e *procInfoEntry) bool {
-		if e.CgroupID == 0 && allowV2 {
-			return true
-		}
-		if len(e.Controllers) == 1 && e.Controllers[0] == "name=systemd" {
-			return true
+		if useV2 {
+			if e.CgroupID == 0 {
+				return true
+			}
+		} else {
+			if len(e.Controllers) == 1 && e.Controllers[0] == "name=systemd" {
+				return true
+			}
 		}
 		return false
 	})

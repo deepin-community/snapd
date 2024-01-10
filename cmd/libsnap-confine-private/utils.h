@@ -28,6 +28,16 @@ __attribute__((format(printf, 1, 2)))
 void debug(const char *fmt, ...);
 
 /**
+ * Get an environment variable and convert it to a boolean.
+ *
+ * Supported values are those of parse_bool(), namely "yes", "no" as well as "1"
+ * and "0". All other values are treated as false and a diagnostic message is
+ * printed to stderr. If the environment variable is unset, set value to the
+ * default_value as if the environment variable was set to default_value.
+ **/
+bool getenv_bool(const char *name, bool default_value);
+
+/**
  * Return true if debugging is enabled.
  *
  * This can used to avoid costly computation that is only useful for debugging.
@@ -101,4 +111,10 @@ void write_string_to_file(const char *filepath, const char *buf);
  **/
 __attribute__((warn_unused_result))
 int sc_nonfatal_mkpath(const char *const path, mode_t mode);
+
+/**
+ * Return true if path is a valid path for the snap-confine binary
+ **/
+__attribute__((warn_unused_result))
+bool sc_is_expected_path(const char *path);
 #endif

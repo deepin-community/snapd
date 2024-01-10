@@ -22,6 +22,7 @@ package daemon_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -29,9 +30,11 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/check.v1"
 
+	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/asserts/assertstest"
 	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/bootloader"
@@ -39,21 +42,29 @@ import (
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/daemon"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/gadgettest"
+	"github.com/snapcore/snapd/gadget/quantity"
 	"github.com/snapcore/snapd/overlord/assertstate/assertstatetest"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/hookstate"
+	"github.com/snapcore/snapd/overlord/install"
+	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/release"
+	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/seed"
 	"github.com/snapcore/snapd/seed/seedtest"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snaptest"
-	"github.com/snapcore/snapd/testutil"
 )
 
 var _ = check.Suite(&systemsSuite{})
 
 type systemsSuite struct {
 	apiBaseSuite
+
+	seedModelForLabel20191119 *asserts.Model
 }
 
 func (s *systemsSuite) SetUpTest(c *check.C) {
@@ -61,6 +72,51 @@ func (s *systemsSuite) SetUpTest(c *check.C) {
 
 	s.expectRootAccess()
 }
+
+var pcGadgetUCYaml = `
+volumes:
+  pc:
+    bootloader: grub
+    schema: gpt
+    structure:
+      - name: mbr
+        type: mbr
+        size: 440
+        content:
+          - image: pc-boot.img
+      - name: BIOS Boot
+        type: DA,21686148-6449-6E6F-744E-656564454649
+        size: 1M
+        offset: 1M
+        offset-write: mbr+92
+        content:
+          - image: pc-core.img
+      - name: ubuntu-seed
+        role: system-seed
+        filesystem: vfat
+        type: EF,C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+        size: 1200M
+        content:
+          - source: grubx64.efi
+            target: EFI/boot/grubx64.efi
+          - source: shim.efi.signed
+            target: EFI/boot/bootx64.efi
+      - name: ubuntu-boot
+        filesystem: ext4
+        size: 750M
+        type: 83,0FC63DAF-8483-4772-8E79-3D69D8477DE4
+        role: system-boot
+      - name: ubuntu-save
+        size: 16M
+        filesystem: ext4
+        type: 83,0FC63DAF-8483-4772-8E79-3D69D8477DE4
+        role: system-save
+      - name: ubuntu-data
+        filesystem: ext4
+        size: 1G
+        type: 83,0FC63DAF-8483-4772-8E79-3D69D8477DE4
+        role: system-data
+`
 
 func (s *systemsSuite) mockSystemSeeds(c *check.C) (restore func()) {
 	// now create a minimal uc20 seed dir with snaps/assertions
@@ -77,10 +133,17 @@ func (s *systemsSuite) mockSystemSeeds(c *check.C) (restore func()) {
 	assertstest.AddMany(s.StoreSigning.Database, s.Brands.AccountsAndKeys("my-brand")...)
 	// add essential snaps
 	seed20.MakeAssertedSnap(c, "name: snapd\nversion: 1\ntype: snapd", nil, snap.R(1), "my-brand", s.StoreSigning.Database)
-	seed20.MakeAssertedSnap(c, "name: pc\nversion: 1\ntype: gadget\nbase: core20", nil, snap.R(1), "my-brand", s.StoreSigning.Database)
+	gadgetFiles := [][]string{
+		{"meta/gadget.yaml", string(pcGadgetUCYaml)},
+		{"pc-boot.img", "pc-boot.img content"},
+		{"pc-core.img", "pc-core.img content"},
+		{"grubx64.efi", "grubx64.efi content"},
+		{"shim.efi.signed", "shim.efi.signed content"},
+	}
+	seed20.MakeAssertedSnap(c, "name: pc\nversion: 1\ntype: gadget\nbase: core20", gadgetFiles, snap.R(1), "my-brand", s.StoreSigning.Database)
 	seed20.MakeAssertedSnap(c, "name: pc-kernel\nversion: 1\ntype: kernel", nil, snap.R(1), "my-brand", s.StoreSigning.Database)
 	seed20.MakeAssertedSnap(c, "name: core20\nversion: 1\ntype: base", nil, snap.R(1), "my-brand", s.StoreSigning.Database)
-	seed20.MakeSeed(c, "20191119", "my-brand", "my-model", map[string]interface{}{
+	s.seedModelForLabel20191119 = seed20.MakeSeed(c, "20191119", "my-brand", "my-model", map[string]interface{}{
 		"display-name": "my fancy model",
 		"architecture": "amd64",
 		"base":         "core20",
@@ -127,7 +190,7 @@ func (s *systemsSuite) TestSystemsGetSome(c *check.C) {
 	err := m.WriteTo("")
 	c.Assert(err, check.IsNil)
 
-	d := s.daemonWithOverlordMockAndStore(c)
+	d := s.daemonWithOverlordMockAndStore()
 	hookMgr, err := hookstate.Manager(d.Overlord().State(), d.Overlord().TaskRunner())
 	c.Assert(err, check.IsNil)
 	mgr, err := devicestate.Manager(d.Overlord().State(), hookMgr, d.Overlord().TaskRunner(), nil)
@@ -191,6 +254,7 @@ func (s *systemsSuite) TestSystemsGetSome(c *check.C) {
 				Actions: []client.SystemAction{
 					{Title: "Reinstall", Mode: "install"},
 					{Title: "Recover", Mode: "recover"},
+					{Title: "Factory reset", Mode: "factory-reset"},
 					{Title: "Run normally", Mode: "run"},
 				},
 			},
@@ -205,7 +269,7 @@ func (s *systemsSuite) TestSystemsGetNone(c *check.C) {
 	c.Assert(err, check.IsNil)
 
 	// model assertion setup
-	d := s.daemonWithOverlordMockAndStore(c)
+	d := s.daemonWithOverlordMockAndStore()
 	hookMgr, err := hookstate.Manager(d.Overlord().State(), d.Overlord().TaskRunner())
 	c.Assert(err, check.IsNil)
 	mgr, err := devicestate.Manager(d.Overlord().State(), hookMgr, d.Overlord().TaskRunner(), nil)
@@ -233,7 +297,7 @@ func (s *systemsSuite) TestSystemActionRequestErrors(c *check.C) {
 	err := m.WriteTo("")
 	c.Assert(err, check.IsNil)
 
-	d := s.daemonWithOverlordMockAndStore(c)
+	d := s.daemonWithOverlordMockAndStore()
 
 	hookMgr, err := hookstate.Manager(d.Overlord().State(), d.Overlord().TaskRunner())
 	c.Assert(err, check.IsNil)
@@ -309,9 +373,9 @@ func (s *systemsSuite) TestSystemActionRequestErrors(c *check.C) {
 		c.Logf("tc: %#v", tc)
 		req, err := http.NewRequest("POST", path.Join("/v2/systems", tc.label), strings.NewReader(tc.body))
 		c.Assert(err, check.IsNil)
-		rsp := s.errorReq(c, req, nil)
-		c.Check(rsp.Status, check.Equals, tc.status)
-		c.Check(rsp.ErrorResult().Message, check.Matches, tc.error)
+		rspe := s.errorReq(c, req, nil)
+		c.Check(rspe.Status, check.Equals, tc.status)
+		c.Check(rspe.Message, check.Matches, tc.error)
 	}
 }
 
@@ -320,8 +384,17 @@ func (s *systemsSuite) TestSystemActionRequestWithSeeded(c *check.C) {
 	bootloader.Force(bt)
 	defer func() { bootloader.Force(nil) }()
 
-	cmd := testutil.MockCommand(c, "shutdown", "")
-	defer cmd.Restore()
+	nRebootCall := 0
+	rebootCheck := func(ra boot.RebootAction, d time.Duration, ri *boot.RebootInfo) error {
+		nRebootCall++
+		// slow reboot schedule
+		c.Check(ra, check.Equals, boot.RebootReboot)
+		c.Check(d, check.Equals, 10*time.Minute)
+		c.Check(ri, check.IsNil)
+		return nil
+	}
+	r := daemon.MockReboot(rebootCheck)
+	defer r()
 
 	restore := s.mockSystemSeeds(c)
 	defer restore()
@@ -353,6 +426,7 @@ func (s *systemsSuite) TestSystemActionRequestWithSeeded(c *check.C) {
 		"seed-time": "2009-11-10T23:00:00Z",
 	}}
 
+	numExpRestart := 0
 	tt := []struct {
 		currentMode    string
 		actionMode     string
@@ -381,14 +455,23 @@ func (s *systemsSuite) TestSystemActionRequestWithSeeded(c *check.C) {
 			comment:     "run mode to run mode",
 		},
 		{
-			// from recover mode -> run mode works to stop recovering and "restore" the system to normal
+			// from run mode -> factory-reset
+			currentMode: "run",
+			actionMode:  "factory-reset",
+			expRestart:  true,
+			comment:     "run mode to factory-reset mode",
+		},
+		{
+			// from recover mode -> run mode works to stop
+			// recovering and "restore" the system to normal
 			currentMode: "recover",
 			actionMode:  "run",
 			expRestart:  true,
 			comment:     "recover mode to run mode",
 		},
 		{
-			// from recover mode -> install mode works to stop recovering and reinstall the system if all is lost
+			// from recover mode -> install mode works to stop
+			// recovering and reinstall the system if all is lost
 			currentMode: "recover",
 			actionMode:  "install",
 			expRestart:  true,
@@ -400,6 +483,13 @@ func (s *systemsSuite) TestSystemActionRequestWithSeeded(c *check.C) {
 			actionMode:     "recover",
 			expUnsupported: true,
 			comment:        "recover mode to recover mode",
+		},
+		{
+			// from recover mode -> factory-reset works
+			currentMode: "recover",
+			actionMode:  "factory-reset",
+			expRestart:  true,
+			comment:     "recover mode to factory-reset mode",
 		},
 		{
 			// from install mode -> install mode is no-no
@@ -439,12 +529,12 @@ func (s *systemsSuite) TestSystemActionRequestWithSeeded(c *check.C) {
 		d := s.daemon(c)
 		st := d.Overlord().State()
 		st.Lock()
-		// devicemgr needs boot id to request a reboot
-		st.VerifyReboot("boot-id-0")
+		// make things look like a reboot
+		restart.ReplaceBootID(st, "boot-id-1")
 		// device model
 		assertstatetest.AddMany(st, s.StoreSigning.StoreAccountKey(""))
 		assertstatetest.AddMany(st, s.Brands.AccountsAndKeys("my-brand")...)
-		s.mockModel(c, st, model)
+		s.mockModel(st, model)
 		if tc.currentMode == "run" {
 			// only set in run mode
 			st.Set("seeded-systems", currentSystem)
@@ -505,22 +595,18 @@ func (s *systemsSuite) TestSystemActionRequestWithSeeded(c *check.C) {
 				// daemon is not started, only check whether reboot was scheduled as expected
 
 				// reboot flag
-				c.Check(d.RequestedRestart(), check.Equals, state.RestartSystemNow, check.Commentf(tc.comment))
-				// slow reboot schedule
-				c.Check(cmd.Calls(), check.DeepEquals, [][]string{
-					{"shutdown", "-r", "+10", "reboot scheduled to update the system"},
-				},
-					check.Commentf(tc.comment),
-				)
+				numExpRestart++
+				c.Check(d.RequestedRestart(), check.Equals, restart.RestartSystemNow, check.Commentf(tc.comment))
 			}
 		}
 
 		c.Assert(rspBody, check.DeepEquals, expResp, check.Commentf(tc.comment))
 
-		cmd.ForgetCalls()
 		s.resetDaemon()
 	}
 
+	// we must have called reboot numExpRestart times
+	c.Check(nRebootCall, check.Equals, numExpRestart)
 }
 
 func (s *systemsSuite) TestSystemActionBrokenSeed(c *check.C) {
@@ -530,7 +616,7 @@ func (s *systemsSuite) TestSystemActionBrokenSeed(c *check.C) {
 	err := m.WriteTo("")
 	c.Assert(err, check.IsNil)
 
-	d := s.daemonWithOverlordMockAndStore(c)
+	d := s.daemonWithOverlordMockAndStore()
 	hookMgr, err := hookstate.Manager(d.Overlord().State(), d.Overlord().TaskRunner())
 	c.Assert(err, check.IsNil)
 	mgr, err := devicestate.Manager(d.Overlord().State(), hookMgr, d.Overlord().TaskRunner(), nil)
@@ -552,13 +638,13 @@ func (s *systemsSuite) TestSystemActionBrokenSeed(c *check.C) {
 	body := `{"action":"do","title":"reinstall","mode":"install"}`
 	req, err := http.NewRequest("POST", "/v2/systems/20191119", strings.NewReader(body))
 	c.Assert(err, check.IsNil)
-	rsp := s.errorReq(c, req, nil)
-	c.Check(rsp.Status, check.Equals, 500)
-	c.Check(rsp.ErrorResult().Message, check.Matches, `cannot load seed system: cannot load assertions: .*`)
+	rspe := s.errorReq(c, req, nil)
+	c.Check(rspe.Status, check.Equals, 500)
+	c.Check(rspe.Message, check.Matches, `cannot load seed system: cannot load assertions for label "20191119": .*`)
 }
 
 func (s *systemsSuite) TestSystemActionNonRoot(c *check.C) {
-	d := s.daemonWithOverlordMockAndStore(c)
+	d := s.daemonWithOverlordMockAndStore()
 	hookMgr, err := hookstate.Manager(d.Overlord().State(), d.Overlord().TaskRunner())
 	c.Assert(err, check.IsNil)
 	mgr, err := devicestate.Manager(d.Overlord().State(), hookMgr, d.Overlord().TaskRunner(), nil)
@@ -622,8 +708,10 @@ func (s *systemsSuite) TestSystemRebootHappy(c *check.C) {
 		{"20200101", ""},
 		{"", "run"},
 		{"", "recover"},
+		{"", "factory-reset"},
 		{"20200101", "run"},
 		{"20200101", "recover"},
+		{"20200101", "factory-reset"},
 	} {
 		called := 0
 		restore := daemon.MockDeviceManagerReboot(func(dm *devicestate.DeviceManager, systemLabel, mode string) error {
@@ -688,4 +776,445 @@ func (s *systemsSuite) TestSystemRebootUnhappy(c *check.C) {
 		result := rspBody["result"].(map[string]interface{})
 		c.Check(result["message"], check.Equals, tc.expectedErr)
 	}
+}
+
+// XXX: duplicated from gadget_test.go
+func asOffsetPtr(offs quantity.Offset) *quantity.Offset {
+	goff := offs
+	return &goff
+}
+
+func (s *systemsSuite) TestSystemsGetSystemDetailsForLabel(c *check.C) {
+	s.mockSystemSeeds(c)
+
+	s.daemon(c)
+	s.expectRootAccess()
+
+	mockGadgetInfo := &gadget.Info{
+		Volumes: map[string]*gadget.Volume{
+			"pc": {
+				Schema:     "gpt",
+				Bootloader: "grub",
+				Structure: []gadget.VolumeStructure{
+					{
+						VolumeName: "foo",
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range []struct {
+		disabled, available                bool
+		storageSafety                      asserts.StorageSafety
+		typ                                secboot.EncryptionType
+		unavailableErr, unavailableWarning string
+
+		expectedSupport                                  client.StorageEncryptionSupport
+		expectedStorageSafety, expectedUnavailableReason string
+	}{
+		{
+			true, false, asserts.StorageSafetyPreferEncrypted, "", "", "",
+			client.StorageEncryptionSupportDisabled, "", "",
+		},
+		{
+			false, false, asserts.StorageSafetyPreferEncrypted, "", "", "unavailable-warn",
+			client.StorageEncryptionSupportUnavailable, "prefer-encrypted", "unavailable-warn",
+		},
+		{
+			false, true, asserts.StorageSafetyPreferEncrypted, "cryptsetup", "", "",
+			client.StorageEncryptionSupportAvailable, "prefer-encrypted", "",
+		},
+		{
+			false, true, asserts.StorageSafetyPreferUnencrypted, "cryptsetup", "", "",
+			client.StorageEncryptionSupportAvailable, "prefer-unencrypted", "",
+		},
+		{
+			false, false, asserts.StorageSafetyEncrypted, "", "unavailable-err", "",
+			client.StorageEncryptionSupportDefective, "encrypted", "unavailable-err",
+		},
+		{
+			false, true, asserts.StorageSafetyEncrypted, "", "", "",
+			client.StorageEncryptionSupportAvailable, "encrypted", "",
+		},
+	} {
+		mockEncryptionSupportInfo := &install.EncryptionSupportInfo{
+			Available:          tc.available,
+			Disabled:           tc.disabled,
+			StorageSafety:      tc.storageSafety,
+			UnavailableErr:     errors.New(tc.unavailableErr),
+			UnavailableWarning: tc.unavailableWarning,
+		}
+
+		r := daemon.MockDeviceManagerSystemAndGadgetAndEncryptionInfo(func(mgr *devicestate.DeviceManager, label string) (*devicestate.System, *gadget.Info, *install.EncryptionSupportInfo, error) {
+			c.Check(label, check.Equals, "20191119")
+			sys := &devicestate.System{
+				Model: s.seedModelForLabel20191119,
+				Label: "20191119",
+				Brand: s.Brands.Account("my-brand"),
+			}
+			return sys, mockGadgetInfo, mockEncryptionSupportInfo, nil
+		})
+		defer r()
+
+		req, err := http.NewRequest("GET", "/v2/systems/20191119", nil)
+		c.Assert(err, check.IsNil)
+		rsp := s.syncReq(c, req, nil)
+
+		c.Assert(rsp.Status, check.Equals, 200)
+		sys := rsp.Result.(client.SystemDetails)
+		c.Check(sys, check.DeepEquals, client.SystemDetails{
+			Label: "20191119",
+			Model: s.seedModelForLabel20191119.Headers(),
+			Brand: snap.StoreAccount{
+				ID:          "my-brand",
+				Username:    "my-brand",
+				DisplayName: "My-brand",
+				Validation:  "unproven",
+			},
+			StorageEncryption: &client.StorageEncryption{
+				Support:           tc.expectedSupport,
+				StorageSafety:     tc.expectedStorageSafety,
+				UnavailableReason: tc.expectedUnavailableReason,
+			},
+			Volumes: mockGadgetInfo.Volumes,
+		}, check.Commentf("%v", tc))
+	}
+}
+
+func (s *systemsSuite) TestSystemsGetSpecificLabelError(c *check.C) {
+	s.daemon(c)
+	s.expectRootAccess()
+
+	r := daemon.MockDeviceManagerSystemAndGadgetAndEncryptionInfo(func(mgr *devicestate.DeviceManager, label string) (*devicestate.System, *gadget.Info, *install.EncryptionSupportInfo, error) {
+		return nil, nil, nil, fmt.Errorf("boom")
+	})
+	defer r()
+
+	req, err := http.NewRequest("GET", "/v2/systems/something", nil)
+	c.Assert(err, check.IsNil)
+	rspe := s.errorReq(c, req, nil)
+
+	c.Assert(rspe.Status, check.Equals, 500)
+	c.Check(rspe.Message, check.Equals, `boom`)
+}
+
+func (s *systemsSuite) TestSystemsGetSpecificLabelNotFoundIntegration(c *check.C) {
+	restore := release.MockOnClassic(false)
+	defer restore()
+
+	s.daemon(c)
+	s.expectRootAccess()
+
+	req, err := http.NewRequest("GET", "/v2/systems/does-not-exist", nil)
+	c.Assert(err, check.IsNil)
+	rspe := s.errorReq(c, req, nil)
+	c.Check(rspe.Status, check.Equals, 500)
+	c.Check(rspe.Message, check.Equals, `cannot load assertions for label "does-not-exist": no seed assertions`)
+}
+
+func (s *systemsSuite) TestSystemsGetSpecificLabelIntegration(c *check.C) {
+	restore := release.MockOnClassic(false)
+	defer restore()
+
+	d := s.daemon(c)
+	s.expectRootAccess()
+	deviceMgr := d.Overlord().DeviceManager()
+
+	restore = s.mockSystemSeeds(c)
+	defer restore()
+
+	r := daemon.MockDeviceManagerSystemAndGadgetAndEncryptionInfo(func(mgr *devicestate.DeviceManager, label string) (*devicestate.System, *gadget.Info, *install.EncryptionSupportInfo, error) {
+		// mockSystemSeed will ensure everything here is coming from
+		// the mocked seed except the encryptionInfo
+		sys, gadgetInfo, encInfo, err := deviceMgr.SystemAndGadgetAndEncryptionInfo(label)
+		// encryptionInfo needs get overridden here to get reliable tests
+		encInfo.Available = false
+		encInfo.StorageSafety = asserts.StorageSafetyPreferEncrypted
+		encInfo.UnavailableWarning = "not encrypting device storage as checking TPM gave: some reason"
+
+		return sys, gadgetInfo, encInfo, err
+	})
+	defer r()
+
+	req, err := http.NewRequest("GET", "/v2/systems/20191119", nil)
+	c.Assert(err, check.IsNil)
+	rsp := s.syncReq(c, req, nil)
+
+	c.Assert(rsp.Status, check.Equals, 200)
+	sys := rsp.Result.(client.SystemDetails)
+
+	sd := client.SystemDetails{
+		Label: "20191119",
+		Model: s.seedModelForLabel20191119.Headers(),
+		Actions: []client.SystemAction{
+			{Title: "Install", Mode: "install"},
+		},
+
+		Brand: snap.StoreAccount{
+			ID:          "my-brand",
+			Username:    "my-brand",
+			DisplayName: "My-brand",
+			Validation:  "unproven",
+		},
+		StorageEncryption: &client.StorageEncryption{
+			Support:           "unavailable",
+			StorageSafety:     "prefer-encrypted",
+			UnavailableReason: "not encrypting device storage as checking TPM gave: some reason",
+		},
+		Volumes: map[string]*gadget.Volume{
+			"pc": {
+				Name:       "pc",
+				Schema:     "gpt",
+				Bootloader: "grub",
+				Structure: []gadget.VolumeStructure{
+					{
+						Name:       "mbr",
+						VolumeName: "pc",
+						Type:       "mbr",
+						Role:       "mbr",
+						Offset:     asOffsetPtr(0),
+						MinSize:    440,
+						Size:       440,
+						Content: []gadget.VolumeContent{
+							{
+								Image: "pc-boot.img",
+							},
+						},
+						YamlIndex: 0,
+					},
+					{
+						Name:       "BIOS Boot",
+						VolumeName: "pc",
+						Type:       "DA,21686148-6449-6E6F-744E-656564454649",
+						MinSize:    1 * quantity.SizeMiB,
+						Size:       1 * quantity.SizeMiB,
+						Offset:     asOffsetPtr(1 * quantity.OffsetMiB),
+						OffsetWrite: &gadget.RelativeOffset{
+							RelativeTo: "mbr",
+							Offset:     92,
+						},
+						Content: []gadget.VolumeContent{
+							{
+								Image: "pc-core.img",
+							},
+						},
+						YamlIndex: 1,
+					},
+					{
+						Name:       "ubuntu-seed",
+						Label:      "ubuntu-seed",
+						Role:       "system-seed",
+						VolumeName: "pc",
+						Type:       "EF,C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
+						Offset:     asOffsetPtr(2 * quantity.OffsetMiB),
+						MinSize:    1200 * quantity.SizeMiB,
+						Size:       1200 * quantity.SizeMiB,
+						Filesystem: "vfat",
+						Content: []gadget.VolumeContent{
+							{
+								UnresolvedSource: "grubx64.efi",
+								Target:           "EFI/boot/grubx64.efi",
+							},
+							{
+								UnresolvedSource: "shim.efi.signed",
+								Target:           "EFI/boot/bootx64.efi",
+							},
+						},
+						YamlIndex: 2,
+					},
+					{
+						Name:       "ubuntu-boot",
+						Label:      "ubuntu-boot",
+						Role:       "system-boot",
+						VolumeName: "pc",
+						Type:       "83,0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+						Offset:     asOffsetPtr(1202 * quantity.OffsetMiB),
+						MinSize:    750 * quantity.SizeMiB,
+						Size:       750 * quantity.SizeMiB,
+						Filesystem: "ext4",
+						YamlIndex:  3,
+					},
+					{
+						Name:       "ubuntu-save",
+						Label:      "ubuntu-save",
+						Role:       "system-save",
+						VolumeName: "pc",
+						Type:       "83,0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+						Offset:     asOffsetPtr(1952 * quantity.OffsetMiB),
+						MinSize:    16 * quantity.SizeMiB,
+						Size:       16 * quantity.SizeMiB,
+						Filesystem: "ext4",
+						YamlIndex:  4,
+					},
+					{
+						Name:       "ubuntu-data",
+						Label:      "ubuntu-data",
+						Role:       "system-data",
+						VolumeName: "pc",
+						Type:       "83,0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+						Offset:     asOffsetPtr(1968 * quantity.OffsetMiB),
+						MinSize:    1 * quantity.SizeGiB,
+						Size:       1 * quantity.SizeGiB,
+						Filesystem: "ext4",
+						YamlIndex:  5,
+					},
+				},
+			},
+		},
+	}
+	gadgettest.SetEnclosingVolumeInStructs(sd.Volumes)
+	c.Assert(sys, check.DeepEquals, sd)
+}
+
+func (s *systemsSuite) TestSystemInstallActionSetupStorageEncryptionCallsDevicestate(c *check.C) {
+	s.testSystemInstallActionCallsDevicestate(c, "setup-storage-encryption", daemon.MockDevicestateInstallSetupStorageEncryption)
+}
+
+func (s *systemsSuite) TestSystemInstallActionFinishCallsDevicestate(c *check.C) {
+	s.testSystemInstallActionCallsDevicestate(c, "finish", daemon.MockDevicestateInstallFinish)
+}
+
+func (s *systemsSuite) testSystemInstallActionCallsDevicestate(c *check.C, step string, mocker func(func(st *state.State, label string, onVolumes map[string]*gadget.Volume) (*state.Change, error)) (restore func())) {
+	d := s.daemon(c)
+	st := d.Overlord().State()
+
+	soon := 0
+	_, restore := daemon.MockEnsureStateSoon(func(st *state.State) {
+		soon++
+	})
+	defer restore()
+
+	nCalls := 0
+	var gotOnVolumes map[string]*gadget.Volume
+	var gotLabel string
+	r := mocker(func(st *state.State, label string, onVolumes map[string]*gadget.Volume) (*state.Change, error) {
+		gotLabel = label
+		gotOnVolumes = onVolumes
+		nCalls++
+		return st.NewChange("foo", "..."), nil
+	})
+	defer r()
+
+	body := map[string]interface{}{
+		"action": "install",
+		"step":   step,
+		"on-volumes": map[string]interface{}{
+			"pc": map[string]interface{}{
+				"bootloader": "grub",
+			},
+		},
+	}
+	b, err := json.Marshal(body)
+	c.Assert(err, check.IsNil)
+	buf := bytes.NewBuffer(b)
+	req, err := http.NewRequest("POST", "/v2/systems/20191119", buf)
+	c.Assert(err, check.IsNil)
+
+	rsp := s.asyncReq(c, req, nil)
+
+	st.Lock()
+	chg := st.Change(rsp.Change)
+	st.Unlock()
+	c.Check(chg, check.NotNil)
+	c.Check(chg.ID(), check.Equals, "1")
+	c.Check(nCalls, check.Equals, 1)
+	c.Check(gotLabel, check.Equals, "20191119")
+	c.Check(gotOnVolumes, check.DeepEquals, map[string]*gadget.Volume{
+		"pc": {
+			Bootloader: "grub",
+		},
+	})
+
+	c.Check(soon, check.Equals, 1)
+}
+
+func (s *systemsSuite) TestSystemInstallActionGeneratesTasks(c *check.C) {
+	d := s.daemon(c)
+	st := d.Overlord().State()
+
+	var soon int
+	_, restore := daemon.MockEnsureStateSoon(func(st *state.State) {
+		soon++
+	})
+	defer restore()
+
+	for _, tc := range []struct {
+		installStep      string
+		expectedNumTasks int
+	}{
+		{"finish", 1},
+		{"setup-storage-encryption", 1},
+	} {
+		soon = 0
+		body := map[string]interface{}{
+			"action": "install",
+			"step":   tc.installStep,
+			"on-volumes": map[string]interface{}{
+				"pc": map[string]interface{}{
+					"bootloader": "grub",
+				},
+			},
+		}
+		b, err := json.Marshal(body)
+		c.Assert(err, check.IsNil)
+		buf := bytes.NewBuffer(b)
+		req, err := http.NewRequest("POST", "/v2/systems/20191119", buf)
+		c.Assert(err, check.IsNil)
+
+		rsp := s.asyncReq(c, req, nil)
+
+		st.Lock()
+		chg := st.Change(rsp.Change)
+		tasks := chg.Tasks()
+		st.Unlock()
+
+		c.Check(chg, check.NotNil, check.Commentf("%v", tc))
+		c.Check(tasks, check.HasLen, tc.expectedNumTasks, check.Commentf("%v", tc))
+		c.Check(soon, check.Equals, 1)
+	}
+}
+
+func (s *systemsSuite) TestSystemInstallActionErrorMissingVolumes(c *check.C) {
+	s.daemon(c)
+
+	for _, tc := range []struct {
+		installStep string
+		expectedErr string
+	}{
+		{"finish", `cannot finish install for "20191119": cannot finish install without volumes data (api)`},
+		{"setup-storage-encryption", `cannot setup storage encryption for install from "20191119": cannot setup storage encryption without volumes data (api)`},
+	} {
+		body := map[string]interface{}{
+			"action": "install",
+			"step":   tc.installStep,
+			// note that "on-volumes" is missing which will
+			// trigger a bug
+		}
+		b, err := json.Marshal(body)
+		c.Assert(err, check.IsNil)
+		buf := bytes.NewBuffer(b)
+		req, err := http.NewRequest("POST", "/v2/systems/20191119", buf)
+		c.Assert(err, check.IsNil)
+
+		rspe := s.errorReq(c, req, nil)
+		c.Check(rspe.Error(), check.Equals, tc.expectedErr)
+	}
+}
+
+func (s *systemsSuite) TestSystemInstallActionError(c *check.C) {
+	s.daemon(c)
+
+	body := map[string]string{
+		"action": "install",
+		"step":   "unknown-install-step",
+	}
+	b, err := json.Marshal(body)
+	c.Assert(err, check.IsNil)
+	buf := bytes.NewBuffer(b)
+	req, err := http.NewRequest("POST", "/v2/systems/20191119", buf)
+	c.Assert(err, check.IsNil)
+
+	rspe := s.errorReq(c, req, nil)
+	c.Check(rspe.Error(), check.Equals, `unsupported install step "unknown-install-step" (api)`)
 }

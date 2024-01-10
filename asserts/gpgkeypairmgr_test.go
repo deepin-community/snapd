@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016 Canonical Ltd
+ * Copyright (C) 2016-2021 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -28,9 +28,8 @@ import (
 	"os"
 	"time"
 
-	. "gopkg.in/check.v1"
-
 	"golang.org/x/crypto/openpgp/packet"
+	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/asserts/assertstest"
@@ -75,7 +74,16 @@ func (gkms *gpgKeypairMgrSuite) TestGetPublicKeyLooksGood(c *C) {
 
 func (gkms *gpgKeypairMgrSuite) TestGetNotFound(c *C) {
 	got, err := gkms.keypairMgr.Get("ffffffffffffffff")
-	c.Check(err, ErrorMatches, `cannot find key "ffffffffffffffff" in GPG keyring`)
+	c.Check(err, ErrorMatches, `cannot find key pair in GPG keyring`)
+	c.Check(asserts.IsKeyNotFound(err), Equals, true)
+	c.Check(got, IsNil)
+}
+
+func (gkms *gpgKeypairMgrSuite) TestGetByNameNotFound(c *C) {
+	gpgKeypairMgr := gkms.keypairMgr.(*asserts.GPGKeypairManager)
+	got, err := gpgKeypairMgr.GetByName("missing")
+	c.Check(err, ErrorMatches, `cannot find key pair in GPG keyring`)
+	c.Check(asserts.IsKeyNotFound(err), Equals, true)
 	c.Check(got, IsNil)
 }
 
@@ -328,4 +336,31 @@ Preferences: SHA512
 		parameters := gpgKeypairMgr.ParametersForGenerate(test.passphrase, "test-key")
 		c.Check(parameters, Equals, baseParameters+test.extraParameters)
 	}
+}
+
+func (gkms *gpgKeypairMgrSuite) TestList(c *C) {
+	gpgKeypairMgr := gkms.keypairMgr.(*asserts.GPGKeypairManager)
+
+	keys, err := gpgKeypairMgr.List()
+	c.Assert(err, IsNil)
+	c.Check(keys, HasLen, 1)
+	c.Check(keys[0].ID, Equals, assertstest.DevKeyID)
+	c.Check(keys[0].Name, Not(Equals), "")
+}
+
+func (gkms *gpgKeypairMgrSuite) TestDelete(c *C) {
+	defer asserts.GPGBatchYes()()
+
+	keyID := assertstest.DevKeyID
+	_, err := gkms.keypairMgr.Get(keyID)
+	c.Assert(err, IsNil)
+
+	err = gkms.keypairMgr.Delete(keyID)
+	c.Assert(err, IsNil)
+
+	err = gkms.keypairMgr.Delete(keyID)
+	c.Check(err, ErrorMatches, `cannot find key.*`)
+
+	_, err = gkms.keypairMgr.Get(keyID)
+	c.Check(err, ErrorMatches, `cannot find key.*`)
 }

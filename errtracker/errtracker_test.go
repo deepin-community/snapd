@@ -32,9 +32,8 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/mgo.v2/bson"
-
 	. "gopkg.in/check.v1"
+	"gopkg.in/mgo.v2/bson"
 
 	"github.com/snapcore/snapd/arch"
 	"github.com/snapcore/snapd/dirs"
@@ -396,7 +395,7 @@ func (s *ErrtrackerTestSuite) TestReportWithNoWhoopsieInstalled(c *C) {
 
 func (s *ErrtrackerTestSuite) TestProcCpuinfo(c *C) {
 	fn := filepath.Join(s.tmpdir, "cpuinfo")
-	// sanity check
+	// validity check
 	buf, err := ioutil.ReadFile(fn)
 	c.Assert(err, IsNil)
 	c.Check(string(buf), Equals, `

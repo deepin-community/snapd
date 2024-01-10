@@ -19,7 +19,11 @@
 package cgroup
 
 import (
+	"time"
+
 	"github.com/godbus/dbus"
+
+	"github.com/snapcore/snapd/testutil"
 )
 
 var (
@@ -34,6 +38,8 @@ var (
 	ErrDBusSpawnChildExited = errDBusSpawnChildExited
 
 	SecurityTagFromCgroupPath = securityTagFromCgroupPath
+
+	ApplyToSnap = applyToSnap
 )
 
 func MockFsTypeForPath(mock func(string) (int64, error)) (restore func()) {
@@ -44,19 +50,9 @@ func MockFsTypeForPath(mock func(string) (int64, error)) (restore func()) {
 	}
 }
 
-func MockFsRootPath(p string) (restore func()) {
-	old := rootPath
-	rootPath = p
-	return func() {
-		rootPath = old
-	}
-}
-
-func MockRandomUUID(uuid string) func() {
+func MockRandomUUID(f func() (string, error)) func() {
 	old := randomUUID
-	randomUUID = func() (string, error) {
-		return uuid, nil
-	}
+	randomUUID = f
 	return func() {
 		randomUUID = old
 	}
@@ -96,4 +92,24 @@ func MockDoCreateTransientScope(fn func(conn *dbus.Conn, unitName string, pid in
 	return func() {
 		doCreateTransientScope = old
 	}
+}
+
+func FreezerCgroupV1Dir() string { return freezerCgroupV1Dir }
+
+func MockCreateScopeJobTimeout(d time.Duration) (restore func()) {
+	oldCreateScopeJobTimeout := createScopeJobTimeout
+	createScopeJobTimeout = d
+	return func() {
+		createScopeJobTimeout = oldCreateScopeJobTimeout
+	}
+}
+
+func MockCgroupsFilePath(path string) (restore func()) {
+	r := testutil.Backup(&cgroupsFilePath)
+	cgroupsFilePath = path
+	return r
+}
+
+func MonitorDelete(folders []string, name string, channel chan string) error {
+	return currentWatcher.monitorDelete(folders, name, channel)
 }

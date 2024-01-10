@@ -1,8 +1,5 @@
 summary: Ensure that the network-control interface works.
 
-# ubuntu-14.04: systemd-run not supported
-systems: [-fedora-*, -opensuse-*, -ubuntu-14.04*]
-
 details: |
     The network-control interface allows a snap to configure networking.
 
@@ -13,6 +10,12 @@ details: |
     A snap declaring a plug on this interface must be able to modify the network configuration
     and ask for its status, the test sets up a network service, gets information about it (read
     capability) and creates an arp entry (write capability).
+
+# ubuntu-14.04: systemd-run not supported
+# ubuntu-18.04-32: network-control-consumer snap not available on i386
+# ubuntu-core-16-32: cannot install snap base "core20"
+# ubuntu-core-18-32: cannot install snap base "core20"
+systems: [-fedora-*, -opensuse-*, -ubuntu-14.04*, -ubuntu-18.04-32, -ubuntu-core-16-32, -ubuntu-core-18-32]
 
 environment:
     PORT: 8081
@@ -53,6 +56,16 @@ execute: |
 
     echo "Then the snap command can query network status information"
     network-control-consumer.cmd ss -lnt | MATCH "LISTEN.*:$PORT"
+
+    echo "And DNS information"
+    case "$SPREAD_SYSTEM" in
+    centos-*|debian-*|arch-linux-*|amazon-linux-*)
+        # echo no systemd-resolved in those images
+        ;;
+    *)
+        network-control-consumer.cmd resolvectl | MATCH "DNS Server"
+        ;;
+    esac
 
     if [ "$(snap debug confinement)" = strict ] ; then
         echo "When the plug is disconnected"
@@ -103,10 +116,16 @@ execute: |
     network-control-consumer.cmd ip link set veth1 netns test-ns
 
     ip link list | MATCH "veth0"
-    ip link list | not MATCH "veth1"
+    ip link list | NOMATCH "veth1"
 
     echo "And a command can be executed in the context of the namespace"
     network-control-consumer.cmd ip netns exec test-ns ip link list | MATCH "veth1"
+
+    # xdp is only support by apparmor in 20.04+
+    if [ "$(snap debug confinement)" = strict ] && ! os.query is-xenial && ! os.query is-bionic && ! os.query is-core16 && ! os.query is-core18; then
+        echo "Check that AF_XDP can be used"
+        network-control-consumer.cmd python3 -c 'import socket; AF_XDP=44; socket.socket(AF_XDP, socket.SOCK_RAW)'
+    fi
 
     if [ "$(snap debug confinement)" = strict ] ; then
         echo "And the policy has the ptrace suppression rule"
@@ -137,4 +156,14 @@ execute: |
             exit 1
         fi
         MATCH "Permission denied" < ns-exec.output
+
+
+        echo "And AF_XDP can no longer be used"
+        if [ "$(snap debug confinement)" = strict ] && ! os.query is-xenial && ! os.query is-bionic && ! os.query is-core16 && ! os.query is-core18; then
+            if network-control-consumer.cmd python3 -c 'import socket; AF_XDP=44; socket.socket(AF_XDP, socket.SOCK_RAW)' 2> python-af-xdp.output; then
+                echo "Expected error trying to open AF_XDP socket"
+                exit 1
+            fi
+            MATCH "Permission denied" < python-af-xdp.output
+        fi
     fi

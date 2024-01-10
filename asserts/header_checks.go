@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2015-2020 Canonical Ltd
+ * Copyright (C) 2015-2022 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -93,9 +93,9 @@ func checkAssertType(assertType *AssertionType) error {
 	if assertType == nil {
 		return fmt.Errorf("internal error: assertion type cannot be nil")
 	}
-	// sanity check against known canonical
-	sanity := typeRegistry[assertType.Name]
-	switch sanity {
+	// validity check against known canonical
+	validity := typeRegistry[assertType.Name]
+	switch validity {
 	case assertType:
 		// fine, matches canonical
 		return nil
@@ -180,10 +180,6 @@ func checkRFC3339DateWhat(m map[string]interface{}, name, what string) (time.Tim
 	return date, nil
 }
 
-func checkRFC3339DateWithDefault(headers map[string]interface{}, name string, defl time.Time) (time.Time, error) {
-	return checkRFC3339DateWithDefaultWhat(headers, name, "header", defl)
-}
-
 func checkRFC3339DateWithDefaultWhat(m map[string]interface{}, name, what string, defl time.Time) (time.Time, error) {
 	value, ok := m[name]
 	if !ok {
@@ -201,34 +197,42 @@ func checkRFC3339DateWithDefaultWhat(m map[string]interface{}, name, what string
 }
 
 func checkUint(headers map[string]interface{}, name string, bitSize int) (uint64, error) {
-	valueStr, err := checkNotEmptyString(headers, name)
+	return checkUintWhat(headers, name, bitSize, "header")
+}
+
+func checkUintWhat(headers map[string]interface{}, name string, bitSize int, what string) (uint64, error) {
+	valueStr, err := checkNotEmptyStringWhat(headers, name, what)
 	if err != nil {
 		return 0, err
 	}
 	value, err := strconv.ParseUint(valueStr, 10, bitSize)
 	if err != nil {
 		if ne, ok := err.(*strconv.NumError); ok && ne.Err == strconv.ErrRange {
-			return 0, fmt.Errorf("%q header is out of range: %v", name, valueStr)
+			return 0, fmt.Errorf("%q %s is out of range: %v", name, what, valueStr)
 		}
-		return 0, fmt.Errorf("%q header is not an unsigned integer: %v", name, valueStr)
+		return 0, fmt.Errorf("%q %s is not an unsigned integer: %v", name, what, valueStr)
 	}
 	if prefixZeros(valueStr) {
-		return 0, fmt.Errorf("%q header has invalid prefix zeros: %s", name, valueStr)
+		return 0, fmt.Errorf("%q %s has invalid prefix zeros: %s", name, what, valueStr)
 	}
 	return value, nil
 }
 
 func checkDigest(headers map[string]interface{}, name string, h crypto.Hash) ([]byte, error) {
-	digestStr, err := checkNotEmptyString(headers, name)
+	return checkDigestWhat(headers, name, h, "header")
+}
+
+func checkDigestWhat(headers map[string]interface{}, name string, h crypto.Hash, what string) ([]byte, error) {
+	digestStr, err := checkNotEmptyStringWhat(headers, name, what)
 	if err != nil {
 		return nil, err
 	}
 	b, err := base64.RawURLEncoding.DecodeString(digestStr)
 	if err != nil {
-		return nil, fmt.Errorf("%q header cannot be decoded: %v", name, err)
+		return nil, fmt.Errorf("%q %s cannot be decoded: %v", name, what, err)
 	}
 	if len(b) != h.Size() {
-		return nil, fmt.Errorf("%q header does not have the expected bit length: %d", name, len(b)*8)
+		return nil, fmt.Errorf("%q %s does not have the expected bit length: %d", name, what, len(b)*8)
 	}
 
 	return b, nil
@@ -288,25 +292,33 @@ func checkStringMatchesWhat(headers map[string]interface{}, name, what string, p
 }
 
 func checkOptionalBool(headers map[string]interface{}, name string) (bool, error) {
+	return checkOptionalBoolWhat(headers, name, "header")
+}
+
+func checkOptionalBoolWhat(headers map[string]interface{}, name, what string) (bool, error) {
 	value, ok := headers[name]
 	if !ok {
 		return false, nil
 	}
 	s, ok := value.(string)
 	if !ok || (s != "true" && s != "false") {
-		return false, fmt.Errorf("%q header must be 'true' or 'false'", name)
+		return false, fmt.Errorf("%q %s must be 'true' or 'false'", name, what)
 	}
 	return s == "true", nil
 }
 
 func checkMap(headers map[string]interface{}, name string) (map[string]interface{}, error) {
-	value, ok := headers[name]
+	return checkMapWhat(headers, name, "header")
+}
+
+func checkMapWhat(m map[string]interface{}, name, what string) (map[string]interface{}, error) {
+	value, ok := m[name]
 	if !ok {
 		return nil, nil
 	}
-	m, ok := value.(map[string]interface{})
+	mv, ok := value.(map[string]interface{})
 	if !ok {
-		return nil, fmt.Errorf("%q header must be a map", name)
+		return nil, fmt.Errorf("%q %s must be a map", name, what)
 	}
-	return m, nil
+	return mv, nil
 }

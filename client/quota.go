@@ -23,56 +23,105 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"time"
 
-	"golang.org/x/xerrors"
+	"github.com/snapcore/snapd/gadget/quantity"
 )
 
 type postQuotaData struct {
-	Action    string   `json:"action"`
-	GroupName string   `json:"group-name"`
-	Parent    string   `json:"parent,omitempty"`
-	Snaps     []string `json:"snaps,omitempty"`
-	MaxMemory uint64   `json:"max-memory,omitempty"`
+	Action      string       `json:"action"`
+	GroupName   string       `json:"group-name"`
+	Parent      string       `json:"parent,omitempty"`
+	Snaps       []string     `json:"snaps,omitempty"`
+	Services    []string     `json:"services,omitempty"`
+	Constraints *QuotaValues `json:"constraints,omitempty"`
 }
 
 type QuotaGroupResult struct {
-	GroupName string   `json:"group-name"`
-	Parent    string   `json:"parent,omitempty"`
-	Subgroups []string `json:"subgroups,omitempty"`
-	Snaps     []string `json:"snaps,omitempty"`
-	MaxMemory uint64   `json:"max-memory"`
+	GroupName   string       `json:"group-name"`
+	Parent      string       `json:"parent,omitempty"`
+	Subgroups   []string     `json:"subgroups,omitempty"`
+	Snaps       []string     `json:"snaps,omitempty"`
+	Services    []string     `json:"services,omitempty"`
+	Constraints *QuotaValues `json:"constraints,omitempty"`
+	Current     *QuotaValues `json:"current,omitempty"`
 }
 
-// EnsureQuota creates a quota group or updates an existing group.
-// The list of snaps can be empty.
-func (client *Client) EnsureQuota(groupName string, parent string, snaps []string, maxMemory uint64) error {
+type QuotaCPUValues struct {
+	Count      int `json:"count,omitempty"`
+	Percentage int `json:"percentage,omitempty"`
+}
+
+type QuotaCPUSetValues struct {
+	CPUs []int `json:"cpus,omitempty"`
+}
+
+type QuotaJournalRate struct {
+	RateCount  int           `json:"rate-count"`
+	RatePeriod time.Duration `json:"rate-period"`
+}
+
+type QuotaJournalValues struct {
+	Size quantity.Size `json:"size,omitempty"`
+	*QuotaJournalRate
+}
+
+type QuotaValues struct {
+	Memory  quantity.Size       `json:"memory,omitempty"`
+	CPU     *QuotaCPUValues     `json:"cpu,omitempty"`
+	CPUSet  *QuotaCPUSetValues  `json:"cpu-set,omitempty"`
+	Threads int                 `json:"threads,omitempty"`
+	Journal *QuotaJournalValues `json:"journal,omitempty"`
+}
+
+type EnsureQuotaOptions struct {
+	// Parent is used to assign a Parent quota group
+	Parent string
+	// Snaps that should be added to the quota group
+	Snaps []string
+	// Services that should be added to the quota group
+	Services []string
+	// Constraints are the resource limits that should be applied to the quota group,
+	// these are added or modified, not removed.
+	Constraints *QuotaValues
+}
+
+// EnsureQuota creates a quota group or updates an existing group with the options
+// provided.
+func (client *Client) EnsureQuota(groupName string, opts *EnsureQuotaOptions) (changeID string, err error) {
 	if groupName == "" {
-		return xerrors.Errorf("cannot create or update quota group without a name")
+		return "", fmt.Errorf("cannot create or update quota group without a name")
 	}
+	if opts == nil {
+		return "", fmt.Errorf("cannot create or update quota group without any options")
+	}
+
 	// TODO: use naming.ValidateQuotaGroup()
 
 	data := &postQuotaData{
-		Action:    "ensure",
-		GroupName: groupName,
-		Parent:    parent,
-		Snaps:     snaps,
-		MaxMemory: maxMemory,
+		Action:      "ensure",
+		GroupName:   groupName,
+		Parent:      opts.Parent,
+		Snaps:       opts.Snaps,
+		Services:    opts.Services,
+		Constraints: opts.Constraints,
 	}
 
 	var body bytes.Buffer
 	if err := json.NewEncoder(&body).Encode(data); err != nil {
-		return err
+		return "", err
 	}
-	if _, err := client.doSync("POST", "/v2/quotas", nil, nil, &body, nil); err != nil {
-		fmt := "cannot create or update quota group: %w"
-		return xerrors.Errorf(fmt, err)
+	chgID, err := client.doAsync("POST", "/v2/quotas", nil, nil, &body)
+
+	if err != nil {
+		return "", err
 	}
-	return nil
+	return chgID, nil
 }
 
 func (client *Client) GetQuotaGroup(groupName string) (*QuotaGroupResult, error) {
 	if groupName == "" {
-		return nil, xerrors.Errorf("cannot get quota group without a name")
+		return nil, fmt.Errorf("cannot get quota group without a name")
 	}
 
 	var res *QuotaGroupResult
@@ -80,12 +129,13 @@ func (client *Client) GetQuotaGroup(groupName string) (*QuotaGroupResult, error)
 	if _, err := client.doSync("GET", path, nil, nil, nil, &res); err != nil {
 		return nil, err
 	}
+
 	return res, nil
 }
 
-func (client *Client) RemoveQuotaGroup(groupName string) error {
+func (client *Client) RemoveQuotaGroup(groupName string) (changeID string, err error) {
 	if groupName == "" {
-		return xerrors.Errorf("cannot remove quota group without a name")
+		return "", fmt.Errorf("cannot remove quota group without a name")
 	}
 	data := &postQuotaData{
 		Action:    "remove",
@@ -94,12 +144,14 @@ func (client *Client) RemoveQuotaGroup(groupName string) error {
 
 	var body bytes.Buffer
 	if err := json.NewEncoder(&body).Encode(data); err != nil {
-		return err
+		return "", err
 	}
-	if _, err := client.doSync("POST", "/v2/quotas", nil, nil, &body, nil); err != nil {
-		return err
+	chgID, err := client.doAsync("POST", "/v2/quotas", nil, nil, &body)
+	if err != nil {
+		return "", fmt.Errorf("cannot remove quota group: %w", err)
 	}
-	return nil
+
+	return chgID, nil
 }
 
 func (client *Client) Quotas() ([]*QuotaGroupResult, error) {
@@ -107,5 +159,6 @@ func (client *Client) Quotas() ([]*QuotaGroupResult, error) {
 	if _, err := client.doSync("GET", "/v2/quotas", nil, nil, nil, &res); err != nil {
 		return nil, err
 	}
+
 	return res, nil
 }

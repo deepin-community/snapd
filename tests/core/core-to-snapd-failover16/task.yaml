@@ -4,9 +4,7 @@ summary: Test the failover scenario of the snapd snap installation on a UC16 sys
 systems: [ubuntu-core-16-*]
 
 prepare: |
-  # shellcheck source=tests/lib/snaps.sh
-  . "$TESTSLIB/snaps.sh"
-  repack_installed_core_snap_into_snapd_snap
+  "$TESTSTOOLS"/snaps-state repack_core_snap_into_snapd_snap
 
 restore: |
   rm -f /etc/systemd/user/snapd.session-agent.service
@@ -56,5 +54,8 @@ execute: |
 
     test ! -e /etc/systemd/system/snapd.service
     test ! -e /etc/systemd/system/usr-lib-snapd.mount
+    test ! -e /etc/systemd/system/snapd.mounts.target
+    test ! -e /etc/systemd/system/snapd.mounts-pre.target
+    test ! -e /etc/systemd/system/snap-snapd-x1.mount
     test ! -e /snap/snapd/x1
   done

@@ -8,50 +8,63 @@ environment:
     NEW_GADGET: test-snapd-pc
 
 prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     #shellcheck source=tests/lib/core-config.sh
     . "$TESTSLIB"/core-config.sh
     #shellcheck source=tests/lib/systemd.sh
     . "$TESTSLIB"/systemd.sh
-    systemctl stop snapd.service snapd.socket
-    clean_snapd_lib
 
-    # Generic setup for test account
-    prepare_core_model
-    prepare_test_account developer1
-    prepare_test_model developer1-pc
-    prepare_testrootorg_store
+    if [ "$SPREAD_REBOOT" = 0 ]; then
+        REBOOT_NEEDED=false
+        if os.query is-core18 && snap list snapd | NOMATCH ' x1 '; then
+            REBOOT_NEEDED=true
+        fi
 
-    # kick first boot again
-    systemctl start snapd.service snapd.socket
+        systemctl stop snapd.service snapd.socket
+
+        clean_snapd_lib
+        prepare_core_model
+        prepare_test_account valid-for-testing
+        prepare_test_model valid-for-testing-pc
+
+        # kick first boot again
+        systemctl start snapd.service snapd.socket
+
+        if [ "$REBOOT_NEEDED" = true ] && "$TESTSTOOLS"/journal-state match-log -n 30 "Waiting for system reboot"; then
+            REBOOT
+        fi
+    fi
 
     # wait for first boot to be done
     wait_for_first_boot_change
+    # and for the serial to be available
+    wait_for_device_initialized_change
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     #shellcheck source=tests/lib/core-config.sh
     . "$TESTSLIB"/core-config.sh
     #shellcheck source=tests/lib/systemd.sh
     . "$TESTSLIB"/systemd.sh
 
-    systemctl stop snapd.service snapd.socket
-    clean_snapd_lib
+    if [ "$SPREAD_REBOOT" = 0 ]; then
+        REBOOT_NEEDED=false
+        if os.query is-core18 && snap list snapd | NOMATCH ' x1 '; then
+            REBOOT_NEEDED=true
+        fi
 
-    # Generic restore for test account
-    restore_test_account developer1
-    restore_test_model developer1-pc
-    restore_testrootorg_store
-    restore_core_model
+        systemctl stop snapd.service snapd.socket
 
-    # kick first boot again
-    systemctl start snapd.service snapd.socket
+        clean_snapd_lib
+        restore_test_account valid-for-testing
+        restore_test_model valid-for-testing-pc
+        restore_core_model
+
+        # kick first boot again
+        systemctl start snapd.service snapd.socket
+
+        if [ "$REBOOT_NEEDED" = true ] && "$TESTSTOOLS"/journal-state match-log -n 30 "Waiting for system reboot"; then
+            REBOOT
+        fi
+    fi
 
     # wait for first boot to be done
     snap wait system seed.loaded
@@ -72,11 +85,8 @@ restore: |
         find /var/snap
         exit 1
     fi
+
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     #shellcheck source=tests/lib/core-config.sh
     . "$TESTSLIB"/core-config.sh
 
@@ -96,14 +106,14 @@ execute: |
 
     # initial boot with the current model
     if [ "$SPREAD_REBOOT" = 0 ]; then
-        # sanity check
+        # precondition check
         snap list "$OLD_GADGET"
 
         echo "We have the right model assertion"
         snap debug model|MATCH "model: my-model"
 
         echo "Now we remodel"
-        MODEL="$(get_test_model developer1-pc-new-gadget)"
+        MODEL="$(get_test_model valid-for-testing-pc-new-gadget-revno-2)"
         snap remodel "${TESTSLIB}/assertions/${MODEL}"
 
         echo "Double check that new gadget was installed"
@@ -129,7 +139,7 @@ execute: |
         snap remove --purge "$OLD_GADGET"
 
         echo "And we can remodel again and remove the new gadget"
-        MODEL="$(get_test_model developer1-pc-revno3)"
+        MODEL="$(get_test_model valid-for-testing-pc-revno-3)"
         snap remodel "${TESTSLIB}/assertions/${MODEL}"
 
         REBOOT

@@ -60,11 +60,12 @@ package apparmor
 // The preamble and default accesses common to all bases go in templateCommon.
 // These rules include the aformentioned host file rules as well as non-file
 // rules (eg signal, dbus, unix, etc).
-//
 var templateCommon = `
 # vim:syntax=apparmor
 
 #include <tunables/global>
+
+###INCLUDE_IF_EXISTS_SNAP_TUNING###
 
 # snapd supports the concept of 'parallel installs' where snaps with the same
 # name are differentiated by '_<instance>' such that foo, foo_bar and foo_baz
@@ -91,6 +92,17 @@ var templateCommon = `
   # The base abstraction doesn't yet have this
   /etc/sysconfig/clock r,
   owner @{PROC}/@{pid}/maps k,
+
+  # /proc/XXXX/map_files contains the same info than /proc/XXXX/maps, but
+  # in a format that is simpler to manage, because it doesn't require to
+  # parse the text data inside a file, but just reading the contents of
+  # a directory.
+  # Reading /proc/XXXX/maps is already allowed in the base template
+  # via <abstractions/base>. Also, only the owner can read it, and the
+  # kernel limits access to it by requiring 'ptrace' enabled, so allowing
+  # to access /proc/XXXX/map_files can be considered secure too.
+  owner @{PROC}/@{pid}/map_files/ r,
+
   # While the base abstraction has rules for encryptfs encrypted home and
   # private directories, it is missing rules for directory read on the toplevel
   # directory of the mount (LP: #1848919)
@@ -99,7 +111,7 @@ var templateCommon = `
 
   # for python apps/services
   #include <abstractions/python>
-  /etc/python3.[0-9]/**                                r,
+  /etc/python3.[0-9]*/**                                r,
 
   # explicitly deny noisy denials to read-only filesystems (see LP: #1496895
   # for details)
@@ -163,6 +175,7 @@ var templateCommon = `
   /run/systemd/userdb/io.systemd.DynamicUser rw,        # systemd-exec users
   /run/systemd/userdb/io.systemd.Home rw,               # systemd-home dirs
   /run/systemd/userdb/io.systemd.NameServiceSwitch rw,  # UNIX/glibc NSS
+  /run/systemd/userdb/io.systemd.Machine rw,            # systemd-machined
 
   /etc/libnl-3/{classid,pktloc} r,      # apps that use libnl
 
@@ -189,10 +202,12 @@ var templateCommon = `
   /usr/lib/os-release k,
 
   # systemd native journal API (see sd_journal_print(4)). This should be in
-  # AppArmor's base abstraction, but until it is, include here.
-  /run/systemd/journal/socket w,
-  /run/systemd/journal/stdout rw, # 'r' shouldn't be needed, but journald
-                                  # doesn't leak anything so allow
+  # AppArmor's base abstraction, but until it is, include here. We include
+  # the base journal path as well as the journal namespace pattern path. Each
+  # journal namespace for quota groups will be prefixed with 'snap-'.
+  /run/systemd/journal{,.snap-*}/socket w,
+  /run/systemd/journal{,.snap-*}/stdout rw, # 'r' shouldn't be needed, but journald
+                                            # doesn't leak anything so allow
 
   # snapctl and its requirements
   /usr/bin/snapctl ixr,
@@ -248,6 +263,7 @@ var templateCommon = `
   /etc/{,writable/}mailname r,
   /etc/{,writable/}timezone r,
   owner @{PROC}/@{pid}/cgroup rk,
+  @{PROC}/@{pid}/cpuset r,
   @{PROC}/@{pid}/io r,
   owner @{PROC}/@{pid}/limits r,
   owner @{PROC}/@{pid}/loginuid r,
@@ -267,6 +283,8 @@ var templateCommon = `
   @{PROC}/sys/kernel/pid_max r,
   @{PROC}/sys/kernel/yama/ptrace_scope r,
   @{PROC}/sys/kernel/shmmax r,
+  # Allow apps to introspect the level of dbus mediation AppArmor implements.
+  /sys/kernel/security/apparmor/features/dbus/mask r,
   @{PROC}/sys/fs/file-max r,
   @{PROC}/sys/fs/file-nr r,
   @{PROC}/sys/fs/inotify/max_* r,
@@ -274,6 +292,7 @@ var templateCommon = `
   @{PROC}/sys/kernel/random/boot_id r,
   @{PROC}/sys/kernel/random/entropy_avail r,
   @{PROC}/sys/kernel/random/uuid r,
+  @{PROC}/sys/kernel/cap_last_cap r,
   # Allow access to the uuidd daemon (this daemon is a thin wrapper around
   # time and getrandom()/{,u}random and, when available, runs under an
   # unprivilged, dedicated user).
@@ -281,6 +300,7 @@ var templateCommon = `
   /sys/devices/virtual/tty/{console,tty*}/active r,
   /sys/fs/cgroup/memory/{,user.slice/}memory.limit_in_bytes r,
   /sys/fs/cgroup/memory/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/memory.limit_in_bytes r,
+  /sys/fs/cgroup/memory/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/memory.stat r,
   /sys/fs/cgroup/cpu,cpuacct/{,user.slice/}cpu.cfs_{period,quota}_us r,
   /sys/fs/cgroup/cpu,cpuacct/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/cpu.cfs_{period,quota}_us r,
   /sys/fs/cgroup/cpu,cpuacct/{,user.slice/}cpu.shares r,
@@ -332,6 +352,15 @@ var templateCommon = `
   # bind mount *not* used here (see 'parallel installs', above)
   owner @{HOME}/snap/@{SNAP_INSTANCE_NAME}/                  r,
   owner @{HOME}/snap/@{SNAP_INSTANCE_NAME}/**                mrkix,
+
+  # Experimental snap folder changes
+  owner @{HOME}/.snap/data/@{SNAP_INSTANCE_NAME}/                    r,
+  owner @{HOME}/.snap/data/@{SNAP_INSTANCE_NAME}/**                  mrkix,
+  owner @{HOME}/.snap/data/@{SNAP_INSTANCE_NAME}/@{SNAP_REVISION}/** wl,
+  owner @{HOME}/.snap/data/@{SNAP_INSTANCE_NAME}/common/**           wl,
+
+  owner @{HOME}/Snap/@{SNAP_INSTANCE_NAME}/                          r,
+  owner @{HOME}/Snap/@{SNAP_INSTANCE_NAME}/**                        mrkixwl,
 
   # Writable home area for this version.
   # bind mount *not* used here (see 'parallel installs', above)
@@ -402,7 +431,7 @@ var templateCommon = `
   signal (receive) peer=unconfined,
 
   # for 'udevadm trigger --verbose --dry-run --tag-match=snappy-assign'
-  /{,s}bin/udevadm ixr,
+  /{,usr/}{,s}bin/udevadm ixr,
   /etc/udev/udev.conf r,
   /{,var/}run/udev/tags/snappy-assign/ r,
   @{PROC}/cmdline r,
@@ -454,6 +483,8 @@ var templateCommon = `
   /run/lock/ r,
   /run/lock/snap.@{SNAP_INSTANCE_NAME}/ rw,
   /run/lock/snap.@{SNAP_INSTANCE_NAME}/** mrwklix,
+  
+  ###DEVMODE_SNAP_CONFINE###
 `
 
 var templateFooter = `
@@ -475,10 +506,10 @@ var defaultCoreRuntimeTemplateRules = `
   # for python apps/services
   /usr/bin/python{,2,2.[0-9]*,3,3.[0-9]*} ixr,
   # additional accesses needed for newer pythons in later bases
-  /usr/lib{,32,64}/python3.[0-9]/**.{pyc,so}           mr,
-  /usr/lib{,32,64}/python3.[0-9]/**.{egg,py,pth}       r,
-  /usr/lib{,32,64}/python3.[0-9]/{site,dist}-packages/ r,
-  /usr/lib{,32,64}/python3.[0-9]/lib-dynload/*.so      mr,
+  /usr/lib{,32,64}/python3.[0-9]*/**.{pyc,so}           mr,
+  /usr/lib{,32,64}/python3.[0-9]*/**.{egg,py,pth}       r,
+  /usr/lib{,32,64}/python3.[0-9]*/{site,dist}-packages/ r,
+  /usr/lib{,32,64}/python3.[0-9]*/lib-dynload/*.so      mr,
   /usr/include/python3.[0-9]*/pyconfig.h               r,
 
   # for perl apps/services
@@ -500,6 +531,7 @@ var defaultCoreRuntimeTemplateRules = `
   /{,usr/}bin/base64 ixr,
   /{,usr/}bin/basename ixr,
   /{,usr/}bin/bunzip2 ixr,
+  /{,usr/}bin/busctl ixr,
   /{,usr/}bin/bzcat ixr,
   /{,usr/}bin/bzdiff ixr,
   /{,usr/}bin/bzgrep ixr,
@@ -544,7 +576,7 @@ var defaultCoreRuntimeTemplateRules = `
   /{,usr/}bin/kill ixr,
   /{,usr/}bin/ldd ixr,
   /{usr/,}lib{,32,64}/ld{,32,64}-*.so ix,
-  /{usr/,}lib/@{multiarch}/ld{,32,64}-*.so ix,
+  /{usr/,}lib/@{multiarch}/ld{,32,64}-*.so* ix,
   /{,usr/}bin/less{,file,pipe} ixr,
   /{,usr/}bin/ln ixr,
   /{,usr/}bin/line ixr,
@@ -561,6 +593,7 @@ var defaultCoreRuntimeTemplateRules = `
   /{,usr/}bin/mv ixr,
   /{,usr/}bin/nice ixr,
   /{,usr/}bin/nohup ixr,
+  /{,usr/}bin/numfmt ixr,
   /{,usr/}bin/od ixr,
   /{,usr/}bin/openssl ixr, # may cause harmless capability block_suspend denial
   /{,usr/}bin/paste ixr,
@@ -606,7 +639,7 @@ var defaultCoreRuntimeTemplateRules = `
   /{,usr/}bin/uptime ixr,
   /{,usr/}bin/vdir ixr,
   /{,usr/}bin/wc ixr,
-  /{,usr/}bin/which ixr,
+  /{,usr/}bin/which{,.debianutils} ixr,
   /{,usr/}bin/xargs ixr,
   /{,usr/}bin/xz ixr,
   /{,usr/}bin/yes ixr,
@@ -760,10 +793,10 @@ var defaultOtherBaseTemplate = templateCommon + defaultOtherBaseTemplateRules + 
 // to send signals to other users (even within the same snap). We want to
 // maintain this with our privilege dropping rules, so we omit 'capability
 // kill' since snaps can work within the system without 'capability kill':
-// - root parent can drop, spawn a child and later (dropped) parent can send a
-//   signal
-// - root parent can spawn a child that drops, then later temporarily drop
-//   (ie, seteuid/setegid), send the signal, then reraise
+//   - root parent can drop, spawn a child and later (dropped) parent can send a
+//     signal
+//   - root parent can spawn a child that drops, then later temporarily drop
+//     (ie, seteuid/setegid), send the signal, then reraise
 var privDropAndChownRules = `
   # allow setuid, setgid and chown for privilege dropping (mediation is done
   # via seccomp). Note: CAP_SETUID allows (and CAP_SETGID is the same, but
@@ -792,6 +825,15 @@ var privDropAndChownRules = `
   # processes that ultimately run as non-root will send signals to those
   # processes as the matching non-root user.
   #capability kill,
+`
+
+// coreSnippet contains apparmor rules specific only for
+// snaps on native core systems.
+var coreSnippet = `
+# Allow each snaps to access each their own folder on the
+# ubuntu-save partition, with write permissions.
+/var/lib/snapd/save/snap/@{SNAP_INSTANCE_NAME}/ rw,
+/var/lib/snapd/save/snap/@{SNAP_INSTANCE_NAME}/** mrwklix,
 `
 
 // classicTemplate contains apparmor template used for snaps with classic
@@ -846,28 +888,6 @@ var classicJailmodeSnippet = `
   @{INSTALL_DIR}/core/*/usr/lib/snapd/snap-exec m,
 `
 
-// nfsSnippet contains extra permissions necessary for snaps and snap-confine
-// to operate when NFS is used. This is an imperfect solution as this grants
-// some network access to all the snaps on the system.
-// For tracking see https://bugs.launchpad.net/apparmor/+bug/1724903
-var nfsSnippet = `
-  # snapd autogenerated workaround for systems using NFS, for details see:
-  # https://bugs.launchpad.net/ubuntu/+source/snapd/+bug/1662552
-  network inet,
-  network inet6,
-`
-
-// overlayRootSnippet contains the extra permissions necessary for snap and
-// snap-confine to operate on systems where '/' is a writable overlay fs.
-// AppArmor requires directory reads for upperdir (but these aren't otherwise
-// visible to the snap). While we filter AppArmor regular expression (AARE)
-// characters elsewhere, we double quote the path in case UPPERDIR has spaces.
-var overlayRootSnippet = `
-  # snapd autogenerated workaround for systems using '/' on overlayfs. For
-  # details see: https://bugs.launchpad.net/apparmor/+bug/1703674
-  "###UPPERDIR###/{,**/}" r,
-`
-
 var ptraceTraceDenySnippet = `
 # While commands like 'ps', 'ip netns identify <pid>', 'ip netns pids foo', etc
 # trigger a 'ptrace (trace)' denial, they aren't actually tracing other
@@ -880,6 +900,17 @@ var ptraceTraceDenySnippet = `
 # dangerous access frivolously.
 deny ptrace (trace),
 deny capability sys_ptrace,
+`
+
+var sysModuleCapabilityDenySnippet = `
+# The rtnetlink kernel interface can trigger the loading of kernel modules,
+# first attempting to operate on a network module (this requires the net_admin
+# capability) and falling back to loading ordinary modules (and this requires
+# the sys_module capability). For reference, see the dev_load() function in:
+# https://kernel.ubuntu.com/git/ubuntu/ubuntu-focal.git/tree/net/core/dev_ioctl.c?h=v5.13#n354
+# The following rule is used to silence the denials for attempting to load
+# generic kernel modules, while still allowing the loading of network modules.
+deny capability sys_module,
 `
 
 // updateNSTemplate defines the apparmor profile for per-snap snap-update-ns.
@@ -927,6 +958,10 @@ profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
 
   # golang runtime variables
   /sys/kernel/mm/transparent_hugepage/hpage_pmd_size r,
+  # glibc 2.27+ may poke this file to find out the number of CPUs
+  # available in the system when creating a new arena for malloc, see
+  # Golang issue 25628
+  /sys/devices/system/cpu/online r,
 
   # Allow reading the command line (snap-update-ns uses it in pre-Go bootstrap code).
   @{PROC}/@{pid}/cmdline r,
@@ -935,6 +970,9 @@ profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
   @{PROC}/@{pid}/fd/* r,
   # Allow reading /proc/version. For release.go WSL detection.
   @{PROC}/version r,
+
+  # Allow reading own cgroups
+  @{PROC}/@{pid}/cgroup r,
 
   # Allow reading somaxconn, required in newer distro releases
   @{PROC}/sys/net/core/somaxconn r,
@@ -981,7 +1019,15 @@ profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
   capability dac_override,
 
   # Allow freezing and thawing the per-snap cgroup freezers
+  # v1 hierarchy where we know the group name of all processes of
+  # a given snap upfront
   /sys/fs/cgroup/freezer/snap.###SNAP_INSTANCE_NAME###/freezer.state rw,
+  # v2 hierarchy, where we need to walk the tree to looking for the tracking
+  # groups and act on each one
+  /sys/fs/cgroup/ r,
+  /sys/fs/cgroup/** r,
+  /sys/fs/cgroup/**/snap.###SNAP_INSTANCE_NAME###.*.scope/cgroup.freeze rw,
+  /sys/fs/cgroup/**/snap.###SNAP_INSTANCE_NAME###.*.service/cgroup.freeze rw,
 
   # Allow the content interface to bind fonts from the host filesystem
   mount options=(ro bind) /var/lib/snapd/hostfs/usr/share/fonts/ -> /snap/###SNAP_INSTANCE_NAME###/*/**,
@@ -1023,6 +1069,10 @@ profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
 
   # snapd logger.go checks /proc/cmdline
   @{PROC}/cmdline r,
+
+  # snap checks if vendored apparmor parser should be used at startup
+  /usr/lib/snapd/info r,
+  /lib/apparmor/functions r,
 
 ###SNIPPETS###
 }

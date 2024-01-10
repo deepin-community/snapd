@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 
 	. "gopkg.in/check.v1"
@@ -34,6 +35,8 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/channel"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/store"
 )
 
@@ -52,16 +55,25 @@ func (s *themesSuite) SetUpTest(c *C) {
 	s.err = store.ErrSnapNotFound
 }
 
-func (s *themesSuite) SnapInfo(ctx context.Context, spec store.SnapSpec, user *auth.UserState) (*snap.Info, error) {
+func (s *themesSuite) SnapExists(ctx context.Context, spec store.SnapSpec, user *auth.UserState) (naming.SnapRef, *channel.Channel, error) {
 	s.pokeStateLock()
 	if info := s.available[spec.Name]; info != nil {
-		return info, nil
+		ch, err := channel.Parse(info.Channel, "")
+		if err != nil {
+			panic(fmt.Sprintf("bad Info Channel: %v", err))
+		}
+		return info, &ch, nil
 	}
-	return nil, s.err
+	return nil, nil, s.err
 }
 
 func (s *themesSuite) daemon(c *C) *daemon.Daemon {
 	return s.apiBaseSuite.daemonWithStore(c, s)
+}
+
+func (s *themesSuite) expectThemesAccess() {
+	s.expectReadAccess(daemon.ThemesOpenAccess{})
+	s.expectWriteAccess(daemon.ThemesAuthenticatedAccess{Polkit: "io.snapcraft.snapd.manage"})
 }
 
 func (s *themesSuite) TestInstalledThemes(c *C) {
@@ -317,6 +329,7 @@ slots:
 }
 
 func (s *themesSuite) TestThemesCmdGet(c *C) {
+	s.expectThemesAccess()
 	s.daemon(c)
 	s.available = map[string]*snap.Info{
 		"gtk-theme-foo": {
@@ -359,7 +372,7 @@ func (s *themesSuite) TestThemesCmdGet(c *C) {
 }
 
 func (s *themesSuite) daemonWithIfaceMgr(c *C) *daemon.Daemon {
-	d := s.apiBaseSuite.daemonWithOverlordMock(c)
+	d := s.apiBaseSuite.daemonWithOverlordMock()
 
 	overlord := d.Overlord()
 	st := overlord.State()
@@ -380,6 +393,7 @@ func (s *themesSuite) daemonWithIfaceMgr(c *C) *daemon.Daemon {
 }
 
 func (s *themesSuite) TestThemesCmdPost(c *C) {
+	s.expectThemesAccess()
 	s.daemonWithIfaceMgr(c)
 
 	s.available = map[string]*snap.Info{
@@ -402,7 +416,7 @@ func (s *themesSuite) TestThemesCmdPost(c *C) {
 			},
 		},
 	}
-	restore := daemon.MockSnapstateInstallMany(func(s *state.State, names []string, userID int) ([]string, []*state.TaskSet, error) {
+	restore := daemon.MockSnapstateInstallMany(func(s *state.State, names []string, _ []*snapstate.RevisionOptions, _ int, _ *snapstate.Flags) ([]string, []*state.TaskSet, error) {
 		t := s.NewTask("fake-theme-install", "Theme install")
 		return names, []*state.TaskSet{state.NewTaskSet(t)}, nil
 	})

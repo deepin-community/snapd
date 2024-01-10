@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2021  Canonical Ltd
+ * Copyright (C) 2021-2023  Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -70,16 +70,25 @@ func unmarshalInitialSetupResult(hookOutput []byte) (*InitialSetupResult, error)
 	return &res, nil
 }
 
+// TODO: unexport this because how the hook is driven is an implemenation
+//
+//	detail. It creates quite a bit of churn unfortunately, see
+//	https://github.com/snapcore/snapd/compare/master...mvo5:ice/refactor-fde?expand=1
+//
 // SetupRequest carries the operation and parameters for the fde-setup hooks
 // made available to them via the snapctl fde-setup-request command.
 type SetupRequest struct {
-	// XXX: make "op" a type: "features", "initial-setup", "update" ?
 	Op string `json:"op"`
 
 	// This needs to be a []byte so that Go's standard library will base64
 	// encode it automatically for us
-	Key     []byte `json:"key,omitempty"`
+	Key []byte `json:"key,omitempty"`
+
+	// Only used when called with "initial-setup"
 	KeyName string `json:"key-name,omitempty"`
+
+	// Name of the partition
+	PartitionName string `json:"partition-name,omitempty"`
 }
 
 // A RunSetupHookFunc implements running the fde-setup kernel hook.
@@ -115,4 +124,29 @@ func InitialSetup(runSetupHook RunSetupHookFunc, params *InitialSetupParams) (*I
 		return nil, err
 	}
 	return res, nil
+}
+
+// CheckFeatures returns the features of fde-setup hook.
+func CheckFeatures(runSetupHook RunSetupHookFunc) ([]string, error) {
+	req := &SetupRequest{
+		Op: "features",
+	}
+	output, err := runSetupHook(req)
+	if err != nil {
+		return nil, err
+	}
+	var res struct {
+		Features []string `json:"features"`
+		Error    string   `json:"error"`
+	}
+	if err := json.Unmarshal(output, &res); err != nil {
+		return nil, fmt.Errorf("cannot parse hook output %q: %v", output, err)
+	}
+	if res.Features == nil && res.Error == "" {
+		return nil, fmt.Errorf(`cannot use hook: neither "features" nor "error" returned`)
+	}
+	if res.Error != "" {
+		return nil, fmt.Errorf("cannot use hook: it returned error: %v", res.Error)
+	}
+	return res.Features, nil
 }

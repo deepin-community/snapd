@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016 Canonical Ltd
+ * Copyright (C) 2021 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -26,6 +26,7 @@ import (
 	"github.com/jessevdk/go-flags"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/signtool"
 	"github.com/snapcore/snapd/i18n"
 )
 
@@ -66,11 +67,14 @@ func (x *cmdExportKey) Execute(args []string) error {
 		keyName = "default"
 	}
 
-	manager := asserts.NewGPGKeypairManager()
+	keypairMgr, err := signtool.GetKeypairManager()
+	if err != nil {
+		return err
+	}
 	if x.Account != "" {
-		privKey, err := manager.GetByName(keyName)
+		privKey, err := keypairMgr.GetByName(keyName)
 		if err != nil {
-			return err
+			return fmt.Errorf("cannot find key named %q: %v", keyName, err)
 		}
 		pubKey := privKey.PublicKey()
 		headers := map[string]interface{}{
@@ -90,9 +94,9 @@ func (x *cmdExportKey) Execute(args []string) error {
 		}
 		fmt.Fprint(Stdout, string(asserts.Encode(assertion)))
 	} else {
-		encoded, err := manager.Export(keyName)
+		encoded, err := keypairMgr.Export(keyName)
 		if err != nil {
-			return err
+			return fmt.Errorf("cannot export key named %q: %v", keyName, err)
 		}
 		fmt.Fprintf(Stdout, "%s\n", encoded)
 	}

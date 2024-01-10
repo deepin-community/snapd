@@ -10,7 +10,7 @@ details: |
 
 # Only enable the test on systems we know portals to function on.
 # Expand as needed.
-systems: [ubuntu-18.04-*, ubuntu-2*]
+systems: [ubuntu-18.04-64, ubuntu-2*]
 
 environment:
     EDITOR_HISTORY: /tmp/editor-history.txt
@@ -57,6 +57,11 @@ debug: |
 
 
 execute: |
+    if not os.query is-pc-amd64; then
+        echo "The snap test-snapd-portal-client is just available for amd64"
+        exit
+    fi
+
     echo "Install the portals test client"
     snap install --edge test-snapd-portal-client
 

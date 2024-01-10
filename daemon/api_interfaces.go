@@ -21,6 +21,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -105,7 +106,7 @@ func getInterfaces(c *Command, r *http.Request, user *auth.UserState) Response {
 			Slots:   slots,
 		})
 	}
-	return SyncResponse(infoJSONs, nil)
+	return SyncResponse(infoJSONs)
 }
 
 func getLegacyConnections(c *Command, r *http.Request, user *auth.UserState) Response {
@@ -117,7 +118,7 @@ func getLegacyConnections(c *Command, r *http.Request, user *auth.UserState) Res
 		Plugs: connsjson.Plugs,
 		Slots: connsjson.Slots,
 	}
-	return SyncResponse(legacyconnsjson, nil)
+	return SyncResponse(legacyconnsjson)
 }
 
 // changeInterfaces controls the interfaces system.
@@ -158,7 +159,7 @@ func changeInterfaces(c *Command, r *http.Request, user *auth.UserState) Respons
 		}
 		var snapst snapstate.SnapState
 		err := snapstate.Get(st, snapName, &snapst)
-		if (err == nil && !snapst.IsInstalled()) || err == state.ErrNoState {
+		if (err == nil && !snapst.IsInstalled()) || errors.Is(err, state.ErrNoState) {
 			return fmt.Errorf("snap %q is not installed", snapName)
 		}
 		if err == nil {
@@ -193,7 +194,7 @@ func changeInterfaces(c *Command, r *http.Request, user *auth.UserState) Respons
 			if _, ok := err.(*ifacestate.ErrAlreadyConnected); ok {
 				change := newChange(st, a.Action+"-snap", summary, nil, affected)
 				change.SetStatus(state.DoneStatus)
-				return AsyncResponse(nil, &Meta{Change: change.ID()})
+				return AsyncResponse(nil, change.ID())
 			}
 			tasksets = append(tasksets, ts)
 		}
@@ -237,7 +238,7 @@ func changeInterfaces(c *Command, r *http.Request, user *auth.UserState) Respons
 	change := newChange(st, a.Action+"-snap", summary, tasksets, affected)
 	st.EnsureBefore(0)
 
-	return AsyncResponse(nil, &Meta{Change: change.ID()})
+	return AsyncResponse(nil, change.ID())
 }
 
 func snapNamesFromConns(conns []*interfaces.ConnRef) []string {

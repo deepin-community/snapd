@@ -8,7 +8,10 @@ systems:
     # Centos 7 gives error "Unit user@12345.service not loaded."
     - -centos-7-*
 
-kill-timeout: 5m
+    # TODO: dbus issue
+    - -ubuntu-core-22-*
+
+kill-timeout: 10m
 
 prepare: |
     # Ensure that snapd.session-agent.socket is enabled.  This may not

@@ -21,6 +21,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -80,10 +81,10 @@ func changeAliases(c *Command, r *http.Request, user *auth.UserState) Response {
 			// or just an alias
 			var snapst snapstate.SnapState
 			err := snapstate.Get(st, a.Snap, &snapst)
-			if err != nil && err != state.ErrNoState {
+			if err != nil && !errors.Is(err, state.ErrNoState) {
 				return InternalError("%v", err)
 			}
-			if err == state.ErrNoState { // not a snap
+			if errors.Is(err, state.ErrNoState) { // not a snap
 				a.Snap = ""
 			}
 		}
@@ -117,7 +118,7 @@ func changeAliases(c *Command, r *http.Request, user *auth.UserState) Response {
 	change := newChange(st, a.Action, summary, []*state.TaskSet{taskset}, []string{a.Snap})
 	st.EnsureBefore(0)
 
-	return AsyncResponse(nil, &Meta{Change: change.ID()})
+	return AsyncResponse(nil, change.ID())
 }
 
 type aliasStatus struct {
@@ -168,5 +169,5 @@ func getAliases(c *Command, r *http.Request, user *auth.UserState) Response {
 		}
 	}
 
-	return SyncResponse(res, nil)
+	return SyncResponse(res)
 }

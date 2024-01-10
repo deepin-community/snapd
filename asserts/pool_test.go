@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2020 Canonical Ltd
+ * Copyright (C) 2020-2022 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -725,7 +725,7 @@ func (s *poolSuite) TestUnknownGroup(c *C) {
 
 	_, err := pool.Singleton("suggestion")
 	c.Assert(err, IsNil)
-	// sanity
+	// validity
 	c.Check(pool.Err("suggestion"), IsNil)
 
 	c.Check(pool.Err("foo"), Equals, asserts.ErrUnknownPoolGroup)
@@ -1096,7 +1096,7 @@ func (s *poolSuite) TestUpdateSeqFormingPinnedNewerSequenceSameRevisionNoop(c *C
 
 	// and sequence point 3 revision 5 wasn't added to asserts database.
 	_, err = s.seq3_1111r5.Ref().Resolve(s.db.Find)
-	c.Assert(asserts.IsNotFound(err), Equals, true)
+	c.Assert(errors.Is(err, &asserts.NotFoundError{}), Equals, true)
 }
 
 func (s *poolSuite) TestUpdateSeqFormingPinnedNewerSequenceNewerRevisionNoop(c *C) {
@@ -1147,7 +1147,7 @@ func (s *poolSuite) TestUpdateSeqFormingPinnedNewerSequenceNewerRevisionNoop(c *
 
 	// and sequence point 2 revision 7 wasn't added to asserts database.
 	_, err = s.seq2_1111r7.Ref().Resolve(s.db.Find)
-	c.Assert(asserts.IsNotFound(err), Equals, true)
+	c.Assert(errors.Is(err, &asserts.NotFoundError{}), Equals, true)
 }
 
 func (s *poolSuite) TestUpdateSeqFormingPinnedSameSequenceNewerRevision(c *C) {
@@ -1319,7 +1319,7 @@ func (s *poolSuite) TestAddSeqToUpdateNotFound(c *C) {
 		Sequence:    1,
 	}
 	err := pool.AddSequenceToUpdate(atseq, "for_one")
-	c.Assert(asserts.IsNotFound(err), Equals, true)
+	c.Assert(errors.Is(err, &asserts.NotFoundError{}), Equals, true)
 }
 
 var errBoom = errors.New("boom")
@@ -1715,4 +1715,30 @@ func (s *poolSuite) TestPoolReuseWithClearGroupsAndUnchanged(c *C) {
 		asserts.MakePoolGrouping(0): {s.dev2Acct.At(), s.decl2.At()},
 	})
 	c.Check(toResolveSeq, HasLen, 0)
+}
+
+func (s *poolSuite) TestBackstore(c *C) {
+	assertstest.AddMany(s.db, s.hub.StoreAccountKey(""), s.dev1Acct)
+	pool := asserts.NewPool(s.db, 64)
+
+	at1111 := &asserts.AtRevision{
+		Ref:      asserts.Ref{Type: asserts.TestOnlyRevType, PrimaryKey: []string{"1111"}},
+		Revision: asserts.RevisionNotKnown,
+	}
+	c.Assert(pool.AddUnresolved(at1111, "for_one"), IsNil)
+	res, _, err := pool.ToResolve()
+	c.Assert(err, IsNil)
+	c.Assert(res, HasLen, 1)
+
+	// resolve (but do not commit)
+	ok, err := pool.Add(s.rev1_1111, asserts.MakePoolGrouping(0))
+	c.Assert(err, IsNil)
+	c.Assert(ok, Equals, true)
+
+	// the assertion should be available via pool's backstore
+	bs := pool.Backstore()
+	c.Assert(bs, NotNil)
+	a, err := bs.Get(s.rev1_1111.Type(), s.rev1_1111.At().PrimaryKey, s.rev1_1111.Type().MaxSupportedFormat())
+	c.Assert(err, IsNil)
+	c.Assert(a, NotNil)
 }

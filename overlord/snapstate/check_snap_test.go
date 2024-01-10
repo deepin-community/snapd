@@ -27,8 +27,11 @@ import (
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/arch"
+	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/overlord/snapstate"
+	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
 	seccomp_compiler "github.com/snapcore/snapd/sandbox/seccomp"
@@ -36,9 +39,6 @@ import (
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/snapdtool"
 	"github.com/snapcore/snapd/testutil"
-
-	"github.com/snapcore/snapd/overlord/snapstate"
-	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 )
 
 type checkSnapSuite struct {
@@ -102,11 +102,11 @@ var assumesTests = []struct {
 	assumes: "[common-data-dir]",
 }, {
 	assumes: "[f1, f2]",
-	error:   `snap "foo" assumes unsupported features: f1, f2 \(try to refresh the core or snapd snaps\)`,
+	error:   `snap "foo" assumes unsupported features: f1, f2 \(try to refresh snapd\)`,
 }, {
 	assumes: "[f1, f2]",
 	classic: true,
-	error:   `snap "foo" assumes unsupported features: f1, f2 \(try to update snapd and refresh the core snap\)`,
+	error:   `snap "foo" assumes unsupported features: f1, f2 \(try to refresh snapd\)`,
 }, {
 	assumes: "[snapd2.15]",
 	version: "unknown",
@@ -201,6 +201,8 @@ var assumesTests = []struct {
 	assumes: "[command-chain]",
 }, {
 	assumes: "[kernel-assets]",
+}, {
+	assumes: "[snap-uid-envvars]",
 },
 }
 
@@ -424,6 +426,119 @@ version: 2
 	err = snapstate.CheckSnap(st, "snap-path", "gadget", nil, nil, snapstate.Flags{}, s.deviceCtx)
 	st.Lock()
 	c.Check(err, ErrorMatches, `cannot replace signed gadget snap with an unasserted one`)
+}
+
+func (s *checkSnapSuite) setupKernelGadgetSnaps(st *state.State) {
+	gadgetInfo := &snap.SideInfo{
+		RealName: "gadget",
+		Revision: snap.R(1),
+		SnapID:   "gadget-id",
+	}
+	snapstate.Set(st, "gadget", &snapstate.SnapState{
+		SnapType: string(snap.TypeGadget),
+		Active:   true,
+		Sequence: []*snap.SideInfo{gadgetInfo},
+		Current:  gadgetInfo.Revision,
+	})
+
+	kernelInfo := &snap.SideInfo{
+		RealName: "kernel",
+		Revision: snap.R(2),
+		SnapID:   "kernel-id",
+	}
+	snapstate.Set(st, "kernel", &snapstate.SnapState{
+		SnapType: string(snap.TypeKernel),
+		Active:   true,
+		Sequence: []*snap.SideInfo{kernelInfo},
+		Current:  kernelInfo.Revision,
+	})
+}
+
+func (s *checkSnapSuite) mockEssSnap(c *C, snapType string, snapId string) (restore func()) {
+	const snapYaml = `name: %[1]s
+type: %[1]s
+version: 2
+`
+
+	info, err := snap.InfoFromSnapYaml([]byte(fmt.Sprintf(snapYaml, snapType)))
+	info.SnapID = snapId
+	c.Assert(err, IsNil)
+
+	var openSnapFile = func(path string, si *snap.SideInfo) (*snap.Info, snap.Container, error) {
+		return info, emptyContainer(c), nil
+	}
+
+	return snapstate.MockOpenSnapFile(openSnapFile)
+}
+
+func (s *checkSnapSuite) TestCheckUnassertedOrAssertedGadgetKernelSnapVsModelGrade(c *C) {
+	reset := release.MockOnClassic(false)
+	defer reset()
+
+	gradeUnsetDeviceCtx := &snapstatetest.TrivialDeviceContext{
+		DeviceModel: MakeModel(map[string]interface{}{
+			"kernel": "kernel",
+			"gadget": "gadget",
+		}),
+	}
+	c.Check(gradeUnsetDeviceCtx.DeviceModel.Grade(), Equals, asserts.ModelGradeUnset)
+	gradeSignedDeviceCtx := &snapstatetest.TrivialDeviceContext{
+		DeviceModel: MakeModel20("gadget", map[string]interface{}{
+			"base":  "core20",
+			"grade": "signed",
+		}),
+	}
+	c.Check(gradeSignedDeviceCtx.DeviceModel.Grade(), Equals, asserts.ModelSigned)
+	gradeDangerousDeviceCtx := &snapstatetest.TrivialDeviceContext{
+		DeviceModel: MakeModel20("gadget", map[string]interface{}{
+			"base":  "core20",
+			"grade": "dangerous",
+		}),
+	}
+	c.Check(gradeDangerousDeviceCtx.DeviceModel.Grade(), Equals, asserts.ModelDangerous)
+
+	tests := []struct {
+		deviceCtx snapstate.DeviceContext
+		essType   string
+		snapID    string
+		err       string
+	}{
+		{gradeUnsetDeviceCtx, "gadget", "gadget-id", ""},
+		{gradeUnsetDeviceCtx, "kernel", "kernel-id", ""},
+		{gradeSignedDeviceCtx, "gadget", "gadget-id", ""},
+		{gradeSignedDeviceCtx, "kernel", "kernel-id", ""},
+		{gradeDangerousDeviceCtx, "gadget", "gadget-id", ""},
+		{gradeDangerousDeviceCtx, "kernel", "kernel-id", ""},
+		{gradeUnsetDeviceCtx, "gadget", "", `cannot replace signed gadget snap with an unasserted one`},
+		{gradeUnsetDeviceCtx, "kernel", "", `cannot replace signed kernel snap with an unasserted one`},
+		{gradeSignedDeviceCtx, "gadget", "", `cannot replace signed gadget snap with an unasserted one`},
+		{gradeSignedDeviceCtx, "kernel", "", `cannot replace signed kernel snap with an unasserted one`},
+		// these combos  are now allowed
+		{gradeDangerousDeviceCtx, "gadget", "", ""},
+		{gradeDangerousDeviceCtx, "kernel", "", ""},
+	}
+
+	for _, t := range tests {
+		func() {
+			st := state.New(nil)
+			st.Lock()
+			defer st.Unlock()
+			s.setupKernelGadgetSnaps(st)
+
+			essRestore := s.mockEssSnap(c, t.essType, t.snapID)
+			defer essRestore()
+
+			st.Unlock()
+			err := snapstate.CheckSnap(st, "snap-path", t.essType, nil, nil, snapstate.Flags{}, t.deviceCtx)
+			st.Lock()
+			comm := Commentf("%s %s %s", t.deviceCtx.Model().Grade(), t.essType, t.snapID)
+			if t.err == "" {
+				c.Check(err, IsNil, comm)
+			} else {
+				c.Check(err, ErrorMatches, t.err, comm)
+			}
+		}()
+	}
 }
 
 func (s *checkSnapSuite) TestCheckSnapGadgetAdditionProhibited(c *C) {
@@ -1019,6 +1134,7 @@ func (s *checkSnapSuite) TestCheckSnapdHappy(c *C) {
 
 // Note, invalid usernames checked in snap/info_snap_yaml.go
 var systemUsernamesTests = []struct {
+	snapID      string
 	sysIDs      string
 	classic     bool
 	noRangeUser bool
@@ -1030,6 +1146,19 @@ var systemUsernamesTests = []struct {
 	scVer:  "dead 2.4.1 deadbeef bpf-actlog",
 }, {
 	sysIDs: "snap_daemon:\n    scope: shared",
+	scVer:  "dead 2.4.1 deadbeef bpf-actlog",
+}, {
+	sysIDs: "snap_microk8s: shared",
+	scVer:  "dead 2.4.1 deadbeef bpf-actlog",
+	snapID: "some-uninteresting-snap-id",
+	error:  `snap "foo" is not allowed to use the system user "snap_microk8s"`,
+}, {
+	snapID: "EaXqgt1lyCaxKaQCU349mlodBkDCXRcg", // microk8s
+	sysIDs: "snap_microk8s: shared",
+	scVer:  "dead 2.4.1 deadbeef bpf-actlog",
+}, {
+	// missing snap ID, therefore installation allowed
+	sysIDs: "snap_microk8s:\n    scope: shared",
 	scVer:  "dead 2.4.1 deadbeef bpf-actlog",
 }, {
 	sysIDs: "snap_daemon:\n    scope: private",
@@ -1162,6 +1291,7 @@ func (s *checkSnapSuite) TestCheckSnapSystemUsernames(c *C) {
 
 		info, err := snap.InfoFromSnapYaml([]byte(yaml))
 		c.Assert(err, IsNil)
+		info.SnapID = test.snapID
 
 		var openSnapFile = func(path string, si *snap.SideInfo) (*snap.Info, snap.Container, error) {
 			return info, emptyContainer(c), nil
@@ -1181,8 +1311,26 @@ func (s *checkSnapSuite) TestCheckSnapSystemUsernames(c *C) {
 }
 
 func (s *checkSnapSuite) TestCheckSnapSystemUsernamesCallsSnapDaemon(c *C) {
+	const yaml = `name: foo
+version: 1.0
+system-usernames:
+  snap_daemon: shared`
+
+	s.testCheckSnapSystemUsernamesCallsCommon(c, "snap_daemon", "584788", yaml)
+}
+
+func (s *checkSnapSuite) TestCheckSnapSystemUsernamesCallsSnapMicrok8s(c *C) {
+	const yaml = `name: microk8s
+version: 1.0
+system-usernames:
+  snap_microk8s: shared`
+
+	s.testCheckSnapSystemUsernamesCallsCommon(c, "snap_microk8s", "584789", yaml)
+}
+
+func (s *checkSnapSuite) testCheckSnapSystemUsernamesCallsCommon(c *C, expectedUser, expectedID, yaml string) {
 	r := osutil.MockFindGid(func(groupname string) (uint64, error) {
-		if groupname == "snap_daemon" || groupname == "snapd-range-524288-root" {
+		if groupname == expectedUser || groupname == "snapd-range-524288-root" {
 			return 0, user.UnknownGroupError(groupname)
 		}
 		return 0, fmt.Errorf("unexpected call to FindGid for %s", groupname)
@@ -1190,7 +1338,7 @@ func (s *checkSnapSuite) TestCheckSnapSystemUsernamesCallsSnapDaemon(c *C) {
 	defer r()
 
 	r = osutil.MockFindUid(func(username string) (uint64, error) {
-		if username == "snap_daemon" || username == "snapd-range-524288-root" {
+		if username == expectedUser || username == "snapd-range-524288-root" {
 			return 0, user.UnknownUserError(username)
 		}
 		return 0, fmt.Errorf("unexpected call to FindUid for %s", username)
@@ -1204,11 +1352,6 @@ func (s *checkSnapSuite) TestCheckSnapSystemUsernamesCallsSnapDaemon(c *C) {
 
 		restore = seccomp_compiler.MockCompilerVersionInfo("dead 2.4.1 deadbeef bpf-actlog")
 		defer restore()
-
-		const yaml = `name: foo
-version: 1.0
-system-usernames:
-  snap_daemon: shared`
 
 		info, err := snap.InfoFromSnapYaml([]byte(yaml))
 		c.Assert(err, IsNil)
@@ -1225,25 +1368,25 @@ system-usernames:
 		mockUserAdd := testutil.MockCommand(c, "useradd", "")
 		defer mockUserAdd.Restore()
 
-		err = snapstate.CheckSnap(s.st, "snap-path", "foo", nil, nil, snapstate.Flags{}, nil)
+		err = snapstate.CheckSnap(s.st, "snap-path", info.SnapName(), nil, nil, snapstate.Flags{}, nil)
 		c.Assert(err, IsNil)
 		if classic {
 			c.Check(mockGroupAdd.Calls(), DeepEquals, [][]string{
 				{"groupadd", "--system", "--gid", "524288", "snapd-range-524288-root"},
-				{"groupadd", "--system", "--gid", "584788", "snap_daemon"},
+				{"groupadd", "--system", "--gid", expectedID, expectedUser},
 			})
 			c.Check(mockUserAdd.Calls(), DeepEquals, [][]string{
 				{"useradd", "--system", "--home-dir", "/nonexistent", "--no-create-home", "--shell", falsePath, "--gid", "524288", "--no-user-group", "--uid", "524288", "snapd-range-524288-root"},
-				{"useradd", "--system", "--home-dir", "/nonexistent", "--no-create-home", "--shell", falsePath, "--gid", "584788", "--no-user-group", "--uid", "584788", "snap_daemon"},
+				{"useradd", "--system", "--home-dir", "/nonexistent", "--no-create-home", "--shell", falsePath, "--gid", expectedID, "--no-user-group", "--uid", expectedID, expectedUser},
 			})
 		} else {
 			c.Check(mockGroupAdd.Calls(), DeepEquals, [][]string{
 				{"groupadd", "--system", "--gid", "524288", "--extrausers", "snapd-range-524288-root"},
-				{"groupadd", "--system", "--gid", "584788", "--extrausers", "snap_daemon"},
+				{"groupadd", "--system", "--gid", expectedID, "--extrausers", expectedUser},
 			})
 			c.Check(mockUserAdd.Calls(), DeepEquals, [][]string{
 				{"useradd", "--system", "--home-dir", "/nonexistent", "--no-create-home", "--shell", falsePath, "--gid", "524288", "--no-user-group", "--uid", "524288", "--extrausers", "snapd-range-524288-root"},
-				{"useradd", "--system", "--home-dir", "/nonexistent", "--no-create-home", "--shell", falsePath, "--gid", "584788", "--no-user-group", "--uid", "584788", "--extrausers", "snap_daemon"},
+				{"useradd", "--system", "--home-dir", "/nonexistent", "--no-create-home", "--shell", falsePath, "--gid", expectedID, "--no-user-group", "--uid", expectedID, "--extrausers", expectedUser},
 			})
 
 		}
@@ -1351,4 +1494,33 @@ version: 2
 	err = snapstate.CheckSnap(st, "snap-path", "new-gadget", nil, nil, snapstate.Flags{}, deviceCtx)
 	st.Lock()
 	c.Check(err, IsNil)
+}
+
+func (s *checkSnapSuite) TestCheckConfigureHooksHappy(c *C) {
+	var openSnapFile = func(path string, si *snap.SideInfo) (*snap.Info, snap.Container, error) {
+		info := snaptest.MockInfo(c, "{name: snap-with-default-configure, version: 1.0}", si)
+		info.Hooks["default-configure"] = &snap.HookInfo{}
+		info.Hooks["configure"] = &snap.HookInfo{}
+		return info, emptyContainer(c), nil
+	}
+
+	restore := snapstate.MockOpenSnapFile(openSnapFile)
+	defer restore()
+
+	err := snapstate.CheckSnap(s.st, "snap-path", "snap-with-default-configure", nil, nil, snapstate.Flags{}, nil)
+	c.Check(err, IsNil)
+}
+
+func (s *checkSnapSuite) TestCheckConfigureHooksUnHappy(c *C) {
+	var openSnapFile = func(path string, si *snap.SideInfo) (*snap.Info, snap.Container, error) {
+		info := snaptest.MockInfo(c, "{name: snap-with-default-configure, version: 1.0}", si)
+		info.Hooks["default-configure"] = &snap.HookInfo{}
+		return info, emptyContainer(c), nil
+	}
+
+	restore := snapstate.MockOpenSnapFile(openSnapFile)
+	defer restore()
+
+	err := snapstate.CheckSnap(s.st, "snap-path", "snap-with-default-configure", nil, nil, snapstate.Flags{}, nil)
+	c.Check(err, ErrorMatches, `cannot specify "default-configure" hook without "configure" hook`)
 }

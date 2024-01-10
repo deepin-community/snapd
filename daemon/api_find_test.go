@@ -20,13 +20,16 @@
 package daemon_test
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 
 	"gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/client"
-	"github.com/snapcore/snapd/daemon"
+	"github.com/snapcore/snapd/httputil"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/snap"
@@ -226,6 +229,22 @@ func (s *findSuite) TestFindSection(c *check.C) {
 	})
 }
 
+func (s *findSuite) TestFindCategory(c *check.C) {
+	s.daemon(c)
+
+	s.rsnaps = []*snap.Info{}
+
+	req, err := http.NewRequest("GET", "/v2/find?q=foo&category=bar", nil)
+	c.Assert(err, check.IsNil)
+
+	_ = s.syncReq(c, req, nil)
+
+	c.Check(s.storeSearch, check.DeepEquals, store.Search{
+		Query:    "foo",
+		Category: "bar",
+	})
+}
+
 func (s *findSuite) TestFindScope(c *check.C) {
 	s.daemon(c)
 
@@ -360,7 +379,12 @@ func (s *findSuite) TestFindOneWithAuth(c *check.C) {
 
 	state := d.Overlord().State()
 	state.Lock()
-	user, err := auth.NewUser(state, "username", "email@test.com", "macaroon", []string{"discharge"})
+	user, err := auth.NewUser(state, auth.NewUserParams{
+		Username:   "username",
+		Email:      "email@test.com",
+		Macaroon:   "macaroon",
+		Discharges: []string{"discharge"},
+	})
 	state.Unlock()
 	c.Check(err, check.IsNil)
 
@@ -382,9 +406,9 @@ func (s *findSuite) TestFindRefreshNotOther(c *check.C) {
 		req, err := http.NewRequest("GET", "/v2/find?select=refresh&"+other+"=foo*", nil)
 		c.Assert(err, check.IsNil)
 
-		rsp := s.errorReq(c, req, nil)
-		c.Check(rsp.Status, check.Equals, 400)
-		c.Check(rsp.Result.(*daemon.ErrorResult).Message, check.Equals, "cannot use '"+other+"' with 'select=refresh'")
+		rspe := s.errorReq(c, req, nil)
+		c.Check(rspe.Status, check.Equals, 400)
+		c.Check(rspe.Message, check.Equals, "cannot use '"+other+"' with 'select=refresh'")
 	}
 }
 
@@ -401,11 +425,11 @@ func (s *findSuite) TestFindNotTogether(c *check.C) {
 			req, err := http.NewRequest("GET", fmt.Sprintf("/v2/find?%s=%s&%s=%s", ki, vi, kj, vj), nil)
 			c.Assert(err, check.IsNil)
 
-			rsp := s.errorReq(c, req, nil)
-			c.Check(rsp.Status, check.Equals, 400)
+			rspe := s.errorReq(c, req, nil)
+			c.Check(rspe.Status, check.Equals, 400)
 			exp1 := "cannot use '" + ki + "' and '" + kj + "' together"
 			exp2 := "cannot use '" + kj + "' and '" + ki + "' together"
-			c.Check(rsp.Result.(*daemon.ErrorResult).Message, check.Matches, exp1+"|"+exp2)
+			c.Check(rspe.Message, check.Matches, exp1+"|"+exp2)
 		}
 	}
 }
@@ -417,10 +441,49 @@ func (s *findSuite) TestFindBadQueryReturnsCorrectErrorKind(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/find?q=return-bad-query-please", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.errorReq(c, req, nil)
-	c.Check(rsp.Status, check.Equals, 400)
-	c.Check(rsp.Result.(*daemon.ErrorResult).Message, check.Matches, "bad query")
-	c.Check(rsp.Result.(*daemon.ErrorResult).Kind, check.Equals, client.ErrorKindBadQuery)
+	rspe := s.errorReq(c, req, nil)
+	c.Check(rspe.Status, check.Equals, 400)
+	c.Check(rspe.Message, check.Matches, "bad query")
+	c.Check(rspe.Kind, check.Equals, client.ErrorKindBadQuery)
+}
+
+func (s *findSuite) TestFindNetworkErrorsReturnCorrectErrorKind(c *check.C) {
+	s.daemon(c)
+
+	req, err := http.NewRequest("GET", "/v2/find?q=query", nil)
+	c.Assert(err, check.IsNil)
+
+	pne := &httputil.PersistentNetworkError{Err: errors.New("problem")}
+	neTout := fakeNetError{message: "net problem", timeout: true}
+	dnse := &net.DNSError{Name: "store", IsTemporary: true}
+	uDNSe := &url.Error{
+		Op:  "Get",
+		URL: "http://...",
+		Err: &net.OpError{
+			Op:  "dial",
+			Net: "tcp",
+			Err: dnse,
+		},
+	}
+
+	tests := []struct {
+		err      error
+		kind     client.ErrorKind
+		expected string
+	}{
+		{pne, client.ErrorKindDNSFailure, "persistent network error: problem"},
+		{neTout, client.ErrorKindNetworkTimeout, "net problem"},
+		{uDNSe, client.ErrorKindDNSFailure, dnse.Error()},
+	}
+
+	for _, t := range tests {
+		s.err = t.err
+
+		rspe := s.errorReq(c, req, nil)
+		c.Check(rspe.Status, check.Equals, 400)
+		c.Check(rspe.Message, check.Equals, t.expected)
+		c.Check(rspe.Kind, check.Equals, t.kind)
+	}
 }
 
 func (s *findSuite) TestFindPriced(c *check.C) {

@@ -34,6 +34,7 @@ import (
 	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/sandbox/cgroup"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -51,13 +52,19 @@ func (s *mainSuite) SetUpTest(c *C) {
 	s.BaseTest.SetUpTest(c)
 	s.as = &update.Assumptions{}
 	buf, restore := logger.MockLogger()
-	s.BaseTest.AddCleanup(restore)
+	s.AddCleanup(restore)
 	s.log = buf
+	s.AddCleanup(cgroup.MockVersion(cgroup.V1, nil))
 }
 
 func (s *mainSuite) TestExecuteMountProfileUpdate(c *C) {
 	dirs.SetRootDir(c.MkDir())
 	defer dirs.SetRootDir("/")
+
+	// mount targets look at the the actual local filesystem
+	if !osutil.IsDirectory("/usr/share/fonts") || !osutil.IsDirectory("/usr/local/share/fonts") {
+		c.Skip("missing local directories (/usr/share/fonts or /usr/local/share/fonts)")
+	}
 
 	restore := update.MockChangePerform(func(chg *update.Change, as *update.Assumptions) ([]*update.Change, error) {
 		return nil, nil
@@ -195,11 +202,27 @@ func (s *mainSuite) TestRemovingSyntheticChanges(c *C) {
 				Entry: osutil.MountEntry{
 					Name: "/snap/mysnap/42/usr/share/mysnap",
 					Dir:  "/usr/share/mysnap", Type: "none",
-					Options: []string{"bind", "ro"},
+					Options: []string{"bind", "ro", "x-snapd.detach"},
 				},
 			})
 		case 1:
-			c.Assert(chg, DeepEquals, &update.Change{
+			c.Check(chg, DeepEquals, &update.Change{
+				Action: update.Unmount,
+				Entry: osutil.MountEntry{
+					Name: "/usr/share/awk", Dir: "/usr/share/awk", Type: "none",
+					Options: []string{"bind", "ro", "x-snapd.synthetic", "x-snapd.needed-by=/usr/share/mysnap", "x-snapd.detach"},
+				},
+			})
+		case 2:
+			c.Check(chg, DeepEquals, &update.Change{
+				Action: update.Unmount,
+				Entry: osutil.MountEntry{
+					Name: "/usr/share/adduser", Dir: "/usr/share/adduser", Type: "none",
+					Options: []string{"bind", "ro", "x-snapd.synthetic", "x-snapd.needed-by=/usr/share/mysnap", "x-snapd.detach"},
+				},
+			})
+		case 3:
+			c.Check(chg, DeepEquals, &update.Change{
 				Action: update.Unmount,
 				Entry: osutil.MountEntry{
 					Name: "tmpfs", Dir: "/usr/share", Type: "tmpfs",

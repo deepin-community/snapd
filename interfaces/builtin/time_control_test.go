@@ -106,10 +106,12 @@ func (s *TimeControlInterfaceSuite) TestSecCompSpec(c *C) {
 func (s *TimeControlInterfaceSuite) TestUDevSpec(c *C) {
 	spec := &udev.Specification{}
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
-	c.Assert(spec.Snippets(), HasLen, 2)
+	c.Assert(spec.Snippets(), HasLen, 3)
 	c.Assert(spec.Snippets(), testutil.Contains, `# time-control
 SUBSYSTEM=="rtc", TAG+="snap_consumer_app"`)
-	c.Assert(spec.Snippets(), testutil.Contains, fmt.Sprintf(`TAG=="snap_consumer_app", RUN+="%v/snap-device-helper $env{ACTION} snap_consumer_app $devpath $major:$minor"`, dirs.DistroLibExecDir))
+	c.Assert(spec.Snippets(), testutil.Contains, `# time-control
+KERNEL=="pps[0-9]*", TAG+="snap_consumer_app"`)
+	c.Assert(spec.Snippets(), testutil.Contains, fmt.Sprintf(`TAG=="snap_consumer_app", SUBSYSTEM!="module", SUBSYSTEM!="subsystem", RUN+="%v/snap-device-helper $env{ACTION} snap_consumer_app $devpath $major:$minor"`, dirs.DistroLibExecDir))
 }
 
 func (s *TimeControlInterfaceSuite) TestStaticInfo(c *C) {

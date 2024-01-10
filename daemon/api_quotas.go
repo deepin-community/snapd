@@ -20,14 +20,16 @@
 package daemon
 
 import (
-	"encoding/json"
 	"net/http"
 	"sort"
 
-	"github.com/snapcore/snapd/gadget/quantity"
+	"github.com/snapcore/snapd/client"
+	"github.com/snapcore/snapd/jsonutil"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/servicestate"
+	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap/naming"
+	"github.com/snapcore/snapd/snap/quota"
 )
 
 var (
@@ -47,19 +49,12 @@ var (
 
 type postQuotaGroupData struct {
 	// Action can be "ensure" or "remove"
-	Action    string   `json:"action"`
-	GroupName string   `json:"group-name"`
-	MaxMemory uint64   `json:"max-memory,omitempty"`
-	Parent    string   `json:"parent,omitempty"`
-	Snaps     []string `json:"snaps,omitempty"`
-}
-
-type quotaGroupResultJSON struct {
-	GroupName string   `json:"group-name"`
-	MaxMemory uint64   `json:"max-memory"`
-	Parent    string   `json:"parent,omitempty"`
-	Snaps     []string `json:"snaps,omitempty"`
-	SubGroups []string `json:"subgroups,omitempty"`
+	Action      string             `json:"action"`
+	GroupName   string             `json:"group-name"`
+	Parent      string             `json:"parent,omitempty"`
+	Snaps       []string           `json:"snaps,omitempty"`
+	Services    []string           `json:"services,omitempty"`
+	Constraints client.QuotaValues `json:"constraints,omitempty"`
 }
 
 var (
@@ -67,6 +62,56 @@ var (
 	servicestateUpdateQuota = servicestate.UpdateQuota
 	servicestateRemoveQuota = servicestate.RemoveQuota
 )
+
+var getQuotaUsage = func(grp *quota.Group) (*client.QuotaValues, error) {
+	var currentUsage client.QuotaValues
+
+	if grp.MemoryLimit != 0 {
+		mem, err := grp.CurrentMemoryUsage()
+		if err != nil {
+			return nil, err
+		}
+		currentUsage.Memory = mem
+	}
+
+	if grp.ThreadLimit != 0 {
+		threads, err := grp.CurrentTaskUsage()
+		if err != nil {
+			return nil, err
+		}
+		currentUsage.Threads = threads
+	}
+
+	return &currentUsage, nil
+}
+
+func createQuotaValues(grp *quota.Group) *client.QuotaValues {
+	var constraints client.QuotaValues
+	constraints.Memory = grp.MemoryLimit
+	constraints.Threads = grp.ThreadLimit
+
+	if grp.CPULimit != nil {
+		constraints.CPU = &client.QuotaCPUValues{
+			Count:      grp.CPULimit.Count,
+			Percentage: grp.CPULimit.Percentage,
+		}
+		constraints.CPUSet = &client.QuotaCPUSetValues{
+			CPUs: grp.CPULimit.CPUSet,
+		}
+	}
+	if grp.JournalLimit != nil {
+		constraints.Journal = &client.QuotaJournalValues{
+			Size: grp.JournalLimit.Size,
+		}
+		if grp.JournalLimit.RateEnabled {
+			constraints.Journal.QuotaJournalRate = &client.QuotaJournalRate{
+				RateCount:  grp.JournalLimit.RateCount,
+				RatePeriod: grp.JournalLimit.RatePeriod,
+			}
+		}
+	}
+	return &constraints
+}
 
 // getQuotaGroups returns all quota groups sorted by name.
 func getQuotaGroups(c *Command, r *http.Request, _ *auth.UserState) Response {
@@ -87,18 +132,26 @@ func getQuotaGroups(c *Command, r *http.Request, _ *auth.UserState) Response {
 	}
 	sort.Strings(names)
 
-	results := make([]quotaGroupResultJSON, len(quotas))
+	results := make([]client.QuotaGroupResult, len(quotas))
 	for i, name := range names {
-		qt := quotas[name]
-		results[i] = quotaGroupResultJSON{
-			GroupName: qt.Name,
-			Parent:    qt.ParentGroup,
-			SubGroups: qt.SubGroups,
-			Snaps:     qt.Snaps,
-			MaxMemory: uint64(qt.MemoryLimit),
+		group := quotas[name]
+
+		currentUsage, err := getQuotaUsage(group)
+		if err != nil {
+			return InternalError(err.Error())
+		}
+
+		results[i] = client.QuotaGroupResult{
+			GroupName:   group.Name,
+			Parent:      group.ParentGroup,
+			Subgroups:   group.SubGroups,
+			Snaps:       group.Snaps,
+			Services:    group.Services,
+			Constraints: createQuotaValues(group),
+			Current:     currentUsage,
 		}
 	}
-	return SyncResponse(results, nil)
+	return SyncResponse(results)
 }
 
 // getQuotaGroupInfo returns details of a single quota Group.
@@ -121,22 +174,59 @@ func getQuotaGroupInfo(c *Command, r *http.Request, _ *auth.UserState) Response 
 		return InternalError(err.Error())
 	}
 
-	res := quotaGroupResultJSON{
-		GroupName: group.Name,
-		Parent:    group.ParentGroup,
-		Snaps:     group.Snaps,
-		SubGroups: group.SubGroups,
-		MaxMemory: uint64(group.MemoryLimit),
+	currentUsage, err := getQuotaUsage(group)
+	if err != nil {
+		return InternalError(err.Error())
 	}
-	return SyncResponse(res, nil)
+
+	res := client.QuotaGroupResult{
+		GroupName:   group.Name,
+		Parent:      group.ParentGroup,
+		Snaps:       group.Snaps,
+		Services:    group.Services,
+		Subgroups:   group.SubGroups,
+		Constraints: createQuotaValues(group),
+		Current:     currentUsage,
+	}
+	return SyncResponse(res)
+}
+
+func quotaValuesToResources(values client.QuotaValues) quota.Resources {
+	resourcesBuilder := quota.NewResourcesBuilder()
+	if values.Memory != 0 {
+		resourcesBuilder.WithMemoryLimit(values.Memory)
+	}
+	if values.CPU != nil {
+		if values.CPU.Count != 0 {
+			resourcesBuilder.WithCPUCount(values.CPU.Count)
+		}
+		if values.CPU.Percentage != 0 {
+			resourcesBuilder.WithCPUPercentage(values.CPU.Percentage)
+		}
+	}
+	if values.CPUSet != nil && len(values.CPUSet.CPUs) != 0 {
+		resourcesBuilder.WithCPUSet(values.CPUSet.CPUs)
+	}
+	if values.Threads != 0 {
+		resourcesBuilder.WithThreadLimit(values.Threads)
+	}
+	if values.Journal != nil {
+		resourcesBuilder.WithJournalNamespace()
+		if values.Journal.Size != 0 {
+			resourcesBuilder.WithJournalSize(values.Journal.Size)
+		}
+		if values.Journal.QuotaJournalRate != nil {
+			resourcesBuilder.WithJournalRate(values.Journal.RateCount, values.Journal.RatePeriod)
+		}
+	}
+	return resourcesBuilder.Build()
 }
 
 // postQuotaGroup creates quota resource group or updates an existing group.
 func postQuotaGroup(c *Command, r *http.Request, _ *auth.UserState) Response {
 	var data postQuotaGroupData
 
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&data); err != nil {
+	if err := jsonutil.DecodeWithNumber(r.Body, &data); err != nil {
 		return BadRequest("cannot decode quota action from request body: %v", err)
 	}
 
@@ -148,8 +238,15 @@ func postQuotaGroup(c *Command, r *http.Request, _ *auth.UserState) Response {
 	st.Lock()
 	defer st.Unlock()
 
+	chgSummary := ""
+
+	var ts *state.TaskSet
+
 	switch data.Action {
 	case "ensure":
+		// pack constraints into a resource limits struct
+		resourceLimits := quotaValuesToResources(data.Constraints)
+
 		// check if the quota group exists first, if it does then we need to
 		// update it instead of create it
 		_, err := servicestate.GetQuota(st, data.GroupName)
@@ -158,27 +255,42 @@ func postQuotaGroup(c *Command, r *http.Request, _ *auth.UserState) Response {
 		}
 		if err == servicestate.ErrQuotaNotFound {
 			// then we need to create the quota
-			if err := servicestateCreateQuota(st, data.GroupName, data.Parent, data.Snaps, quantity.Size(data.MaxMemory)); err != nil {
-				// XXX: dedicated error type?
-				return BadRequest(err.Error())
+			ts, err = servicestateCreateQuota(st, data.GroupName, servicestate.CreateQuotaOptions{
+				ParentName:     data.Parent,
+				Snaps:          data.Snaps,
+				Services:       data.Services,
+				ResourceLimits: resourceLimits,
+			})
+			if err != nil {
+				return errToResponse(err, nil, BadRequest, "cannot create quota group: %v")
 			}
+			chgSummary = "Create quota group"
 		} else if err == nil {
 			// the quota group already exists, update it
-			updateOpts := servicestate.QuotaGroupUpdate{
-				AddSnaps:       data.Snaps,
-				NewMemoryLimit: quantity.Size(data.MaxMemory),
+			updateOpts := servicestate.UpdateQuotaOptions{
+				AddSnaps:          data.Snaps,
+				AddServices:       data.Services,
+				NewResourceLimits: resourceLimits,
 			}
-			if err := servicestateUpdateQuota(st, data.GroupName, updateOpts); err != nil {
-				return BadRequest(err.Error())
+			ts, err = servicestateUpdateQuota(st, data.GroupName, updateOpts)
+			if err != nil {
+				return errToResponse(err, nil, BadRequest, "cannot update quota group: %v")
 			}
+			chgSummary = "Update quota group"
 		}
 
 	case "remove":
-		if err := servicestateRemoveQuota(st, data.GroupName); err != nil {
-			return BadRequest(err.Error())
+		var err error
+		ts, err = servicestateRemoveQuota(st, data.GroupName)
+		if err != nil {
+			return errToResponse(err, nil, BadRequest, "cannot remove quota group: %v")
 		}
+		chgSummary = "Remove quota group"
 	default:
 		return BadRequest("unknown quota action %q", data.Action)
 	}
-	return SyncResponse(nil, nil)
+
+	chg := newChange(st, "quota-control", chgSummary, []*state.TaskSet{ts}, data.Snaps)
+	ensureStateSoon(st)
+	return AsyncResponse(nil, chg.ID())
 }

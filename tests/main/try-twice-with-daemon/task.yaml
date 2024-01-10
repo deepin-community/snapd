@@ -8,12 +8,12 @@ environment:
 execute: |
     echo "Given a buildable snap in a known directory"
     echo "When try is executed on that directory"
-    snap try "$TESTSLIB"/snaps/test-snapd-service-try-v1
+    snap try test-snapd-service-try-v1
 
     echo "Then the snap is listed as installed with try in the notes"
     snap list | MATCH "^test-snapd-service-try .* try"
 
-    # Sanity check just to ensure the test and its input yaml are correct
+    # Precondition check just to ensure the test and its input yaml are correct
     echo "And it doesn't have a systemd service just yet"
     # Note: systemctl in yakkety doesn't report LoadState=not-found for unknown services
     # so need to grep all the services
@@ -24,7 +24,7 @@ execute: |
 
     echo "When snap.yaml is updated with the daemon line added"
     echo "Then it can be tried again"
-    snap try "$TESTSLIB"/snaps/test-snapd-service-try-v2
+    snap try test-snapd-service-try-v2
     snap list | MATCH "^test-snapd-service-try .* try"
     echo "And a service is now loaded with systemd"
 

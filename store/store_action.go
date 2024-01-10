@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2020 Canonical Ltd
+ * Copyright (C) 2014-2022 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/snapasserts"
 	"github.com/snapcore/snapd/jsonutil"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/overlord/auth"
@@ -56,6 +57,8 @@ type CurrentSnap struct {
 	Block            []snap.Revision
 	Epoch            snap.Epoch
 	CohortKey        string
+	// ValidationSets is an optional array of validation set primary keys.
+	ValidationSets []snapasserts.ValidationSetKey
 }
 
 type AssertionQuery interface {
@@ -75,6 +78,8 @@ type currentSnapV2JSON struct {
 	RefreshedDate    *time.Time `json:"refreshed-date,omitempty"`
 	IgnoreValidation bool       `json:"ignore-validation,omitempty"`
 	CohortKey        string     `json:"cohort-key,omitempty"`
+	// ValidationSets is an optional array of validation set primary keys.
+	ValidationSets [][]string `json:"validation-sets,omitempty"`
 }
 
 type SnapActionFlags int
@@ -93,6 +98,9 @@ type SnapAction struct {
 	CohortKey    string
 	Flags        SnapActionFlags
 	Epoch        snap.Epoch
+	// ValidationSets is an optional array of validation set primary keys
+	// (relevant for install and refresh actions).
+	ValidationSets []snapasserts.ValidationSetKey
 }
 
 func isValidAction(action string) bool {
@@ -123,8 +131,9 @@ type snapActionJSON struct {
 	// nil epoch is not an empty interface{}, you'll get the null in the json.
 	Epoch interface{} `json:"epoch,omitempty"`
 	// For assertions
-	Key        string        `json:"key,omitempty"`
-	Assertions []interface{} `json:"assertions,omitempty"`
+	Key            string        `json:"key,omitempty"`
+	Assertions     []interface{} `json:"assertions,omitempty"`
+	ValidationSets [][]string    `json:"validation-sets,omitempty"`
 }
 
 type assertAtJSON struct {
@@ -162,7 +171,7 @@ type snapActionResult struct {
 	Result string `json:"result"`
 	// For snap
 	InstanceKey      string    `json:"instance-key"`
-	SnapID           string    `json:"snap-id,omitempy"`
+	SnapID           string    `json:"snap-id,omitempty"`
 	Name             string    `json:"name,omitempty"`
 	Snap             storeSnap `json:"snap"`
 	EffectiveChannel string    `json:"effective-channel,omitempty"`
@@ -229,27 +238,29 @@ func (s *Store) SnapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 
 		if saErr, ok := err.(*SnapActionError); ok && authRefreshes < 2 && len(saErr.Other) > 0 {
 			// do we need to try to refresh auths?, 2 tries
-			var refreshNeed authRefreshNeed
+			var refreshNeed AuthRefreshNeed
 			for _, otherErr := range saErr.Other {
 				switch otherErr {
 				case errUserAuthorizationNeedsRefresh:
-					refreshNeed.user = true
+					refreshNeed.User = true
 				case errDeviceAuthorizationNeedsRefresh:
-					refreshNeed.device = true
+					refreshNeed.Device = true
 				}
 			}
 			if refreshNeed.needed() {
-				err := s.refreshAuth(user, refreshNeed)
-				if err != nil {
-					// best effort
-					logger.Noticef("cannot refresh soft-expired authorisation: %v", err)
+				if a, ok := s.auth.(RefreshingAuthorizer); ok {
+					err := a.RefreshAuth(refreshNeed, s.dauthCtx, user, s.client)
+					if err != nil {
+						// best effort
+						logger.Noticef("cannot refresh soft-expired authorisation: %v", err)
+					}
+					authRefreshes++
+					// TODO: we could avoid retrying here
+					// if refreshAuth gave no error we got
+					// as many non-error results from the
+					// store as actions anyway
+					continue
 				}
-				authRefreshes++
-				// TODO: we could avoid retrying here
-				// if refreshAuth gave no error we got
-				// as many non-error results from the
-				// store as actions anyway
-				continue
 			}
 		}
 
@@ -319,6 +330,12 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 		if !curSnap.RefreshedDate.IsZero() {
 			refreshedDate = &curSnap.RefreshedDate
 		}
+
+		valsetKeys := make([][]string, 0, len(curSnap.ValidationSets))
+		for _, vsKey := range curSnap.ValidationSets {
+			valsetKeys = append(valsetKeys, vsKey.Components())
+		}
+
 		curSnapJSONs[i] = &currentSnapV2JSON{
 			SnapID:           curSnap.SnapID,
 			InstanceKey:      instanceKey,
@@ -328,6 +345,7 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 			RefreshedDate:    refreshedDate,
 			Epoch:            curSnap.Epoch,
 			CohortKey:        curSnap.CohortKey,
+			ValidationSets:   valsetKeys,
 		}
 	}
 
@@ -359,6 +377,11 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 			ignoreValidation = &f
 		}
 
+		valsetKeyComponents := make([][]string, 0, len(a.ValidationSets))
+		for _, vsKey := range a.ValidationSets {
+			valsetKeyComponents = append(valsetKeyComponents, vsKey.Components())
+		}
+
 		var instanceKey string
 		aJSON := &snapActionJSON{
 			Action:           a.Action,
@@ -366,6 +389,7 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 			Channel:          a.Channel,
 			Revision:         a.Revision.N,
 			CohortKey:        a.CohortKey,
+			ValidationSets:   valsetKeyComponents,
 			IgnoreValidation: ignoreValidation,
 		}
 		if !a.Revision.Unset() {
@@ -423,7 +447,7 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 			for j, at := range ats {
 				aj := &assertAtJSON{
 					Type:       at.Type.Name,
-					PrimaryKey: at.PrimaryKey,
+					PrimaryKey: asserts.ReducePrimaryKey(at.Type, at.PrimaryKey),
 				}
 				rev := at.Revision
 				if rev != asserts.RevisionNotKnown {
@@ -485,7 +509,11 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 	}
 
 	if len(toResolve) > 0 || len(toResolveSeq) > 0 {
-		assertMaxFormats = asserts.MaxSupportedFormats(1)
+		if s.cfg.AssertionMaxFormats == nil {
+			assertMaxFormats = asserts.MaxSupportedFormats(1)
+		} else {
+			assertMaxFormats = s.cfg.AssertionMaxFormats
+		}
 	}
 
 	// build input for the install/refresh endpoint
@@ -513,7 +541,7 @@ func (s *Store) snapAction(ctx context.Context, currentSnaps []*CurrentSnap, act
 		reqOptions.addHeader("Snap-Refresh-Reason", "scheduled")
 	}
 
-	if useDeltas() {
+	if s.useDeltas() {
 		logger.Debugf("Deltas enabled. Adding header Snap-Accept-Delta-Format: %v", s.deltaFormat)
 		reqOptions.addHeader("Snap-Accept-Delta-Format", s.deltaFormat)
 	}
@@ -667,7 +695,7 @@ func reportFetchAssertionsError(res *snapActionResult, assertq AssertionQuery) e
 	errl := res.ErrorList
 	carryingRef := func(ent *errorListEntry) bool {
 		aType := asserts.Type(ent.Type)
-		return aType != nil && len(ent.PrimaryKey) == len(aType.PrimaryKey)
+		return aType != nil && aType.AcceptablePrimaryKey(ent.PrimaryKey)
 	}
 	carryingSeqKey := func(ent *errorListEntry) bool {
 		aType := asserts.Type(ent.Type)

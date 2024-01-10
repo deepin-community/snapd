@@ -36,6 +36,7 @@ import (
 	"github.com/snapcore/snapd/daemon"
 	"github.com/snapcore/snapd/overlord/snapshotstate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/snap"
 )
 
 var _ = check.Suite(&snapshotSuite{})
@@ -46,19 +47,22 @@ type snapshotSuite struct {
 
 func (s *snapshotSuite) SetUpTest(c *check.C) {
 	s.apiBaseSuite.SetUpTest(c)
-	s.daemonWithOverlordMock(c)
+	s.daemonWithOverlordMock()
 	s.expectAuthenticatedAccess()
 	s.expectWriteAccess(daemon.AuthenticatedAccess{Polkit: "io.snapcraft.snapd.manage"})
 }
 
-func (s *snapshotSuite) TestSnapshotMany(c *check.C) {
-	defer daemon.MockSnapshotSave(func(s *state.State, snaps, users []string) (uint64, []string, *state.TaskSet, error) {
+func (s *snapshotSuite) TestSnapshotManyOptionsNone(c *check.C) {
+	defer daemon.MockSnapshotSave(func(s *state.State, snaps, users []string,
+		options map[string]*snap.SnapshotOptions) (uint64, []string, *state.TaskSet, error) {
 		c.Check(snaps, check.HasLen, 2)
+		c.Check(options, check.IsNil)
 		t := s.NewTask("fake-snapshot-2", "Snapshot two")
 		return 1, snaps, state.NewTaskSet(t), nil
 	})()
 
 	inst := daemon.MustUnmarshalSnapInstruction(c, `{"action": "snapshot", "snaps": ["foo", "bar"]}`)
+
 	st := s.d.Overlord().State()
 	st.Lock()
 	res, err := inst.DispatchForMany()(inst, st)
@@ -66,6 +70,51 @@ func (s *snapshotSuite) TestSnapshotMany(c *check.C) {
 	c.Assert(err, check.IsNil)
 	c.Check(res.Summary, check.Equals, `Snapshot snaps "foo", "bar"`)
 	c.Check(res.Affected, check.DeepEquals, inst.Snaps)
+}
+
+func (s *snapshotSuite) TestSnapshotManyOptionsFull(c *check.C) {
+	var snapshotSaveCalled int
+	defer daemon.MockSnapshotSave(func(s *state.State, snaps, users []string,
+		options map[string]*snap.SnapshotOptions) (uint64, []string, *state.TaskSet, error) {
+		snapshotSaveCalled++
+		c.Check(snaps, check.HasLen, 2)
+		c.Check(options, check.HasLen, 2)
+		c.Check(options, check.DeepEquals, map[string]*snap.SnapshotOptions{
+			"foo": {Exclude: []string{"foo-path-1", "foo-path-2"}},
+			"bar": {Exclude: []string{"bar-path-1", "bar-path-2"}},
+		})
+		t := s.NewTask("fake-snapshot-2", "Snapshot two")
+		return 1, snaps, state.NewTaskSet(t), nil
+	})()
+
+	inst := daemon.MustUnmarshalSnapInstruction(c, `{"action": "snapshot", "snaps": ["foo", "bar"],
+	"snapshot-options": {"foo": {"exclude":["foo-path-1", "foo-path-2"]}, "bar":{"exclude":["bar-path-1", "bar-path-2"]}}}`)
+
+	st := s.d.Overlord().State()
+	st.Lock()
+	res, err := inst.DispatchForMany()(inst, st)
+	st.Unlock()
+	c.Assert(err, check.IsNil)
+	c.Check(res.Summary, check.Equals, `Snapshot snaps "foo", "bar"`)
+	c.Check(res.Affected, check.DeepEquals, inst.Snaps)
+	c.Check(snapshotSaveCalled, check.Equals, 1)
+}
+
+func (s *snapshotSuite) TestSnapshotManyError(c *check.C) {
+	defer daemon.MockSnapshotSave(func(s *state.State, snaps, users []string,
+		options map[string]*snap.SnapshotOptions) (uint64, []string, *state.TaskSet, error) {
+		c.Check(snaps, check.HasLen, 2)
+		return 0, nil, nil, &snap.NotInstalledError{Snap: "foo"}
+	})()
+
+	inst := daemon.MustUnmarshalSnapInstruction(c, `{"action": "snapshot", "snaps": ["foo", "bar"]}`)
+
+	st := s.d.Overlord().State()
+	st.Lock()
+	res, err := inst.DispatchForMany()(inst, st)
+	st.Unlock()
+	c.Check(res, check.IsNil)
+	c.Check(err, check.ErrorMatches, `snap "foo" is not installed`)
 }
 
 func (s *snapshotSuite) TestListSnapshots(c *check.C) {
@@ -114,9 +163,9 @@ func (s *snapshotSuite) TestListSnapshotsBadFiltering(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/snapshots?set=no", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.errorReq(c, req, nil)
-	c.Check(rsp.Status, check.Equals, 400)
-	c.Check(rsp.ErrorResult().Message, check.Equals, `'set', if given, must be a positive base 10 number; got "no"`)
+	rspe := s.errorReq(c, req, nil)
+	c.Check(rspe.Status, check.Equals, 400)
+	c.Check(rspe.Message, check.Equals, `'set', if given, must be a positive base 10 number; got "no"`)
 }
 
 func (s *snapshotSuite) TestListSnapshotsListError(c *check.C) {
@@ -129,9 +178,9 @@ func (s *snapshotSuite) TestListSnapshotsListError(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/snapshots", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.errorReq(c, req, nil)
-	c.Check(rsp.Status, check.Equals, 500)
-	c.Check(rsp.ErrorResult().Message, check.Equals, "no")
+	rspe := s.errorReq(c, req, nil)
+	c.Check(rspe.Status, check.Equals, 500)
+	c.Check(rspe.Message, check.Equals, "no")
 }
 
 func (s *snapshotSuite) TestFormatSnapshotAction(c *check.C) {
@@ -196,9 +245,9 @@ func (s *snapshotSuite) TestChangeSnapshots400(c *check.C) {
 		req, err := http.NewRequest("POST", "/v2/snapshots", strings.NewReader(test.body))
 		c.Assert(err, check.IsNil, comm)
 
-		rsp := s.errorReq(c, req, nil)
-		c.Check(rsp.Status, check.Equals, 400, comm)
-		c.Check(rsp.ErrorResult().Message, check.Matches, test.error, comm)
+		rspe := s.errorReq(c, req, nil)
+		c.Check(rspe.Status, check.Equals, 400, comm)
+		c.Check(rspe.Message, check.Matches, test.error, comm)
 	}
 }
 
@@ -225,9 +274,9 @@ func (s *snapshotSuite) TestChangeSnapshots404(c *check.C) {
 			req, err := http.NewRequest("POST", "/v2/snapshots", strings.NewReader(body))
 			c.Assert(err, check.IsNil, comm)
 
-			rsp := s.errorReq(c, req, nil)
-			c.Check(rsp.Status, check.Equals, 404, comm)
-			c.Check(rsp.ErrorResult().Message, check.Matches, expectedError.Error(), comm)
+			rspe := s.errorReq(c, req, nil)
+			c.Check(rspe.Status, check.Equals, 404, comm)
+			c.Check(rspe.Message, check.Matches, expectedError.Error(), comm)
 			c.Check(done, check.Equals, action, comm)
 		}
 	}
@@ -254,9 +303,9 @@ func (s *snapshotSuite) TestChangeSnapshots500(c *check.C) {
 		req, err := http.NewRequest("POST", "/v2/snapshots", strings.NewReader(body))
 		c.Assert(err, check.IsNil, comm)
 
-		rsp := s.errorReq(c, req, nil)
-		c.Check(rsp.Status, check.Equals, 500, comm)
-		c.Check(rsp.ErrorResult().Message, check.Matches, expectedError.Error(), comm)
+		rspe := s.errorReq(c, req, nil)
+		c.Check(rspe.Status, check.Equals, 500, comm)
+		c.Check(rspe.Message, check.Matches, expectedError.Error(), comm)
 		c.Check(done, check.Equals, action, comm)
 	}
 }
@@ -304,7 +353,6 @@ func (s *snapshotSuite) TestChangeSnapshot(c *check.C) {
 		c.Check(apiData, check.DeepEquals, map[string]interface{}{
 			"snap-names": []interface{}{"foo"},
 		})
-
 	}
 }
 
@@ -329,9 +377,9 @@ func (s *snapshotSuite) TestExportSnapshotsBadRequestOnNonNumericID(c *check.C) 
 	req, err := http.NewRequest("GET", "/v2/snapshots/xxx/export", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.errorReq(c, req, nil)
-	c.Check(rsp.Status, check.Equals, 400)
-	c.Check(rsp.Result, check.DeepEquals, &daemon.ErrorResult{Message: `'id' must be a positive base 10 number; got "xxx"`})
+	rspe := s.errorReq(c, req, nil)
+	c.Check(rspe.Status, check.Equals, 400)
+	c.Check(rspe.Message, check.Equals, `'id' must be a positive base 10 number; got "xxx"`)
 }
 
 func (s *snapshotSuite) TestExportSnapshotsBadRequestOnError(c *check.C) {
@@ -345,9 +393,9 @@ func (s *snapshotSuite) TestExportSnapshotsBadRequestOnError(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/snapshots/1/export", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.errorReq(c, req, nil)
-	c.Check(rsp.Status, check.Equals, 400)
-	c.Check(rsp.Result, check.DeepEquals, &daemon.ErrorResult{Message: `cannot export 1: boom`})
+	rspe := s.errorReq(c, req, nil)
+	c.Check(rspe.Status, check.Equals, 400)
+	c.Check(rspe.Message, check.Equals, `cannot export 1: boom`)
 	c.Check(snapshotExportCalled, check.Equals, 1)
 }
 
@@ -381,9 +429,9 @@ func (s *snapshotSuite) TestImportSnapshotError(c *check.C) {
 	c.Assert(err, check.IsNil)
 	req.Header.Set("Content-Type", client.SnapshotExportMediaType)
 
-	rsp := s.errorReq(c, req, nil)
-	c.Check(rsp.Status, check.Equals, 400)
-	c.Check(rsp.ErrorResult().Message, check.Equals, "no")
+	rspe := s.errorReq(c, req, nil)
+	c.Check(rspe.Status, check.Equals, 400)
+	c.Check(rspe.Message, check.Equals, "no")
 }
 
 func (s *snapshotSuite) TestImportSnapshotNoContentLengthError(c *check.C) {
@@ -392,9 +440,9 @@ func (s *snapshotSuite) TestImportSnapshotNoContentLengthError(c *check.C) {
 	c.Assert(err, check.IsNil)
 	req.Header.Set("Content-Type", client.SnapshotExportMediaType)
 
-	rsp := s.errorReq(c, req, nil)
-	c.Check(rsp.Status, check.Equals, 400)
-	c.Check(rsp.ErrorResult().Message, check.Equals, `cannot parse Content-Length: strconv.ParseInt: parsing "": invalid syntax`)
+	rspe := s.errorReq(c, req, nil)
+	c.Check(rspe.Status, check.Equals, 400)
+	c.Check(rspe.Message, check.Equals, `cannot parse Content-Length: strconv.ParseInt: parsing "": invalid syntax`)
 }
 
 func (s *snapshotSuite) TestImportSnapshotLimits(c *check.C) {

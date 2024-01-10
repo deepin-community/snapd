@@ -27,24 +27,18 @@ import (
 
 type (
 	AccessChecker = accessChecker
-	AccessResult  = accessResult
 
-	OpenAccess          = openAccess
-	AuthenticatedAccess = authenticatedAccess
-	RootAccess          = rootAccess
-	SnapAccess          = snapAccess
-)
-
-const (
-	AccessOK           = accessOK
-	AccessUnauthorized = accessUnauthorized
-	AccessForbidden    = accessForbidden
-	AccessCancelled    = accessCancelled
+	OpenAccess                = openAccess
+	AuthenticatedAccess       = authenticatedAccess
+	RootAccess                = rootAccess
+	SnapAccess                = snapAccess
+	ThemesOpenAccess          = themesOpenAccess
+	ThemesAuthenticatedAccess = themesAuthenticatedAccess
 )
 
 var CheckPolkitActionImpl = checkPolkitActionImpl
 
-func MockCheckPolkitAction(new func(r *http.Request, ucred *Ucrednet, action string) AccessResult) (restore func()) {
+func MockCheckPolkitAction(new func(r *http.Request, ucred *Ucrednet, action string) *APIError) (restore func()) {
 	old := checkPolkitAction
 	checkPolkitAction = new
 	return func() {
@@ -57,5 +51,23 @@ func MockPolkitCheckAuthorization(new func(pid int32, uid uint32, actionId strin
 	polkitCheckAuthorization = new
 	return func() {
 		polkitCheckAuthorization = old
+	}
+}
+
+func MockCgroupSnapNameFromPid(new func(pid int) (string, error)) (restore func()) {
+	old := cgroupSnapNameFromPid
+	cgroupSnapNameFromPid = new
+	return func() {
+		cgroupSnapNameFromPid = old
+	}
+}
+
+var RequireThemeApiAccessImpl = requireThemeApiAccessImpl
+
+func MockRequireThemeApiAccess(new func(d *Daemon, ucred *ucrednet) *apiError) (restore func()) {
+	old := requireThemeApiAccess
+	requireThemeApiAccess = new
+	return func() {
+		requireThemeApiAccess = old
 	}
 }

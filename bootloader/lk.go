@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2019 Canonical Ltd
+ * Copyright (C) 2022 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -26,13 +26,14 @@ import (
 	"os"
 	"path/filepath"
 
+	"golang.org/x/xerrors"
+
 	"github.com/snapcore/snapd/bootloader/lkenv"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/disks"
 	"github.com/snapcore/snapd/snap"
-	"golang.org/x/xerrors"
 )
 
 const (
@@ -105,7 +106,7 @@ func (l *lk) dir() string {
 		return filepath.Join(l.rootdir, "/dev/disk/by-partlabel/")
 	case RoleRecovery, RoleRunMode:
 		// TODO: maybe panic'ing here is a bit harsh...
-		panic("internal error: shouldn't be using lk.dir() for uc20 runtime modes!")
+		panic("internal error: shouldn't be using lk.dir() for UC20+ runtime modes!")
 	default:
 		panic("unexpected bootloader role for lk dir")
 	}

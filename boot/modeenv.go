@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2019-2020 Canonical Ltd
+ * Copyright (C) 2019-2022 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -28,12 +28,17 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/mvo5/goconfigparser"
 
+	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/release"
+	"github.com/snapcore/snapd/secboot"
+	"github.com/snapcore/snapd/snapdenv"
 )
 
 type bootAssetsMap map[string][]string
@@ -58,10 +63,22 @@ type Modeenv struct {
 	Base                string   `key:"base"`
 	TryBase             string   `key:"try_base"`
 	BaseStatus          string   `key:"base_status"`
-	CurrentKernels      []string `key:"current_kernels"`
-	Model               string   `key:"model"`
-	BrandID             string   `key:"model,secondary"`
-	Grade               string   `key:"grade"`
+	// Gadget is the currently active gadget snap
+	Gadget         string   `key:"gadget"`
+	CurrentKernels []string `key:"current_kernels"`
+	// Model, BrandID, Grade, SignKeyID describe the properties of current
+	// device model.
+	Model          string `key:"model"`
+	BrandID        string `key:"model,secondary"`
+	Classic        bool   `key:"classic"`
+	Grade          string `key:"grade"`
+	ModelSignKeyID string `key:"model_sign_key_id"`
+	// TryModel, TryBrandID, TryGrade, TrySignKeyID describe the properties
+	// of the candidate model.
+	TryModel          string `key:"try_model"`
+	TryBrandID        string `key:"try_model,secondary"`
+	TryGrade          string `key:"try_grade"`
+	TryModelSignKeyID string `key:"try_model_sign_key_id"`
 	// BootFlags is the set of boot flags. Whether this applies for the current
 	// or next boot is not indicated in the modeenv. When the modeenv is read in
 	// the initramfs these flags apply to the current boot and are copied into
@@ -140,8 +157,12 @@ func modeenvFile(rootdir string) string {
 }
 
 // ReadModeenv attempts to read the modeenv file at
-// <rootdir>/var/iib/snapd/modeenv.
+// <rootdir>/var/lib/snapd/modeenv.
 func ReadModeenv(rootdir string) (*Modeenv, error) {
+	if snapdenv.Preseeding() {
+		return nil, fmt.Errorf("internal error: modeenv cannot be read during preseeding")
+	}
+
 	modeenvPath := modeenvFile(rootdir)
 	cfg := goconfigparser.New()
 	cfg.AllowNoSectionHeader = true
@@ -166,6 +187,7 @@ func ReadModeenv(rootdir string) (*Modeenv, error) {
 	}
 	unmarshalModeenvValueFromCfg(cfg, "base", &m.Base)
 	unmarshalModeenvValueFromCfg(cfg, "base_status", &m.BaseStatus)
+	unmarshalModeenvValueFromCfg(cfg, "gadget", &m.Gadget)
 	unmarshalModeenvValueFromCfg(cfg, "try_base", &m.TryBase)
 
 	// current_kernels is a comma-delimited list in a string
@@ -174,8 +196,17 @@ func ReadModeenv(rootdir string) (*Modeenv, error) {
 	unmarshalModeenvValueFromCfg(cfg, "model", &bm)
 	m.BrandID = bm.brandID
 	m.Model = bm.model
+	unmarshalModeenvValueFromCfg(cfg, "classic", &m.Classic)
 	// expect the caller to validate the grade
 	unmarshalModeenvValueFromCfg(cfg, "grade", &m.Grade)
+	unmarshalModeenvValueFromCfg(cfg, "model_sign_key_id", &m.ModelSignKeyID)
+	var tryBm modeenvModel
+	unmarshalModeenvValueFromCfg(cfg, "try_model", &tryBm)
+	m.TryBrandID = tryBm.brandID
+	m.TryModel = tryBm.model
+	unmarshalModeenvValueFromCfg(cfg, "try_grade", &m.TryGrade)
+	unmarshalModeenvValueFromCfg(cfg, "try_model_sign_key_id", &m.TryModelSignKeyID)
+
 	unmarshalModeenvValueFromCfg(cfg, "current_trusted_boot_assets", &m.CurrentTrustedBootAssets)
 	unmarshalModeenvValueFromCfg(cfg, "current_trusted_recovery_boot_assets", &m.CurrentTrustedRecoveryBootAssets)
 	unmarshalModeenvValueFromCfg(cfg, "current_kernel_command_lines", &m.CurrentKernelCommandLines)
@@ -246,6 +277,10 @@ func (m *Modeenv) Write() error {
 
 // WriteTo outputs the modeenv to the file at <rootdir>/var/lib/snapd/modeenv.
 func (m *Modeenv) WriteTo(rootdir string) error {
+	if snapdenv.Preseeding() {
+		return fmt.Errorf("internal error: modeenv cannot be written during preseeding")
+	}
+
 	modeenvPath := modeenvFile(rootdir)
 
 	if err := os.MkdirAll(filepath.Dir(modeenvPath), 0755); err != nil {
@@ -263,6 +298,7 @@ func (m *Modeenv) WriteTo(rootdir string) error {
 	marshalModeenvEntryTo(buf, "base", m.Base)
 	marshalModeenvEntryTo(buf, "try_base", m.TryBase)
 	marshalModeenvEntryTo(buf, "base_status", m.BaseStatus)
+	marshalModeenvEntryTo(buf, "gadget", m.Gadget)
 	marshalModeenvEntryTo(buf, "current_kernels", strings.Join(m.CurrentKernels, ","))
 	if m.Model != "" || m.Grade != "" {
 		if m.Model == "" {
@@ -273,7 +309,23 @@ func (m *Modeenv) WriteTo(rootdir string) error {
 		}
 		marshalModeenvEntryTo(buf, "model", &modeenvModel{brandID: m.BrandID, model: m.Model})
 	}
+	if m.Classic {
+		marshalModeenvEntryTo(buf, "classic", true)
+	}
+	// TODO: complain when grade or key are unset
 	marshalModeenvEntryTo(buf, "grade", m.Grade)
+	marshalModeenvEntryTo(buf, "model_sign_key_id", m.ModelSignKeyID)
+	if m.TryModel != "" || m.TryGrade != "" {
+		if m.TryModel == "" {
+			return fmt.Errorf("internal error: try model is unset")
+		}
+		if m.TryBrandID == "" {
+			return fmt.Errorf("internal error: try brand is unset")
+		}
+		marshalModeenvEntryTo(buf, "try_model", &modeenvModel{brandID: m.TryBrandID, model: m.TryModel})
+	}
+	marshalModeenvEntryTo(buf, "try_grade", m.TryGrade)
+	marshalModeenvEntryTo(buf, "try_model_sign_key_id", m.TryModelSignKeyID)
 	marshalModeenvEntryTo(buf, "current_trusted_boot_assets", m.CurrentTrustedBootAssets)
 	marshalModeenvEntryTo(buf, "current_trusted_recovery_boot_assets", m.CurrentTrustedRecoveryBootAssets)
 	marshalModeenvEntryTo(buf, "current_kernel_command_lines", m.CurrentKernelCommandLines)
@@ -293,6 +345,79 @@ func (m *Modeenv) WriteTo(rootdir string) error {
 		return err
 	}
 	return nil
+}
+
+// modelForSealing is a helper type that implements
+// github.com/snapcore/secboot.SnapModel interface.
+type modelForSealing struct {
+	brandID        string
+	model          string
+	classic        bool
+	grade          asserts.ModelGrade
+	modelSignKeyID string
+}
+
+// verify interface match
+var _ secboot.ModelForSealing = (*modelForSealing)(nil)
+
+func (m *modelForSealing) BrandID() string           { return m.brandID }
+func (m *modelForSealing) SignKeyID() string         { return m.modelSignKeyID }
+func (m *modelForSealing) Model() string             { return m.model }
+func (m *modelForSealing) Classic() bool             { return m.classic }
+func (m *modelForSealing) Grade() asserts.ModelGrade { return m.grade }
+func (m *modelForSealing) Series() string            { return release.Series }
+
+// modelUniqueID returns a unique ID which can be used as a map index of the
+// provided model.
+func modelUniqueID(m secboot.ModelForSealing) string {
+	return fmt.Sprintf("%s/%s,%s,%s", m.BrandID(), m.Model(), m.Grade(), m.SignKeyID())
+}
+
+// ModelForSealing returns a wrapper implementing
+// github.com/snapcore/secboot.SnapModel interface which describes the current
+// model.
+func (m *Modeenv) ModelForSealing() secboot.ModelForSealing {
+	return &modelForSealing{
+		brandID:        m.BrandID,
+		model:          m.Model,
+		classic:        m.Classic,
+		grade:          asserts.ModelGrade(m.Grade),
+		modelSignKeyID: m.ModelSignKeyID,
+	}
+}
+
+// TryModelForSealing returns a wrapper implementing
+// github.com/snapcore/secboot.SnapModel interface which describes the candidate
+// or try model.
+func (m *Modeenv) TryModelForSealing() secboot.ModelForSealing {
+	return &modelForSealing{
+		brandID:        m.TryBrandID,
+		model:          m.TryModel,
+		classic:        m.Classic,
+		grade:          asserts.ModelGrade(m.TryGrade),
+		modelSignKeyID: m.TryModelSignKeyID,
+	}
+}
+
+func (m *Modeenv) setModel(model *asserts.Model) {
+	m.Model = model.Model()
+	m.BrandID = model.BrandID()
+	m.Grade = string(model.Grade())
+	m.ModelSignKeyID = model.SignKeyID()
+}
+
+func (m *Modeenv) setTryModel(model *asserts.Model) {
+	m.TryModel = model.Model()
+	m.TryBrandID = model.BrandID()
+	m.TryGrade = string(model.Grade())
+	m.TryModelSignKeyID = model.SignKeyID()
+}
+
+func (m *Modeenv) clearTryModel() {
+	m.TryModel = ""
+	m.TryBrandID = ""
+	m.TryGrade = ""
+	m.TryModelSignKeyID = ""
 }
 
 type modeenvValueMarshaller interface {
@@ -318,6 +443,8 @@ func marshalModeenvEntryTo(out io.Writer, key string, what interface{}) error {
 			return nil
 		}
 		asString = asModeenvStringList(v)
+	case bool:
+		asString = strconv.FormatBool(v)
 	default:
 		if vm, ok := what.(modeenvValueMarshaller); ok {
 			marshalled, err := vm.MarshalModeenvValue()
@@ -344,7 +471,7 @@ func marshalModeenvEntryTo(out io.Writer, key string, what interface{}) error {
 }
 
 // unmarshalModeenvValueFromCfg unmarshals the value of the entry with
-// th given key to dest. If there's no such entry dest might be left
+// the given key to dest. If there's no such entry dest might be left
 // empty.
 func unmarshalModeenvValueFromCfg(cfg *goconfigparser.ConfigParser, key string, dest interface{}) error {
 	if dest == nil {
@@ -357,6 +484,16 @@ func unmarshalModeenvValueFromCfg(cfg *goconfigparser.ConfigParser, key string, 
 		*v = kv
 	case *[]string:
 		*v = splitModeenvStringList(kv)
+	case *bool:
+		if kv == "" {
+			*v = false
+			return nil
+		}
+		var err error
+		*v, err = strconv.ParseBool(kv)
+		if err != nil {
+			return fmt.Errorf("cannot parse modeenv value %q to bool: %v", kv, err)
+		}
 	default:
 		if vm, ok := v.(modeenvValueUnmarshaller); ok {
 			if err := vm.UnmarshalModeenvValue(kv); err != nil {

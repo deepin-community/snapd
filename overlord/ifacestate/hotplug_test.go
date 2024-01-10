@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"time"
 
+	. "gopkg.in/check.v1"
+
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/builtin"
@@ -42,8 +44,6 @@ import (
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/testutil"
-
-	. "gopkg.in/check.v1"
 )
 
 type hotplugSuite struct {
@@ -634,7 +634,7 @@ func (s *hotplugSuite) TestHotplugEnumerationDone(c *C) {
 			"interface":   "test-a",
 			"hotplug-key": "yet-another-device"}})
 
-	// sanity
+	// precondition
 	slot, _ := repo.SlotForHotplugKey("test-a", "key-other-device")
 	c.Assert(slot, NotNil)
 
@@ -807,7 +807,7 @@ func (s *hotplugSuite) TestDefaultDeviceKey(c *C) {
 	key, err := ifacestate.DefaultDeviceKey(di, 0)
 	c.Assert(err, IsNil)
 
-	// sanity check
+	// validity check
 	c.Check(key, HasLen, 65)
 	c.Check(key, Equals, snap.HotplugKey("08bcbdcda3fee3534c0288506d9b75d4e26fe3692a36a11e75d05eac9ebf5ca7d"))
 	c.Assert(key, Equals, keyHelper("ID_V4L_PRODUCT\x00v4lproduct\x00ID_VENDOR_ID\x00vendor\x00ID_MODEL_ID\x00model\x00ID_SERIAL\x00serial\x00"))

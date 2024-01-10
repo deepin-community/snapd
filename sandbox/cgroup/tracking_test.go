@@ -20,10 +20,12 @@
 package cgroup_test
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/godbus/dbus"
 	. "gopkg.in/check.v1"
@@ -50,6 +52,7 @@ var _ = Suite(&trackingSuite{})
 
 func (s *trackingSuite) SetUpTest(c *C) {
 	dirs.SetRootDir(c.MkDir())
+	cgroup.MockVersion(cgroup.V2, nil)
 }
 
 func (s *trackingSuite) TearDownTest(c *C) {
@@ -72,6 +75,22 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingFeatureDisabled(c *C)
 	c.Assert(err, ErrorMatches, "cannot track application process")
 }
 
+// TestCreateTransientScopeForTrackingUUIDFailure tests the UUID error path
+func (s *trackingSuite) TestCreateTransientScopeForTrackingUUIDFailure(c *C) {
+	// Hand out stub connections to both the system and session bus.
+	// Neither is really used here but they must appear to be available.
+	restore := dbusutil.MockConnections(dbustest.StubConnection, dbustest.StubConnection)
+	defer restore()
+
+	restore = cgroup.MockRandomUUID(func() (string, error) {
+		return "", errors.New("mocked uuid error")
+	})
+	defer restore()
+
+	err := cgroup.CreateTransientScopeForTracking("snap.pkg.app", nil)
+	c.Assert(err, ErrorMatches, "mocked uuid error")
+}
+
 // CreateTransientScopeForTracking does stuff when refresh app awareness is on
 func (s *trackingSuite) TestCreateTransientScopeForTrackingFeatureEnabled(c *C) {
 	// Pretend that refresh app awareness is enabled
@@ -85,22 +104,38 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingFeatureEnabled(c *C) 
 	defer restore()
 	// Rig the random UUID generator to return this value.
 	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
-	restore = cgroup.MockRandomUUID(uuid)
+	restore = cgroup.MockRandomUUID(func() (string, error) {
+		return uuid, nil
+	})
 	defer restore()
+	signalChan := make(chan struct{})
 	// Replace interactions with DBus so that only session bus is available and responds with our logic.
-	conn, err := dbustest.Connection(func(msg *dbus.Message, n int) ([]*dbus.Message, error) {
+	conn, inject, err := dbustest.InjectableConnection(func(msg *dbus.Message, n int) ([]*dbus.Message, error) {
 		switch n {
 		case 0:
-			return []*dbus.Message{checkAndRespondToStartTransientUnit(c, msg, "snap.pkg.app."+uuid+".scope", 312123)}, nil
+			return []*dbus.Message{checkSystemdSignalSubscribe(c, msg)}, nil
+		case 1:
+			defer func() {
+				close(signalChan)
+			}()
+			return []*dbus.Message{checkAndRespondToStartTransientUnit(c, msg, "snap.pkg.app-"+uuid+".scope", 312123)}, nil
+		case 2:
+			return []*dbus.Message{checkSystemSignalUnsubscribe(c, msg)}, nil
 		}
 		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
 	})
+	go func() {
+		select {
+		case <-signalChan:
+			inject(mockJobRemovedSignal("snap.pkg.app-"+uuid+".scope", "done"))
+		}
+	}()
 	c.Assert(err, IsNil)
 	restore = dbusutil.MockOnlySessionBusAvailable(conn)
 	defer restore()
 	// Replace the cgroup analyzer function
 	restore = cgroup.MockCgroupProcessPathInTrackingCgroup(func(pid int) (string, error) {
-		return "/user.slice/user-12345.slice/user@12345.service/snap.pkg.app." + uuid + ".scope", nil
+		return "/user.slice/user-12345.slice/user@12345.service/snap.pkg.app-" + uuid + ".scope", nil
 	})
 	defer restore()
 
@@ -185,7 +220,9 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyRootFallback(c
 
 	// Rig the random UUID generator to return this value.
 	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
-	restore = cgroup.MockRandomUUID(uuid)
+	restore = cgroup.MockRandomUUID(func() (string, error) {
+		return uuid, nil
+	})
 	defer restore()
 
 	// Calling StartTransientUnit fails on the session and then works on the system bus.
@@ -208,7 +245,7 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyRootFallback(c
 	// Rig the cgroup analyzer to pretend that we got placed into the system slice.
 	restore = cgroup.MockCgroupProcessPathInTrackingCgroup(func(pid int) (string, error) {
 		c.Assert(pid, Equals, 312123)
-		return "/system.slice/snap.pkg.app." + uuid + ".scope", nil
+		return "/system.slice/snap.pkg.app-" + uuid + ".scope", nil
 	})
 	defer restore()
 
@@ -239,7 +276,9 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyRootFailedFall
 
 	// Rig the random UUID generator to return this value.
 	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
-	restore = cgroup.MockRandomUUID(uuid)
+	restore = cgroup.MockRandomUUID(func() (string, error) {
+		return uuid, nil
+	})
 	defer restore()
 
 	// Calling StartTransientUnit fails so that we try to use the system bus as fallback.
@@ -280,7 +319,9 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyNoDBus(c *C) {
 
 	// Rig the random UUID generator to return this value.
 	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
-	restore = cgroup.MockRandomUUID(uuid)
+	restore = cgroup.MockRandomUUID(func() (string, error) {
+		return uuid, nil
+	})
 	defer restore()
 
 	// Calling StartTransientUnit is not attempted without a DBus connection.
@@ -321,7 +362,9 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingSilentlyFails(c *C) {
 
 	// Rig the random UUID generator to return this value.
 	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
-	restore = cgroup.MockRandomUUID(uuid)
+	restore = cgroup.MockRandomUUID(func() (string, error) {
+		return uuid, nil
+	})
 	defer restore()
 
 	// Calling StartTransientUnit succeeds but in reality does not move our
@@ -370,7 +413,9 @@ func (s *trackingSuite) TestCreateTransientScopeForRootOnSystemBus(c *C) {
 
 	// Rig the random UUID generator to return this value.
 	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
-	restore = cgroup.MockRandomUUID(uuid)
+	restore = cgroup.MockRandomUUID(func() (string, error) {
+		return uuid, nil
+	})
 	defer restore()
 
 	// Pretend that attempting to create a transient scope succeeds.  Measure
@@ -378,20 +423,128 @@ func (s *trackingSuite) TestCreateTransientScopeForRootOnSystemBus(c *C) {
 	// call was made on the system bus, as requested by TrackingOptions below.
 	restore = cgroup.MockDoCreateTransientScope(func(conn *dbus.Conn, unitName string, pid int) error {
 		c.Assert(conn, Equals, systemBus)
-		c.Assert(unitName, Equals, "snap.pkg.app."+uuid+".scope")
+		c.Assert(unitName, Equals, "snap.pkg.app-"+uuid+".scope")
 		return nil
 	})
 	defer restore()
 
 	// Rig the cgroup analyzer to indicate successful tracking.
 	restore = cgroup.MockCgroupProcessPathInTrackingCgroup(func(pid int) (string, error) {
-		return "snap.pkg.app." + uuid + ".scope", nil
+		return "snap.pkg.app-" + uuid + ".scope", nil
 	})
 	defer restore()
 
 	// Create a transient scope and see it succeed.
 	err = cgroup.CreateTransientScopeForTracking("snap.pkg.app", &cgroup.TrackingOptions{AllowSessionBus: false})
 	c.Assert(err, IsNil)
+}
+
+type testTransientScopeConfirm struct {
+	uuid        string
+	confirmUnit string
+	confirmErr  error
+	expectedErr string
+}
+
+func (s *trackingSuite) testCreateTransientScopeConfirm(c *C, tc testTransientScopeConfirm) {
+	enableFeatures(c, features.RefreshAppAwareness)
+
+	logBuf, restore := logger.MockLogger()
+	defer restore()
+	os.Setenv("SNAPD_DEBUG", "true")
+	defer os.Unsetenv("SNAPD_DEBUG")
+	restore = cgroup.MockOsGetuid(12345)
+	defer restore()
+	restore = cgroup.MockOsGetpid(312123)
+	defer restore()
+	restore = cgroup.MockRandomUUID(func() (string, error) {
+		return tc.uuid, nil
+	})
+	defer restore()
+	sessionBus, err := dbustest.Connection(func(msg *dbus.Message, n int) ([]*dbus.Message, error) {
+		// we are not expecting any dbus traffic
+		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
+	})
+
+	c.Assert(err, IsNil)
+	restore = dbusutil.MockOnlySessionBusAvailable(sessionBus)
+	defer restore()
+	restore = cgroup.MockDoCreateTransientScope(func(conn *dbus.Conn, unitName string, pid int) error {
+		c.Assert(conn, Equals, sessionBus)
+		c.Assert(unitName, Equals, "snap.pkg.app-"+tc.uuid+".scope")
+		return nil
+	})
+	defer restore()
+
+	restore = cgroup.MockCgroupProcessPathInTrackingCgroup(func(pid int) (string, error) {
+		return tc.confirmUnit, tc.confirmErr
+	})
+	defer restore()
+
+	// creating transient scope fails when systemd reports that the job failed
+	err = cgroup.CreateTransientScopeForTracking("snap.pkg.app", nil)
+	if tc.expectedErr == "" {
+		c.Assert(err, IsNil)
+	} else {
+		c.Assert(err, ErrorMatches, tc.expectedErr)
+		if tc.confirmErr == nil {
+			c.Check(logBuf.String(), testutil.Contains, "systemd could not associate process 312123 with transient scope")
+		}
+	}
+}
+
+func (s *trackingSuite) TestCreateTransientScopeConfirmHappy(c *C) {
+	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
+	s.testCreateTransientScopeConfirm(c, testTransientScopeConfirm{
+		uuid:        uuid,
+		confirmUnit: "foo/bar/baz/snap.pkg.app-" + uuid + ".scope",
+	})
+}
+
+func (s *trackingSuite) TestCreateTransientScopeConfirmOtherUnit(c *C) {
+	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
+	s.testCreateTransientScopeConfirm(c, testTransientScopeConfirm{
+		uuid:        uuid,
+		confirmUnit: "foo/bar/baz/other-unit.scope",
+		expectedErr: cgroup.ErrCannotTrackProcess.Error(),
+	})
+}
+
+func (s *trackingSuite) TestCreateTransientScopeConfirmCheckError(c *C) {
+	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
+	s.testCreateTransientScopeConfirm(c, testTransientScopeConfirm{
+		uuid:        uuid,
+		confirmErr:  fmt.Errorf("mock failure"),
+		expectedErr: "mock failure",
+	})
+}
+
+const systemdSignalMatch = `type='signal',interface='org.freedesktop.systemd1.Manager',member='JobRemoved'`
+
+func checkSystemdSignalSubscribe(c *C, msg *dbus.Message) *dbus.Message {
+	var rule string
+	dbus.Store(msg.Body, &rule)
+	c.Check(rule, Equals, systemdSignalMatch)
+	return &dbus.Message{
+		Type: dbus.TypeMethodReply,
+		Headers: map[dbus.HeaderField]dbus.Variant{
+			dbus.FieldReplySerial: dbus.MakeVariant(msg.Serial()),
+			dbus.FieldSender:      dbus.MakeVariant(":1"), // This does not matter.
+		},
+	}
+}
+
+func checkSystemSignalUnsubscribe(c *C, msg *dbus.Message) *dbus.Message {
+	var rule string
+	dbus.Store(msg.Body, &rule)
+	c.Check(rule, Equals, systemdSignalMatch)
+	return &dbus.Message{
+		Type: dbus.TypeMethodReply,
+		Headers: map[dbus.HeaderField]dbus.Variant{
+			dbus.FieldReplySerial: dbus.MakeVariant(msg.Serial()),
+			dbus.FieldSender:      dbus.MakeVariant(":1"), // This does not matter.
+		},
+	}
 }
 
 func checkAndRespondToStartTransientUnit(c *C, msg *dbus.Message, scopeName string, pid int) *dbus.Message {
@@ -453,15 +606,222 @@ func checkAndFailToStartTransientUnit(c *C, msg *dbus.Message, errMsg string) *d
 	}
 }
 
-func (s *trackingSuite) TestDoCreateTransientScopeHappy(c *C) {
+func mockJobRemovedSignal(unit, result string) *dbus.Message {
+	return &dbus.Message{
+		Type: dbus.TypeSignal,
+		Headers: map[dbus.HeaderField]dbus.Variant{
+			dbus.FieldSender:    dbus.MakeVariant(":1"), // This does not matter.
+			dbus.FieldPath:      dbus.MakeVariant(dbus.ObjectPath("/org/freedesktop/systemd1")),
+			dbus.FieldInterface: dbus.MakeVariant("org.freedesktop.systemd1.Manager"),
+			dbus.FieldMember:    dbus.MakeVariant("JobRemoved"),
+			dbus.FieldSignature: dbus.MakeVariant(
+				dbus.SignatureOf(uint32(0), dbus.ObjectPath(""), "", "")),
+		},
+		Body: []interface{}{
+			uint32(1),
+			dbus.ObjectPath("/org/freedesktop/systemd1/job/1462"),
+			unit,
+			result,
+		},
+	}
+}
+
+func (s *trackingSuite) TestCreateTransientScopeHappyWithRetriedCheckCgroupV1(c *C) {
+	enableFeatures(c, features.RefreshAppAwareness)
+
+	restore := cgroup.MockVersion(cgroup.V1, nil)
+	defer restore()
+	logBuf, restore := logger.MockLogger()
+	defer restore()
+	os.Setenv("SNAPD_DEBUG", "true")
+	defer os.Unsetenv("SNAPD_DEBUG")
+	restore = cgroup.MockOsGetuid(12345)
+	defer restore()
+	restore = cgroup.MockOsGetpid(312123)
+	defer restore()
+	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
+	restore = cgroup.MockRandomUUID(func() (string, error) {
+		return uuid, nil
+	})
+	defer restore()
+	sessionBus, err := dbustest.Connection(func(msg *dbus.Message, n int) ([]*dbus.Message, error) {
+		c.Logf("%v got msg: %v", n, msg)
+		switch n {
+		case 0:
+			return []*dbus.Message{checkAndRespondToStartTransientUnit(c, msg, "snap.pkg.app-"+uuid+".scope", 312123)}, nil
+			// CreateTransientScopeForTracking is called twice in the test
+		case 1:
+			return []*dbus.Message{checkAndRespondToStartTransientUnit(c, msg, "snap.pkg.app-"+uuid+".scope", 312123)}, nil
+		}
+		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
+	})
+
+	c.Assert(err, IsNil)
+	restore = dbusutil.MockOnlySessionBusAvailable(sessionBus)
+	defer restore()
+
+	pathInTrackingCgroupCallsToSuccess := 5
+	pathInTrackingCgroupCalls := 0
+	restore = cgroup.MockCgroupProcessPathInTrackingCgroup(func(pid int) (string, error) {
+		pathInTrackingCgroupCalls++
+		if pathInTrackingCgroupCalls < pathInTrackingCgroupCallsToSuccess {
+			return "vte-spawn-1234-1234-1234.scope", nil
+		}
+		return "snap.pkg.app-" + uuid + ".scope", nil
+	})
+	defer restore()
+
+	// creating transient scope succeeds even if check is retried
+	err = cgroup.CreateTransientScopeForTracking("snap.pkg.app", nil)
+	c.Assert(err, IsNil)
+	c.Check(pathInTrackingCgroupCalls, Equals, 5)
+	c.Check(logBuf.String(), Not(testutil.Contains), "systemd could not associate process 312123 with transient scope")
+
+	// try again, but exhaust the limit if attempts which should be set to 100
+	pathInTrackingCgroupCalls = 0
+	pathInTrackingCgroupCallsToSuccess = 99999
+	logBuf.Reset()
+	err = cgroup.CreateTransientScopeForTracking("snap.pkg.app", nil)
+	c.Assert(err, ErrorMatches, "cannot track application process")
+	c.Check(pathInTrackingCgroupCalls, Equals, 100)
+	c.Check(logBuf.String(), testutil.Contains, "systemd could not associate process 312123 with transient scope")
+}
+
+func (s *trackingSuite) TestCreateTransientScopeUnhappyJobFailed(c *C) {
+	enableFeatures(c, features.RefreshAppAwareness)
+
+	restore := cgroup.MockOsGetuid(12345)
+	defer restore()
+	restore = cgroup.MockOsGetpid(312123)
+	defer restore()
+	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
+	restore = cgroup.MockRandomUUID(func() (string, error) {
+		return uuid, nil
+	})
+	defer restore()
+	signalChan := make(chan struct{})
+	sessionBus, inject, err := dbustest.InjectableConnection(func(msg *dbus.Message, n int) ([]*dbus.Message, error) {
+		c.Logf("dbus message %v", n)
+		switch n {
+		case 0:
+			return []*dbus.Message{checkSystemdSignalSubscribe(c, msg)}, nil
+		case 1:
+			defer func() {
+				close(signalChan)
+			}()
+			return []*dbus.Message{checkAndRespondToStartTransientUnit(c, msg, "snap.pkg.app-"+uuid+".scope", 312123)}, nil
+		case 2:
+			return []*dbus.Message{checkSystemSignalUnsubscribe(c, msg)}, nil
+		}
+		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
+	})
+	go func() {
+		select {
+		case <-signalChan:
+			inject(mockJobRemovedSignal("snap.pkg.app-"+uuid+".scope", "failed"))
+		}
+	}()
+
+	c.Assert(err, IsNil)
+	restore = dbusutil.MockOnlySessionBusAvailable(sessionBus)
+	defer restore()
+
+	restore = cgroup.MockCgroupProcessPathInTrackingCgroup(func(pid int) (string, error) {
+		c.Fatal("unexpected call")
+		return "", fmt.Errorf("unexpected call")
+	})
+	defer restore()
+
+	// creating transient scope fails when systemd reports that the job failed
+	err = cgroup.CreateTransientScopeForTracking("snap.pkg.app", nil)
+	c.Assert(err, ErrorMatches, "transient scope could not be started, job /org/freedesktop/systemd1/job/1462 finished with result failed")
+}
+
+func (s *trackingSuite) TestCreateTransientScopeUnhappyJobTimeout(c *C) {
+	enableFeatures(c, features.RefreshAppAwareness)
+
+	restore := cgroup.MockOsGetuid(12345)
+	defer restore()
+	restore = cgroup.MockOsGetpid(312123)
+	defer restore()
+	uuid := "cc98cd01-6a25-46bd-b71b-82069b71b770"
+	restore = cgroup.MockRandomUUID(func() (string, error) {
+		return uuid, nil
+	})
+	defer restore()
+	restore = cgroup.MockCreateScopeJobTimeout(100 * time.Millisecond)
+	defer restore()
+	// mock a connection, but without support for injecting signal messages
+	sessionBus, err := dbustest.Connection(func(msg *dbus.Message, n int) ([]*dbus.Message, error) {
+		c.Logf("dbus message %v", n)
+		switch n {
+		case 0:
+			return []*dbus.Message{checkSystemdSignalSubscribe(c, msg)}, nil
+		case 1:
+			return []*dbus.Message{checkAndRespondToStartTransientUnit(c, msg, "snap.pkg.app-"+uuid+".scope", 312123)}, nil
+		case 2:
+			return []*dbus.Message{checkSystemSignalUnsubscribe(c, msg)}, nil
+		}
+		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
+	})
+
+	c.Assert(err, IsNil)
+	restore = dbusutil.MockOnlySessionBusAvailable(sessionBus)
+	defer restore()
+
+	restore = cgroup.MockCgroupProcessPathInTrackingCgroup(func(pid int) (string, error) {
+		c.Fatal("unexpected call")
+		return "", fmt.Errorf("unexpected call")
+	})
+	defer restore()
+
+	// creating transient scope fails when systemd reports that the job failed
+	err = cgroup.CreateTransientScopeForTracking("snap.pkg.app", nil)
+	c.Assert(err, ErrorMatches, "transient scope not created in 100ms")
+}
+
+func (s *trackingSuite) TestDoCreateTransientScopeHappyCgroupV2(c *C) {
+	signalChan := make(chan struct{})
+	conn, inject, err := dbustest.InjectableConnection(func(msg *dbus.Message, n int) ([]*dbus.Message, error) {
+		c.Logf("message: %v", msg)
+		switch n {
+		case 0:
+			return []*dbus.Message{checkSystemdSignalSubscribe(c, msg)}, nil
+		case 1:
+			defer func() {
+				close(signalChan)
+			}()
+			return []*dbus.Message{checkAndRespondToStartTransientUnit(c, msg, "foo.scope", 312123)}, nil
+		case 2:
+			return []*dbus.Message{checkSystemSignalUnsubscribe(c, msg)}, nil
+		}
+		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
+	})
+	go func() {
+		select {
+		case <-signalChan:
+			inject(mockJobRemovedSignal("foo.scope", "done"))
+		}
+	}()
+
+	c.Assert(err, IsNil)
+	defer conn.Close()
+	err = cgroup.DoCreateTransientScope(conn, "foo.scope", 312123)
+	c.Assert(err, IsNil)
+}
+
+func (s *trackingSuite) TestDoCreateTransientScopeHappyCgroupV1(c *C) {
+	restore := cgroup.MockVersion(cgroup.V1, nil)
+	defer restore()
+
 	conn, err := dbustest.Connection(func(msg *dbus.Message, n int) ([]*dbus.Message, error) {
+		c.Logf("message: %v", msg)
 		switch n {
 		case 0:
 			return []*dbus.Message{checkAndRespondToStartTransientUnit(c, msg, "foo.scope", 312123)}, nil
 		}
 		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
 	})
-
 	c.Assert(err, IsNil)
 	defer conn.Close()
 	err = cgroup.DoCreateTransientScope(conn, "foo.scope", 312123)
@@ -481,7 +841,11 @@ func (s *trackingSuite) TestDoCreateTransientScopeForwardedErrors(c *C) {
 		conn, err := dbustest.Connection(func(msg *dbus.Message, n int) ([]*dbus.Message, error) {
 			switch n {
 			case 0:
+				return []*dbus.Message{checkSystemdSignalSubscribe(c, msg)}, nil
+			case 1:
 				return []*dbus.Message{checkAndFailToStartTransientUnit(c, msg, t.dbusError)}, nil
+			case 2:
+				return []*dbus.Message{checkSystemSignalUnsubscribe(c, msg)}, nil
 			}
 			return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
 		})
@@ -500,7 +864,11 @@ func (s *trackingSuite) TestDoCreateTransientScopeClashingScopeName(c *C) {
 	conn, err := dbustest.Connection(func(msg *dbus.Message, n int) ([]*dbus.Message, error) {
 		switch n {
 		case 0:
+			return []*dbus.Message{checkSystemdSignalSubscribe(c, msg)}, nil
+		case 1:
 			return []*dbus.Message{checkAndFailToStartTransientUnit(c, msg, errMsg)}, nil
+		case 2:
+			return []*dbus.Message{checkSystemSignalUnsubscribe(c, msg)}, nil
 		}
 		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
 	})
@@ -516,7 +884,11 @@ func (s *trackingSuite) TestDoCreateTransientScopeOtherDBusErrors(c *C) {
 	conn, err := dbustest.Connection(func(msg *dbus.Message, n int) ([]*dbus.Message, error) {
 		switch n {
 		case 0:
+			return []*dbus.Message{checkSystemdSignalSubscribe(c, msg)}, nil
+		case 1:
 			return []*dbus.Message{checkAndFailToStartTransientUnit(c, msg, errMsg)}, nil
+		case 2:
+			return []*dbus.Message{checkSystemSignalUnsubscribe(c, msg)}, nil
 		}
 		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
 	})

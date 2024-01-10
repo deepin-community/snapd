@@ -27,6 +27,7 @@ import (
 
 	. "gopkg.in/check.v1"
 
+	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/sandbox/cgroup"
 	"github.com/snapcore/snapd/testutil"
 )
@@ -44,7 +45,8 @@ func (s *cgroupSuite) SetUpTest(c *C) {
 	s.BaseTest.SetUpTest(c)
 
 	s.rootDir = c.MkDir()
-	s.AddCleanup(cgroup.MockFsRootPath(s.rootDir))
+	dirs.SetRootDir(s.rootDir)
+	s.AddCleanup(func() { dirs.SetRootDir("/") })
 }
 
 func (s *cgroupSuite) TestIsUnified(c *C) {
@@ -91,7 +93,7 @@ func (s *cgroupSuite) TestProbeVersionUnhappy(c *C) {
 	})
 	defer restore()
 	v, err := cgroup.ProbeCgroupVersion()
-	c.Assert(err, ErrorMatches, "cannot determine filesystem type: statfs fail")
+	c.Assert(err, ErrorMatches, "cannot determine cgroup version: statfs fail")
 	c.Assert(v, Equals, cgroup.Unknown)
 }
 
@@ -246,33 +248,41 @@ func (s *cgroupSuite) TestProcessPathInTrackingCgroup(c *C) {
 `
 
 	d := c.MkDir()
-	restore := cgroup.MockFsRootPath(d)
-	defer restore()
-
-	restore = cgroup.MockVersion(cgroup.V2, nil)
-	defer restore()
+	defer dirs.SetRootDir(dirs.GlobalRootDir)
+	dirs.SetRootDir(d)
 
 	f := filepath.Join(d, "proc", "1234", "cgroup")
 	c.Assert(os.MkdirAll(filepath.Dir(f), 0755), IsNil)
 
-	for _, scenario := range []struct{ cgroups, path, errMsg string }{
-		{cgroups: "", path: "", errMsg: "cannot find tracking cgroup"},
-		{cgroups: noise + "", path: "", errMsg: "cannot find tracking cgroup"},
-		{cgroups: noise + "0::/foo", path: "/foo"},
-		{cgroups: noise + "1:name=systemd:/bar", path: "/bar"},
+	for _, scenario := range []struct {
+		cgVersion             int
+		cgroups, path, errMsg string
+	}{
+		{cgVersion: cgroup.V2, cgroups: "", path: "", errMsg: "cannot find tracking cgroup"},
+		{cgVersion: cgroup.V2, cgroups: noise + "", path: "", errMsg: "cannot find tracking cgroup"},
+		{cgVersion: cgroup.V2, cgroups: noise + "0::/foo", path: "/foo"},
+		{cgVersion: cgroup.V2, cgroups: noise + "1:name=systemd:/bar", errMsg: "cannot find tracking cgroup"},
+		// If only V1 is mounted, then the same configuration works
+		{cgVersion: cgroup.V1, cgroups: noise + "1:name=systemd:/bar", path: "/bar"},
 		// First match wins (normally they are in sync).
-		{cgroups: noise + "1:name=systemd:/bar\n0::/foo", path: "/bar"},
-		{cgroups: "0::/tricky:path", path: "/tricky:path"},
-		{cgroups: "1:ctrl" /* no path */, errMsg: `cannot parse proc cgroup entry ".*": expected three fields`},
-		{cgroups: "potato:foo:/bar" /* bad ID number */, errMsg: `cannot parse proc cgroup entry ".*": cannot parse cgroup id "potato"`},
+		{cgVersion: cgroup.V1, cgroups: noise + "1:name=systemd:/bar\n0::/foo", path: "/bar"},
+		{cgVersion: cgroup.V2, cgroups: noise + "1:name=systemd:/bar\n0::/foo", path: "/foo"},
+		{cgVersion: cgroup.V2, cgroups: "0::/tricky:path", path: "/tricky:path"},
+		{cgVersion: cgroup.V2, cgroups: "1:ctrl" /* no path */, errMsg: `cannot parse proc cgroup entry ".*": expected three fields`},
+		{cgVersion: cgroup.V2, cgroups: "potato:foo:/bar" /* bad ID number */, errMsg: `cannot parse proc cgroup entry ".*": cannot parse cgroup id "potato"`},
 	} {
+		restoreCGVersion := cgroup.MockVersion(scenario.cgVersion, nil)
+
 		c.Assert(ioutil.WriteFile(f, []byte(scenario.cgroups), 0644), IsNil)
 		path, err := cgroup.ProcessPathInTrackingCgroup(1234)
 		if scenario.errMsg != "" {
 			c.Assert(err, ErrorMatches, scenario.errMsg)
 		} else {
 			c.Assert(path, Equals, scenario.path)
+			c.Assert(err, IsNil)
 		}
+
+		restoreCGVersion()
 	}
 }
 
@@ -281,10 +291,10 @@ func (s *cgroupSuite) TestProcessPathInTrackingCgroupV2SpecialCase(c *C) {
 1:name=systemd:/user.slice/user-0.slice/session-1.scope
 `
 	d := c.MkDir()
-	restore := cgroup.MockFsRootPath(d)
-	defer restore()
+	defer dirs.SetRootDir(dirs.GlobalRootDir)
+	dirs.SetRootDir(d)
 
-	restore = cgroup.MockVersion(cgroup.V1, nil)
+	restore := cgroup.MockVersion(cgroup.V1, nil)
 	defer restore()
 
 	f := filepath.Join(d, "proc", "1234", "cgroup")

@@ -21,330 +21,192 @@ package servicestate
 
 import (
 	"fmt"
-	"sort"
-	"time"
+	"strings"
 
 	"github.com/snapcore/snapd/features"
-	"github.com/snapcore/snapd/gadget/quantity"
-	"github.com/snapcore/snapd/logger"
-	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/overlord/configstate/config"
+	"github.com/snapcore/snapd/overlord/servicestate/internal"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
-	"github.com/snapcore/snapd/progress"
-	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/quota"
 	"github.com/snapcore/snapd/snapdenv"
-	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/systemd"
-	"github.com/snapcore/snapd/timings"
-	"github.com/snapcore/snapd/wrappers"
 )
 
 var (
-	systemdVersion int
+	systemdVersionError error
 )
 
-// TODO: move to a systemd.AtLeast() ?
-func checkSystemdVersion() error {
-	vers, err := systemd.Version()
-	if err != nil {
-		return err
-	}
-	systemdVersion = vers
-	return nil
+func checkSystemdVersion() {
+	systemdVersionError = systemd.EnsureAtLeast(230)
 }
 
 func init() {
-	if err := checkSystemdVersion(); err != nil {
-		logger.Noticef("failed to check systemd version: %v", err)
+	snapstate.AddSnapToQuotaGroup = AddSnapToQuotaGroup
+	EnsureQuotaUsability()
+}
+
+// EnsureQuotaUsability is exported for unit tests from other packages to re-run
+// the init() time checks for quota usability which set the errors which
+// quotaGroupsAvailable() checks for.
+// It saves the previous state of the usability errors to be restored via the
+// provided restore function.
+func EnsureQuotaUsability() (restore func()) {
+	oldSystemdErr := systemdVersionError
+	checkSystemdVersion()
+
+	return func() {
+		systemdVersionError = oldSystemdErr
 	}
 }
 
-// MockSystemdVersion mocks the systemd version to the given version. This is
-// only available for unit tests and will panic when run in production.
-func MockSystemdVersion(vers int) (restore func()) {
-	osutil.MustBeTestBinary("cannot mock systemd version outside of tests")
-	old := systemdVersion
-	systemdVersion = vers
-	return func() {
-		systemdVersion = old
-	}
+var resourcesCheckFeatureRequirements = func(r *quota.Resources) error {
+	return r.CheckFeatureRequirements()
 }
 
 func quotaGroupsAvailable(st *state.State) error {
 	// check if the systemd version is too old
-	if systemdVersion < 205 {
-		return fmt.Errorf("systemd version too old: snap quotas requires systemd 205 and newer (currently have %d)", systemdVersion)
+	if systemdVersionError != nil {
+		return fmt.Errorf("cannot use quotas with incompatible systemd: %v", systemdVersionError)
 	}
+	return nil
+}
 
+func isExperimentalQuotasAvailable(st *state.State, quotaName string) error {
 	tr := config.NewTransaction(st)
-	enableQuotaGroups, err := features.Flag(tr, features.QuotaGroups)
+	status, err := features.Flag(tr, features.QuotaGroups)
 	if err != nil && !config.IsNoOption(err) {
 		return err
 	}
-	if !enableQuotaGroups {
-		return fmt.Errorf("experimental feature disabled - test it by setting 'experimental.quota-groups' to true")
-	}
-
-	return nil
-}
-
-func ensureSnapServicesForGroup(st *state.State, grp *quota.Group, allGrps map[string]*quota.Group, extraSnaps []string) error {
-	// build the map of snap infos to options to provide to EnsureSnapServices
-	snapSvcMap := map[*snap.Info]*wrappers.SnapServiceOptions{}
-	for _, sn := range append(grp.Snaps, extraSnaps...) {
-		info, err := snapstate.CurrentInfo(st, sn)
-		if err != nil {
-			return err
-		}
-
-		opts, err := SnapServiceOptions(st, sn, allGrps)
-		if err != nil {
-			return err
-		}
-
-		snapSvcMap[info] = opts
-	}
-
-	// TODO: the following lines should maybe be EnsureOptionsForDevice() or
-	// something since it is duplicated a few places
-	ensureOpts := &wrappers.EnsureSnapServicesOptions{
-		Preseeding: snapdenv.Preseeding(),
-	}
-
-	// set RequireMountedSnapdSnap if we are on UC18+ only
-	deviceCtx, err := snapstate.DeviceCtx(st, nil, nil)
-	if err != nil {
-		return err
-	}
-
-	if !deviceCtx.Classic() && deviceCtx.Model().Base() != "" {
-		ensureOpts.RequireMountedSnapdSnap = true
-	}
-
-	grpsToStart := []*quota.Group{}
-	appsToRestartBySnap := map[*snap.Info][]*snap.AppInfo{}
-
-	collectModifiedUnits := func(app *snap.AppInfo, grp *quota.Group, unitType string, name, old, new string) {
-		switch unitType {
-		case "slice":
-			// this slice was either modified or written for the first time
-
-			// There are currently 3 possible cases that have different
-			// operations required, but we ignore one of them, so there really
-			// are just 2 cases we care about:
-			// 1. If this slice was initially written, we just need to systemctl
-			//    start it
-			// 2. If the slice was modified to be given more resources (i.e. a
-			//    higher memory limit), then we just need to do a daemon-reload
-			//    which causes systemd to modify the cgroup which will always
-			//    work since a cgroup can be atomically given more resources
-			//    without issue since the cgroup can't be using more than the
-			//    current limit.
-			// 3. If the slice was modified to be given _less_ resources (i.e. a
-			//    lower memory limit), then we need to stop the services before
-			//    issuing the daemon-reload to systemd, then do the
-			//    daemon-reload which will succeed in modifying the cgroup, then
-			//    start the services we stopped back up again. This is because
-			//    otherwise if the services are currently running and using more
-			//    resources than they would be allowed after the modification is
-			//    applied by systemd to the cgroup, the kernel responds with
-			//    EBUSY, and it isn't clear if the modification is then properly
-			//    in place or not.
-			//
-			// We will already have called daemon-reload at the end of
-			// EnsureSnapServices directly, so handling case 3 is difficult, and
-			// for now we disallow making this sort of change to a quota group,
-			// that logic is handled at a higher level than this function.
-			// Thus the only decision we really have to make is if the slice was
-			// newly written or not, and if it was save it for later
-			if old == "" {
-				grpsToStart = append(grpsToStart, grp)
-			}
-
-		case "service":
-			// in this case, the only way that a service could have been changed
-			// was if it was moved into or out of a slice, in both cases we need
-			// to restart the service
-			sn := app.Snap
-			appsToRestartBySnap[sn] = append(appsToRestartBySnap[sn], app)
-
-			// TODO: what about sockets and timers? activation units just start
-			// the full unit, so as long as the full unit is restarted we should
-			// be okay?
-		}
-	}
-	if err := wrappers.EnsureSnapServices(snapSvcMap, ensureOpts, collectModifiedUnits, progress.Null); err != nil {
-		return err
-	}
-
-	if ensureOpts.Preseeding {
-		return nil
-	}
-
-	// TODO: should this logic move to wrappers in wrappers.RestartGroups()?
-	systemSysd := systemd.New(systemd.SystemMode, progress.Null)
-
-	// now start the slices
-	for _, grp := range grpsToStart {
-		// TODO: what should these timeouts for stopping/restart slices be?
-		if err := systemSysd.Start(grp.SliceFileName()); err != nil {
-			return err
-		}
-	}
-
-	// after starting all the grps that we modified from EnsureSnapServices,
-	// we need to handle the case where a quota was removed, this will only
-	// happen one at a time and can be identified by the grp provided to us
-	// not existing in the state
-	if _, ok := allGrps[grp.Name]; !ok {
-		// stop the quota group, then remove it
-		if !ensureOpts.Preseeding {
-			if err := systemSysd.Stop(grp.SliceFileName(), 5*time.Second); err != nil {
-				logger.Noticef("unable to stop systemd slice while removing group %q: %v", grp.Name, err)
-			}
-		}
-
-		// TODO: this results in a second systemctl daemon-reload which is
-		// undesirable, we should figure out how to do this operation with a
-		// single daemon-reload
-		if err := wrappers.RemoveQuotaGroup(grp, progress.Null); err != nil {
-			return err
-		}
-	}
-
-	// now restart the services for each snap that was newly moved into a quota
-	// group
-	nullPerfTimings := &timings.Timings{}
-	// iterate in a sorted order over the snaps to restart their apps for easy
-	// tests
-	snaps := make([]*snap.Info, 0, len(appsToRestartBySnap))
-	for sn := range appsToRestartBySnap {
-		snaps = append(snaps, sn)
-	}
-
-	sort.Slice(snaps, func(i, j int) bool {
-		return snaps[i].InstanceName() < snaps[j].InstanceName()
-	})
-
-	for _, sn := range snaps {
-		disabledSvcs, err := wrappers.QueryDisabledServices(sn, progress.Null)
-		if err != nil {
-			return err
-		}
-
-		isDisabledSvc := make(map[string]bool, len(disabledSvcs))
-		for _, svc := range disabledSvcs {
-			isDisabledSvc[svc] = true
-		}
-
-		startupOrdered, err := snap.SortServices(appsToRestartBySnap[sn])
-		if err != nil {
-			return err
-		}
-
-		// drop disabled services from the startup ordering
-		startupOrderedMinusDisabled := make([]*snap.AppInfo, 0, len(startupOrdered)-len(disabledSvcs))
-
-		for _, svc := range startupOrdered {
-			if !isDisabledSvc[svc.ServiceName()] {
-				startupOrderedMinusDisabled = append(startupOrderedMinusDisabled, svc)
-			}
-		}
-
-		st.Unlock()
-		err = wrappers.RestartServices(startupOrderedMinusDisabled, nil, progress.Null, nullPerfTimings)
-		st.Lock()
-
-		if err != nil {
-			return err
-		}
+	if !status {
+		return fmt.Errorf("%s quota options are experimental - test it by setting 'experimental.quota-groups' to true", quotaName)
 	}
 	return nil
 }
 
-func validateSnapForAddingToGroup(st *state.State, snaps []string, group string, allGrps map[string]*quota.Group) error {
-	for _, name := range snaps {
-		// validate that the snap exists
-		_, err := snapstate.CurrentInfo(st, name)
-		if err != nil {
-			return fmt.Errorf("cannot use snap %q in group %q: %v", name, group, err)
-		}
-
-		// check that the snap is not already in a group
-		for _, grp := range allGrps {
-			if strutil.ListContains(grp.Snaps, name) {
-				return fmt.Errorf("cannot add snap %q to group %q: snap already in quota group %q", name, group, grp.Name)
-			}
-		}
-	}
-
-	return nil
-}
-
-// CreateQuota attempts to create the specified quota group with the specified
-// snaps in it.
-// TODO: should this use something like QuotaGroupUpdate with fewer fields?
-func CreateQuota(st *state.State, name string, parentName string, snaps []string, memoryLimit quantity.Size) error {
+func verifyQuotaRequirements(st *state.State, resourceLimits quota.Resources) error {
+	// validate quotas in general are available
 	if err := quotaGroupsAvailable(st); err != nil {
 		return err
 	}
 
-	allGrps, err := AllQuotas(st)
-	if err != nil {
-		return err
+	// Upon initialization verification for systemd version 230 has already been done,
+	// but for some of these quota types we need even higher version.
+	// see: EnsureQuotaUsability
+
+	// MemoryLimit requires systemd 211, so it's covered by the initial check
+	// CPUQuota requires systemd 213, so no further checks need to be done
+	// TasksMax requires systemd 228, so no further checks need to be done
+
+	// AllowedCPUs requires systemd 243, so we need to verify the version here
+	if resourceLimits.CPUSet != nil {
+		if err := systemd.EnsureAtLeast(243); err != nil {
+			return fmt.Errorf("cannot use the cpu-set quota with incompatible systemd: %v", err)
+		}
 	}
 
-	// ensure that the quota group does not exist yet
+	// Journal quotas require systemd 245, so we need to verify the version here as well
+	if resourceLimits.Journal != nil {
+		if err := systemd.EnsureAtLeast(245); err != nil {
+			return fmt.Errorf("cannot use journal quota with incompatible systemd: %v", err)
+		}
+
+		// To use journal quotas, the quota-group experimental features must be enabled.
+		if err := isExperimentalQuotasAvailable(st, "journal"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CreateQuotaOptions reflects all of options available when creating new quota
+// groups.
+type CreateQuotaOptions struct {
+	// ParentName is the name of the parent quota group, the group should be
+	// placed under.
+	ParentName string
+
+	// Snaps is the set of snaps to add to the quota group. These are
+	// instance names of snaps.
+	Snaps []string
+
+	// Services is the set of services to add to the quota group. These are
+	// formatted as my-snap.my-service.
+	Services []string
+
+	// ResourceLimits is the resource limits to be used for the quota group.
+	ResourceLimits quota.Resources
+}
+
+// CreateQuota attempts to create the specified quota group with the specified
+// snaps in it.
+func CreateQuota(st *state.State, name string, createOpts CreateQuotaOptions) (*state.TaskSet, error) {
+	if err := verifyQuotaRequirements(st, createOpts.ResourceLimits); err != nil {
+		return nil, err
+	}
+
+	allGrps, err := AllQuotas(st)
+	if err != nil {
+		return nil, err
+	}
+
+	// make sure the group does not exist yet
 	if _, ok := allGrps[name]; ok {
-		return fmt.Errorf("group %q already exists", name)
+		return nil, fmt.Errorf("group %q already exists", name)
+	}
+
+	// verify we are not trying to add a mixture of services and snaps
+	if len(createOpts.Snaps) > 0 && len(createOpts.Services) > 0 {
+		return nil, fmt.Errorf("cannot mix services and snaps in the same quota group")
+	}
+
+	// validate the resource limits for the group
+	if err := createOpts.ResourceLimits.Validate(); err != nil {
+		return nil, fmt.Errorf("cannot create quota group %q: %v", name, err)
+	}
+	// validate that the system has the features needed for this resource
+	if err := resourcesCheckFeatureRequirements(&createOpts.ResourceLimits); err != nil {
+		return nil, fmt.Errorf("cannot create quota group %q: %v", name, err)
 	}
 
 	// make sure the specified snaps exist and aren't currently in another group
-	if err := validateSnapForAddingToGroup(st, snaps, name, allGrps); err != nil {
-		return err
+	parentGrp := allGrps[createOpts.ParentName]
+	if err := validateSnapForAddingToGroup(st, createOpts.Snaps, name, parentGrp, allGrps); err != nil {
+		return nil, err
 	}
 
-	// make sure that the parent group exists if we are creating a sub-group
-	var grp *quota.Group
-	updatedGrps := []*quota.Group{}
-	if parentName != "" {
-		parentGrp, ok := allGrps[parentName]
-		if !ok {
-			return fmt.Errorf("cannot create group under non-existent parent group %q", parentName)
-		}
-
-		grp, err = parentGrp.NewSubGroup(name, memoryLimit)
-		if err != nil {
-			return err
-		}
-
-		updatedGrps = append(updatedGrps, parentGrp)
-	} else {
-		// make a new group
-		grp, err = quota.NewGroup(name, memoryLimit)
-		if err != nil {
-			return err
-		}
-	}
-	updatedGrps = append(updatedGrps, grp)
-
-	// put the snaps in the group
-	grp.Snaps = snaps
-
-	// update the modified groups in state
-	allGrps, err = patchQuotas(st, updatedGrps...)
-	if err != nil {
-		return err
+	// if services are provided, the make sure they refer to correct snaps and valid
+	// services.
+	if err := validateSnapServicesForAddingToGroup(st, createOpts.Services, name, parentGrp, allGrps); err != nil {
+		return nil, err
 	}
 
-	// ensure the snap services with the group
-	if err := ensureSnapServicesForGroup(st, grp, allGrps, nil); err != nil {
-		return err
+	if err := CheckQuotaChangeConflictMany(st, []string{name}); err != nil {
+		return nil, err
+	}
+	if err := snapstate.CheckChangeConflictMany(st, createOpts.Snaps, ""); err != nil {
+		return nil, err
 	}
 
-	return nil
+	// create the task with the action in it
+	qc := QuotaControlAction{
+		Action:         "create",
+		QuotaName:      name,
+		ResourceLimits: createOpts.ResourceLimits,
+		AddSnaps:       createOpts.Snaps,
+		AddServices:    createOpts.Services,
+		ParentName:     createOpts.ParentName,
+	}
+
+	ts := state.NewTaskSet()
+
+	summary := fmt.Sprintf("Create quota group %q", name)
+	task := st.NewTask("quota-control", summary)
+	task.Set("quota-control-actions", []QuotaControlAction{qc})
+	ts.AddTask(task)
+
+	return ts, nil
 }
 
 // RemoveQuota deletes the specific quota group. Any snaps currently in the
@@ -352,147 +214,177 @@ func CreateQuota(st *state.State, name string, parentName string, snaps []string
 // removed is a sub-group.
 // TODO: currently this only supports removing leaf sub-group groups, it doesn't
 // support removing parent quotas, but probably it makes sense to allow that too
-func RemoveQuota(st *state.State, name string) error {
+func RemoveQuota(st *state.State, name string) (*state.TaskSet, error) {
 	if snapdenv.Preseeding() {
-		return fmt.Errorf("removing quota groups not supported while preseeding")
+		return nil, fmt.Errorf("removing quota groups not supported while preseeding")
 	}
 
 	allGrps, err := AllQuotas(st)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// first get the group for later before it is deleted from state
+	// make sure the group exists
 	grp, ok := allGrps[name]
 	if !ok {
-		return fmt.Errorf("cannot remove non-existent quota group %q", name)
+		return nil, fmt.Errorf("cannot remove non-existent quota group %q", name)
 	}
 
 	// XXX: remove this limitation eventually
 	if len(grp.SubGroups) != 0 {
-		return fmt.Errorf("cannot remove quota group with sub-groups, remove the sub-groups first")
+		return nil, fmt.Errorf("cannot remove quota group %q with sub-groups, remove the sub-groups first", name)
 	}
 
-	// if this group has a parent, we need to remove the linkage to this
-	// sub-group from the parent first
-	if grp.ParentGroup != "" {
-		// the parent here must exist otherwise AllQuotas would have failed
-		// because state would have been inconsistent
-		parent := allGrps[grp.ParentGroup]
-
-		// ensure that the parent group of this group no longer mentions this
-		// group as a sub-group - we know that it must since AllQuotas validated
-		// the state for us
-		if len(parent.SubGroups) == 1 {
-			// this group was an only child, so clear the whole list
-			parent.SubGroups = nil
-		} else {
-			// we have to delete the child but keep the other children
-			newSubgroups := make([]string, 0, len(parent.SubGroups)-1)
-			for _, sub := range parent.SubGroups {
-				if sub != name {
-					newSubgroups = append(newSubgroups, sub)
-				}
-			}
-
-			parent.SubGroups = newSubgroups
-		}
-
-		allGrps[grp.ParentGroup] = parent
+	if err := CheckQuotaChangeConflictMany(st, []string{name}); err != nil {
+		return nil, err
+	}
+	if err := snapstate.CheckChangeConflictMany(st, grp.Snaps, ""); err != nil {
+		return nil, err
 	}
 
-	// now delete the group from state - do this first for convenience to ensure
-	// that we can just use SnapServiceOptions below and since it operates via
-	// state, it will immediately reflect the deletion
-	delete(allGrps, name)
-
-	// make sure that the group set is consistent before saving it - we may need
-	// to delete old links from this group's parent to the child
-	if err := quota.ResolveCrossReferences(allGrps); err != nil {
-		return fmt.Errorf("cannot remove quota %q: %v", name, err)
+	qc := QuotaControlAction{
+		Action:    "remove",
+		QuotaName: name,
 	}
 
-	// now set it in state
-	st.Set("quotas", allGrps)
+	ts := state.NewTaskSet()
 
-	// update snap service units that may need to be re-written because they are
-	// not in a slice anymore
-	if err := ensureSnapServicesForGroup(st, grp, allGrps, nil); err != nil {
-		return err
-	}
+	summary := fmt.Sprintf("Remove quota group %q", name)
+	task := st.NewTask("quota-control", summary)
+	task.Set("quota-control-actions", []QuotaControlAction{qc})
+	ts.AddTask(task)
 
-	return nil
+	return ts, nil
 }
 
-// QuotaGroupUpdate reflects all of the modifications that can be performed on
+// UpdateQuotaOptions reflects all of the modifications that can be performed on
 // a quota group in one operation.
-type QuotaGroupUpdate struct {
+type UpdateQuotaOptions struct {
 	// AddSnaps is the set of snaps to add to the quota group. These are
 	// instance names of snaps, and are appended to the existing snaps in
 	// the quota group
 	AddSnaps []string
 
-	// NewMemoryLimit is the new memory limit to be used for the quota group. If
-	// zero, then the quota group's memory limit is not changed.
-	NewMemoryLimit quantity.Size
+	// AddServices is the set of snap services to add to the quota group. These are
+	// names of the format <snap.service>, and are appended to the existing services in
+	// the quota group
+	AddServices []string
+
+	// NewResourceLimits is the new resource limits to be used for the quota group. A
+	// limit is only changed if the corresponding limit is != nil.
+	NewResourceLimits quota.Resources
 }
 
 // UpdateQuota updates the quota as per the options.
 // TODO: this should support more kinds of updates such as moving groups between
 // parents, removing sub-groups from their parents, and removing snaps from
 // the group.
-func UpdateQuota(st *state.State, name string, updateOpts QuotaGroupUpdate) error {
-	if err := quotaGroupsAvailable(st); err != nil {
-		return err
+func UpdateQuota(st *state.State, name string, updateOpts UpdateQuotaOptions) (*state.TaskSet, error) {
+	if err := verifyQuotaRequirements(st, updateOpts.NewResourceLimits); err != nil {
+		return nil, err
 	}
 
-	// ensure that the quota group exists
 	allGrps, err := AllQuotas(st)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	grp, ok := allGrps[name]
 	if !ok {
-		return fmt.Errorf("group %q does not exist", name)
+		return nil, fmt.Errorf("group %q does not exist", name)
 	}
 
-	modifiedGrps := []*quota.Group{grp}
+	currentQuotas := grp.GetQuotaResources()
+	if err := validateQuotaLimitsChange(grp, currentQuotas, updateOpts.NewResourceLimits); err != nil {
+		return nil, fmt.Errorf("cannot update group %q: %v", name, err)
+	}
+	// validate that the system has the features needed for this resource
+	if err := resourcesCheckFeatureRequirements(&updateOpts.NewResourceLimits); err != nil {
+		return nil, fmt.Errorf("cannot update group %q: %v", name, err)
+	}
+
+	// verify we are not trying to add a mixture of services and snaps
+	if err := groupEnsureOnlySnapsOrServices(updateOpts.AddSnaps, updateOpts.AddServices, grp); err != nil {
+		return nil, err
+	}
 
 	// now ensure that all of the snaps mentioned in AddSnaps exist as snaps and
 	// that they aren't already in an existing quota group
-	if err := validateSnapForAddingToGroup(st, updateOpts.AddSnaps, name, allGrps); err != nil {
-		return err
+	parentGrp := allGrps[grp.ParentGroup]
+	if err := validateSnapForAddingToGroup(st, updateOpts.AddSnaps, name, parentGrp, allGrps); err != nil {
+		return nil, err
 	}
 
-	//  append the snaps list in the group
-	grp.Snaps = append(grp.Snaps, updateOpts.AddSnaps...)
+	// if services are provided, the make sure they refer to correct snaps and valid
+	// services.
+	if err := validateSnapServicesForAddingToGroup(st, updateOpts.AddServices, name, parentGrp, allGrps); err != nil {
+		return nil, err
+	}
 
-	// if the memory limit is not zero then change it too
-	if updateOpts.NewMemoryLimit != 0 {
-		// we disallow decreasing the memory limit because it is difficult to do
-		// so correctly with the current state of our code in
-		// EnsureSnapServices, see comment in ensureSnapServicesForGroup for
-		// full details
-		if updateOpts.NewMemoryLimit < grp.MemoryLimit {
-			return fmt.Errorf("cannot decrease memory limit of existing quota-group, remove and re-create it to decrease the limit")
+	if err := CheckQuotaChangeConflictMany(st, []string{name}); err != nil {
+		return nil, err
+	}
+	if err := snapstate.CheckChangeConflictMany(st, updateOpts.AddSnaps, ""); err != nil {
+		return nil, err
+	}
+
+	// create the action and the correspoding task set
+	qc := QuotaControlAction{
+		Action:         "update",
+		QuotaName:      name,
+		ResourceLimits: updateOpts.NewResourceLimits,
+		AddSnaps:       updateOpts.AddSnaps,
+		AddServices:    updateOpts.AddServices,
+	}
+
+	ts := state.NewTaskSet()
+
+	summary := fmt.Sprintf("Update quota group %q", name)
+	task := st.NewTask("quota-control", summary)
+	task.Set("quota-control-actions", []QuotaControlAction{qc})
+	ts.AddTask(task)
+
+	return ts, nil
+}
+
+// remove a string item at index i from the string slice,
+// it maintains the ordering of the original slice.
+func remove(slice []string, i int) []string {
+	return append(slice[:i], slice[i+1:]...)
+}
+
+// removeServicesFromSubGroups removes all service references of a snap in
+// sub-groups related to the group of the snap, and returns the groups that were modified.
+func removeServicesFromSubGroups(grp *quota.Group, snap string, allGrps map[string]*quota.Group) ([]*quota.Group, error) {
+	// If a snap has services in sub-groups, the services must be in the first level of sub-groups only,
+	// that's why the code here does not check for nested sub-groups.
+	var modifiedGrps []*quota.Group
+	for _, name := range grp.SubGroups {
+		subgrp, ok := allGrps[name]
+		if !ok {
+			return nil, fmt.Errorf("non-existent sub-group %q", name)
 		}
-		grp.MemoryLimit = updateOpts.NewMemoryLimit
-	}
 
-	// update the quota group state
-	allGrps, err = patchQuotas(st, modifiedGrps...)
-	if err != nil {
-		return err
+		for idx, svc := range subgrp.Services {
+			// the Services has names of format my-snap.my-service, so check
+			// if the service starts with the snap name
+			if strings.HasPrefix(svc, snap+".") {
+				// found a service that matches the snap we are removing,
+				// so remove that too
+				subgrp.Services = remove(subgrp.Services, idx)
+				modifiedGrps = append(modifiedGrps, subgrp)
+			}
+		}
 	}
-
-	// ensure service states are updated
-	return ensureSnapServicesForGroup(st, grp, allGrps, nil)
+	return modifiedGrps, nil
 }
 
 // EnsureSnapAbsentFromQuota ensures that the specified snap is not present
 // in any quota group, usually in preparation for removing that snap from the
 // system to keep the quota group itself consistent.
+// This function is idempotent, since if it was interrupted after unlocking the
+// state inside ensureSnapServicesForGroup it will not re-execute since the
+// specified snap will not be present inside the group reference in the state.
 func EnsureSnapAbsentFromQuota(st *state.State, snap string) error {
 	allGrps, err := AllQuotas(st)
 	if err != nil {
@@ -503,14 +395,18 @@ func EnsureSnapAbsentFromQuota(st *state.State, snap string) error {
 	for _, grp := range allGrps {
 		for idx, sn := range grp.Snaps {
 			if sn == snap {
-				// drop this snap from the list of Snaps by swapping it with the
-				// last snap in the list, and then dropping the last snap from
-				// the list
-				grp.Snaps[idx] = grp.Snaps[len(grp.Snaps)-1]
-				grp.Snaps = grp.Snaps[:len(grp.Snaps)-1]
+				// remove any snap reference from sub-groups, this returns
+				// a list of modified sub-groups which we can then pass along
+				// to PatchQuotas
+				subGrps, err := removeServicesFromSubGroups(grp, snap, allGrps)
+				if err != nil {
+					return err
+				}
+
+				grp.Snaps = remove(grp.Snaps, idx)
 
 				// update the quota group state
-				allGrps, err = patchQuotas(st, grp)
+				allGrps, err = internal.PatchQuotas(st, append(subGrps, grp)...)
 				if err != nil {
 					return err
 				}
@@ -519,12 +415,35 @@ func EnsureSnapAbsentFromQuota(st *state.State, snap string) error {
 				// snap as an extra snap to ensure since it was removed from the
 				// group and thus won't be considered just by looking at the
 				// group pointer directly
-				return ensureSnapServicesForGroup(st, grp, allGrps, []string{snap})
-
+				opts := &ensureSnapServicesForGroupOptions{
+					allGrps:    allGrps,
+					extraSnaps: []string{snap},
+				}
+				// TODO: we could pass timing and progress here from the task we
+				// are executing as eventually
+				return ensureSnapServicesStateForGroup(st, grp, opts)
 			}
 		}
 	}
 
 	// the snap wasn't in any group, nothing to do
 	return nil
+}
+
+// AddSnapToQuotaGroup returns a task for adding a snap to a quota group. It wraps the task creation
+// with proper conflict detection for the affected quota-group. Conflict detection for the snap being
+// added must be done by the larger context, as this function is intended to be used in the context
+// of a more complex change.
+func AddSnapToQuotaGroup(st *state.State, snapName string, quotaGroup string) (*state.Task, error) {
+	if err := CheckQuotaChangeConflictMany(st, []string{quotaGroup}); err != nil {
+		return nil, err
+	}
+
+	// This could result in doing 'setup-profiles' twice, but
+	// unfortunately we can't execute this code earlier as the snap
+	// needs to appear as installed first.
+	quotaControlTask := st.NewTask("quota-add-snap", fmt.Sprintf(i18n.G("Add snap %q to quota group %q"),
+		snapName, quotaGroup))
+	quotaControlTask.Set("quota-name", quotaGroup)
+	return quotaControlTask, nil
 }

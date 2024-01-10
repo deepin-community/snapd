@@ -10,62 +10,54 @@ environment:
     NEW_KERNEL: test-snapd-pc-kernel
 
 prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     #shellcheck source=tests/lib/core-config.sh
     . "$TESTSLIB"/core-config.sh
     #shellcheck source=tests/lib/systemd.sh
     . "$TESTSLIB"/systemd.sh
 
     # Save the revision of the pc-kernel snap.
-    readlink /snap/pc-kernel/current > original-revision.txt
+    readlink /snap/"$OLD_KERNEL"/current > original-revision.txt
+    # Save the original tracking channel
+    snap info "$OLD_KERNEL" | awk '/^tracking:/ {print $2}' > original-channel.txt
 
     systemctl stop snapd.service snapd.socket
-    clean_snapd_lib
 
-    # Generic setup for test account
+    clean_snapd_lib
     prepare_core_model
-    prepare_test_account developer1
-    prepare_test_model developer1-pc
-    prepare_testrootorg_store
+    prepare_test_account valid-for-testing
+    prepare_test_model valid-for-testing-pc
 
     # kick first boot again
     systemctl start snapd.service snapd.socket
 
     # wait for first boot to be done
     wait_for_first_boot_change
+    # and for the serial to be available
+    wait_for_device_initialized_change
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     #shellcheck source=tests/lib/core-config.sh
     . "$TESTSLIB"/core-config.sh
     #shellcheck source=tests/lib/systemd.sh
     . "$TESTSLIB"/systemd.sh
 
-    # Wait for the final refresh to complete.
-    snap watch --last=refresh
+    # Wait for the final refresh to complete (if needed).
+    snap watch --last=refresh?
 
     # Remove all the revisions of pc-kernel that should not be there.
-    for revno_path in /snap/pc-kernel/*; do
+    for revno_path in /snap/"$OLD_KERNEL"/*; do
         revno="$(basename "$revno_path")"
         if [ "$revno" == current ] || [ "$revno" == "$(cat original-revision.txt)" ]; then
             continue;
         fi
-        snap remove pc-kernel --revision="$revno"
+        snap remove "$OLD_KERNEL" --revision="$revno"
     done
 
     systemctl stop snapd.service snapd.socket
-    clean_snapd_lib
 
-    # Generic restore for test account
-    restore_test_account developer1
-    restore_test_model developer1-pc
-    restore_testrootorg_store
+    clean_snapd_lib
+    restore_test_account valid-for-testing
+    restore_test_model valid-for-testing-pc
     restore_core_model
 
     # kick first boot again
@@ -86,10 +78,6 @@ restore: |
     fi
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     #shellcheck source=tests/lib/core-config.sh
     . "$TESTSLIB"/core-config.sh
 
@@ -109,14 +97,14 @@ execute: |
 
     # initial boot with the current model 
     if [ "$SPREAD_REBOOT" = 0 ]; then
-        # sanity check
+        # precondition check
         snap list "$OLD_KERNEL"
 
         echo "We have the right model assertion"
         snap debug model|MATCH "model: my-model"
 
         echo "Now we remodel"
-        MODEL="$(get_test_model developer1-pc-new-kernel)"
+        MODEL="$(get_test_model valid-for-testing-pc-new-kernel-revno-2)"
         snap remodel "${TESTSLIB}/assertions/${MODEL}"
 
         echo "Double check that we boot into the right kernel"
@@ -147,7 +135,7 @@ execute: |
         snap remove --purge "$OLD_KERNEL"
 
         echo "And we can remodel again and remove the new kernel"
-        MODEL="$(get_test_model developer1-pc-revno3)"
+        MODEL="$(get_test_model valid-for-testing-pc-revno-3)"
         snap remodel "${TESTSLIB}/assertions/${MODEL}"
         REBOOT
     fi
@@ -163,6 +151,6 @@ execute: |
         snap remove --purge "$NEW_KERNEL"
 
         echo "Ensure we are back to the original kernel channel and kernel"
-        snap refresh --channel="$KERNEL_CHANNEL" "$OLD_KERNEL"
+        snap refresh --channel="$(cat original-channel.txt)" "$OLD_KERNEL"
         REBOOT
     fi

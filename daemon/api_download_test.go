@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2019 Canonical Ltd
+ * Copyright (C) 2019-2022 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -65,9 +65,9 @@ var storeSnaps = map[string]*snap.Info{
 			Revision: snap.R(1),
 		},
 		DownloadInfo: snap.DownloadInfo{
-			Size:            int64(len(snapContent)),
-			AnonDownloadURL: "http://localhost/bar",
-			Sha3_384:        "sha3sha3sha3",
+			Size:        int64(len(snapContent)),
+			DownloadURL: "http://localhost/bar",
+			Sha3_384:    "sha3sha3sha3",
 		},
 	},
 	"edge-bar": {
@@ -78,9 +78,9 @@ var storeSnaps = map[string]*snap.Info{
 			Channel: "edge",
 		},
 		DownloadInfo: snap.DownloadInfo{
-			Size:            int64(len(snapContent)),
-			AnonDownloadURL: "http://localhost/edge-bar",
-			Sha3_384:        "sha3sha3sha3",
+			Size:        int64(len(snapContent)),
+			DownloadURL: "http://localhost/edge-bar",
+			Sha3_384:    "sha3sha3sha3",
 		},
 	},
 	"rev7-bar": {
@@ -90,16 +90,16 @@ var storeSnaps = map[string]*snap.Info{
 			Revision: snap.R(7),
 		},
 		DownloadInfo: snap.DownloadInfo{
-			Size:            int64(len(snapContent)),
-			AnonDownloadURL: "http://localhost/rev7-bar",
-			Sha3_384:        "sha3sha3sha3",
+			Size:        int64(len(snapContent)),
+			DownloadURL: "http://localhost/rev7-bar",
+			Sha3_384:    "sha3sha3sha3",
 		},
 	},
 	"download-error-trigger-snap": {
 		DownloadInfo: snap.DownloadInfo{
-			Size:            100,
-			AnonDownloadURL: "http://localhost/foo",
-			Sha3_384:        "sha3sha3sha3",
+			Size:        100,
+			DownloadURL: "http://localhost/foo",
+			Sha3_384:    "sha3sha3sha3",
 		},
 	},
 	"foo-resume-3": {
@@ -108,9 +108,9 @@ var storeSnaps = map[string]*snap.Info{
 			Revision: snap.R(1),
 		},
 		DownloadInfo: snap.DownloadInfo{
-			Size:            int64(len(snapContent)),
-			AnonDownloadURL: "http://localhost/foo-resume-3",
-			Sha3_384:        "sha3sha3sha3",
+			Size:        int64(len(snapContent)),
+			DownloadURL: "http://localhost/foo-resume-3",
+			Sha3_384:    "sha3sha3sha3",
 		},
 	},
 }
@@ -189,14 +189,13 @@ func (s *snapDownloadSuite) TestDownloadSnapErrors(c *check.C) {
 
 		req, err := http.NewRequest("POST", "/v2/download", bytes.NewBuffer(data))
 		c.Assert(err, check.IsNil)
-		rsp := s.errorReq(c, req, nil)
+		rspe := s.errorReq(c, req, nil)
 
-		c.Assert(rsp.Status, check.Equals, scen.status)
+		c.Assert(rspe.Status, check.Equals, scen.status)
 		if scen.err == "" {
 			c.Errorf("error was expected")
 		}
-		result := rsp.Result
-		c.Check(result.(*daemon.ErrorResult).Message, check.Matches, scen.err)
+		c.Check(rspe.Message, check.Matches, scen.err)
 	}
 }
 
@@ -334,9 +333,9 @@ func (s *snapDownloadSuite) TestStreamOneSnap(c *check.C) {
 		rsp := s.req(c, req, nil)
 
 		if t.err != "" {
-			c.Check(rsp.(*daemon.Resp).Status, check.Equals, t.status, check.Commentf("unexpected result for %v", t.dataJSON))
-			result := rsp.(*daemon.Resp).Result
-			c.Check(result.(*daemon.ErrorResult).Message, check.Matches, t.err, check.Commentf("unexpected result for %v", t.dataJSON))
+			rspe := rsp.(*daemon.APIError)
+			c.Check(rspe.Status, check.Equals, t.status, check.Commentf("unexpected result for %v", t.dataJSON))
+			c.Check(rspe.Message, check.Matches, t.err, check.Commentf("unexpected result for %v", t.dataJSON))
 		} else {
 			c.Assert(rsp, check.FitsTypeOf, &daemon.SnapStream{}, check.Commentf("unexpected result for %v", t.dataJSON))
 			ss := rsp.(*daemon.SnapStream)
@@ -406,8 +405,8 @@ func (s *snapDownloadSuite) TestStreamRangeHeaderErrors(c *check.C) {
 		req.Header.Add("Range", t)
 
 		rsp := s.req(c, req, nil)
-		if dr, ok := rsp.(*daemon.Resp); ok {
-			c.Fatalf("unexpected daemon result (test broken): %v", dr.Result)
+		if dr, ok := rsp.(daemon.StructuredResponse); ok {
+			c.Fatalf("unexpected daemon result (test broken): %v", dr.JSON().Result)
 		}
 		w := httptest.NewRecorder()
 		ss := rsp.(*daemon.SnapStream)

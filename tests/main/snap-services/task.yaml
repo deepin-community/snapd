@@ -1,15 +1,17 @@
 summary: verify the output of 'snap services' command
 
+systems:
+  # TODO: dbus issue
+  - -ubuntu-core-22-*
+
 prepare: |
     snap set system experimental.user-daemons=true
-    snap set system experimental.dbus-activation=true
 
 restore: |
-    snap unset system experimental.dbus-activation
     snap unset system experimental.user-daemons
 
 execute: |
-    # sanity check of systemctl behavior for non-existing services;
+    # precondition check of systemctl behavior for non-existing services;
     # it is expected that the returned UnitFileState is empty.
     systemctl show --property=Id foo.service | MATCH "foo.service"
     systemctl show --property=ActiveState foo.service | MATCH "inactive"

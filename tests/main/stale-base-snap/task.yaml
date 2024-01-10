@@ -19,6 +19,10 @@ backends: [-autopkgtest]
 # base snap is possible but that is a separate test.
 systems: [-ubuntu-core-*]
 
+environment:
+    # uploading large snap triggers OOM
+    SNAPD_NO_MEMORY_LIMIT: 1
+
 prepare: |
     # We will need the Swiss-army-knife shell snap. We want to use it in
     # devmode so that we can look at /customized file which is non-standard.
@@ -61,18 +65,6 @@ execute: |
     # Now, refresh core to our customized core snap.
     snap install --dangerous ./core-customized.snap
     snap list | MATCH customized
-
-    if is_cgroupv2 ; then
-        # stale mount namespace is always discarded with cgroupv2, because we
-        # cannot currently determine whether there are processes using it
-        test-snapd-sh.sh -c "test -e /customized"
-
-        # Kill our helper process.
-        kill -9 "$pid"
-        wait -n || true
-
-        exit 0
-    fi
 
     # Now we are in a situation where the core snap is stale but our sleeper
     # application is still alive so we cannot use it.

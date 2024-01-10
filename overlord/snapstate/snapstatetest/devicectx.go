@@ -66,8 +66,20 @@ func (dc *TrivialDeviceContext) Base() string {
 	return dc.DeviceModel.Base()
 }
 
+func (dc *TrivialDeviceContext) Gadget() string {
+	return dc.DeviceModel.Gadget()
+}
+
 func (dc *TrivialDeviceContext) HasModeenv() bool {
 	return dc.Model().Grade() != asserts.ModelGradeUnset
+}
+
+func (d *TrivialDeviceContext) IsCoreBoot() bool {
+	return d.Model().Kernel() != ""
+}
+
+func (d *TrivialDeviceContext) IsClassicBoot() bool {
+	return !d.IsCoreBoot()
 }
 
 func (dc *TrivialDeviceContext) RunMode() bool {
@@ -119,8 +131,12 @@ func MockDeviceContext(deviceCtx snapstate.DeviceContext) (restore func()) {
 	r1 := ReplaceDeviceCtxHook(deviceCtxHook)
 	// for convenience reflect from the context whether there is a
 	// remodeling
-	r2 := ReplaceRemodelingHook(func(*state.State) bool {
-		return deviceCtx != nil && deviceCtx.ForRemodeling()
+	r2 := ReplaceRemodelingHook(func(s *state.State) *state.Change {
+		if deviceCtx != nil && deviceCtx.ForRemodeling() {
+			return s.NewChange("sample", "test remodeling change")
+		}
+
+		return nil
 	})
 	return func() {
 		r1()
@@ -140,10 +156,10 @@ func UseFallbackDeviceModel() (restore func()) {
 	return MockDeviceModel(sysdb.GenericClassicModel())
 }
 
-func ReplaceRemodelingHook(remodelingHook func(st *state.State) bool) (restore func()) {
-	oldHook := snapstate.Remodeling
-	snapstate.Remodeling = remodelingHook
+func ReplaceRemodelingHook(remodelingHook func(st *state.State) *state.Change) (restore func()) {
+	oldHook := snapstate.RemodelingChange
+	snapstate.RemodelingChange = remodelingHook
 	return func() {
-		snapstate.Remodeling = oldHook
+		snapstate.RemodelingChange = oldHook
 	}
 }

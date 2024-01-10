@@ -36,11 +36,26 @@ func addMountUnit(s *snap.Info, preseed bool, meter progress.Meter) error {
 	} else {
 		sysd = systemd.New(systemd.SystemMode, meter)
 	}
-	_, err := sysd.AddMountUnitFile(s.InstanceName(), s.Revision.String(), squashfsPath, whereDir, "squashfs")
+	_, err := sysd.EnsureMountUnitFile(s.InstanceName(), s.Revision.String(), squashfsPath, whereDir, "squashfs")
 	return err
 }
 
 func removeMountUnit(mountDir string, meter progress.Meter) error {
 	sysd := systemd.New(systemd.SystemMode, meter)
 	return sysd.RemoveMountUnitFile(mountDir)
+}
+
+func (b Backend) RemoveSnapMountUnits(s snap.PlaceInfo, meter progress.Meter) error {
+	sysd := systemd.New(systemd.SystemMode, meter)
+	originFilter := ""
+	mountPoints, err := sysd.ListMountUnits(s.InstanceName(), originFilter)
+	if err != nil {
+		return err
+	}
+	for _, mountPoint := range mountPoints {
+		if err := sysd.RemoveMountUnitFile(mountPoint); err != nil {
+			return err
+		}
+	}
+	return nil
 }

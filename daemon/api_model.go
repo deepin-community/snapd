@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2019 Canonical Ltd
+ * Copyright (C) 2021 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -21,10 +21,12 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/client"
+	"github.com/snapcore/snapd/client/clientutil"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/state"
@@ -32,9 +34,11 @@ import (
 
 var (
 	serialModelCmd = &Command{
-		Path:       "/v2/model/serial",
-		GET:        getSerial,
-		ReadAccess: openAccess{},
+		Path:        "/v2/model/serial",
+		GET:         getSerial,
+		POST:        postSerial,
+		ReadAccess:  openAccess{},
+		WriteAccess: rootAccess{},
 	}
 	modelCmd = &Command{
 		Path:        "/v2/model",
@@ -49,11 +53,6 @@ var devicestateRemodel = devicestate.Remodel
 
 type postModelData struct {
 	NewModel string `json:"new-model"`
-}
-
-type modelAssertJSON struct {
-	Headers map[string]interface{} `json:"headers,omitempty"`
-	Body    string                 `json:"body,omitempty"`
 }
 
 func postModel(c *Command, r *http.Request, _ *auth.UserState) Response {
@@ -82,7 +81,7 @@ func postModel(c *Command, r *http.Request, _ *auth.UserState) Response {
 	}
 	ensureStateSoon(st)
 
-	return AsyncResponse(nil, &Meta{Change: chg.ID()})
+	return AsyncResponse(nil, chg.ID())
 
 }
 
@@ -100,17 +99,12 @@ func getModel(c *Command, r *http.Request, _ *auth.UserState) Response {
 	devmgr := c.d.overlord.DeviceManager()
 
 	model, err := devmgr.Model()
-	if err == state.ErrNoState {
-		res := &errorResult{
+	if errors.Is(err, state.ErrNoState) {
+		return &apiError{
+			Status:  404,
 			Message: "no model assertion yet",
 			Kind:    client.ErrorKindAssertionNotFound,
 			Value:   "model",
-		}
-
-		return &resp{
-			Type:   ResponseTypeError,
-			Result: res,
-			Status: 404,
 		}
 	}
 	if err != nil {
@@ -118,14 +112,14 @@ func getModel(c *Command, r *http.Request, _ *auth.UserState) Response {
 	}
 
 	if opts.jsonResult {
-		modelJSON := modelAssertJSON{}
+		modelJSON := clientutil.ModelAssertJSON{}
 
 		modelJSON.Headers = model.Headers()
 		if !opts.headersOnly {
 			modelJSON.Body = string(model.Body())
 		}
 
-		return SyncResponse(modelJSON, nil)
+		return SyncResponse(modelJSON)
 	}
 
 	return AssertResponse([]asserts.Assertion{model}, false)
@@ -145,17 +139,12 @@ func getSerial(c *Command, r *http.Request, _ *auth.UserState) Response {
 	devmgr := c.d.overlord.DeviceManager()
 
 	serial, err := devmgr.Serial()
-	if err == state.ErrNoState {
-		res := &errorResult{
+	if errors.Is(err, state.ErrNoState) {
+		return &apiError{
+			Status:  404,
 			Message: "no serial assertion yet",
 			Kind:    client.ErrorKindAssertionNotFound,
 			Value:   "serial",
-		}
-
-		return &resp{
-			Type:   ResponseTypeError,
-			Result: res,
-			Status: 404,
 		}
 	}
 	if err != nil {
@@ -163,15 +152,57 @@ func getSerial(c *Command, r *http.Request, _ *auth.UserState) Response {
 	}
 
 	if opts.jsonResult {
-		serialJSON := modelAssertJSON{}
+		serialJSON := clientutil.ModelAssertJSON{}
 
 		serialJSON.Headers = serial.Headers()
 		if !opts.headersOnly {
 			serialJSON.Body = string(serial.Body())
 		}
 
-		return SyncResponse(serialJSON, nil)
+		return SyncResponse(serialJSON)
 	}
 
 	return AssertResponse([]asserts.Assertion{serial}, false)
+}
+
+type postSerialData struct {
+	Action                    string `json:"action"`
+	NoRegistrationUntilReboot bool   `json:"no-registration-until-reboot"`
+}
+
+var devicestateDeviceManagerUnregister = (*devicestate.DeviceManager).Unregister
+
+func postSerial(c *Command, r *http.Request, _ *auth.UserState) Response {
+	var postData postSerialData
+
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&postData); err != nil {
+		return BadRequest("cannot decode serial action data from request body: %v", err)
+	}
+	if decoder.More() {
+		return BadRequest("spurious content after serial action")
+	}
+	switch postData.Action {
+	case "forget":
+	case "":
+		return BadRequest("missing serial action")
+	default:
+		return BadRequest("unsupported serial action %q", postData.Action)
+	}
+
+	st := c.d.overlord.State()
+	st.Lock()
+	defer st.Unlock()
+
+	devmgr := c.d.overlord.DeviceManager()
+
+	unregOpts := &devicestate.UnregisterOptions{
+		NoRegistrationUntilReboot: postData.NoRegistrationUntilReboot,
+	}
+	err := devicestateDeviceManagerUnregister(devmgr, unregOpts)
+	if err != nil {
+		return InternalError("forgetting serial failed: %v", err)
+	}
+
+	return SyncResponse(nil)
 }
