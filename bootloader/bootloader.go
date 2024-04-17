@@ -28,6 +28,7 @@ import (
 	"github.com/snapcore/snapd/bootloader/assets"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/kcmdline"
 	"github.com/snapcore/snapd/snap"
 )
 
@@ -57,17 +58,17 @@ type Options struct {
 	// PrepareImageTime indicates whether the booloader is being
 	// used at prepare-image time, that means not on a runtime
 	// system.
-	PrepareImageTime bool
+	PrepareImageTime bool `json:"prepare-image-time,omitempty"`
 
 	// Role specifies to use the bootloader for the given role.
-	Role Role
+	Role Role `json:"role,omitempty"`
 
 	// NoSlashBoot indicates to use the native layout of the
 	// bootloader partition and not the /boot mount.
 	// It applies only for RoleRunMode.
 	// It is implied and ignored for RoleRecovery.
 	// It is an error to set it for RoleSole.
-	NoSlashBoot bool
+	NoSlashBoot bool `json:"no-slash-boot,omitempty"`
 }
 
 func (o *Options) validate() error {
@@ -179,6 +180,8 @@ type CommandLineComponents struct {
 	// set and ExtraArgs. Note that, it is an error if extra and full
 	// arguments are non-empty.
 	FullArgs string
+	// A list of patterns to remove arguments from the default command line
+	RemoveArgs []kcmdline.ArgumentPattern
 }
 
 func (c *CommandLineComponents) Validate() error {
@@ -211,19 +214,28 @@ type TrustedAssetsBootloader interface {
 	// edition of managed built-in boot assets as reference.
 	CandidateCommandLine(pieces CommandLineComponents) (string, error)
 
-	// TrustedAssets returns the list of relative paths to assets inside the
-	// bootloader's rootdir that are measured in the boot process in the
-	// order of loading during the boot. Does not require rootdir to be set.
-	TrustedAssets() ([]string, error)
+	// DefaultCommandLine returns the default kernel command-line
+	// used by the bootloader excluding the recovery mode and
+	// system parameters.
+	DefaultCommandLine(candidate bool) (string, error)
 
-	// RecoveryBootChain returns the load chain for recovery modes.
-	// It should be called on a RoleRecovery bootloader.
-	RecoveryBootChain(kernelPath string) ([]BootFile, error)
+	// TrustedAssets returns a map of relative paths to asset
+	// identifers. The paths are inside the bootloader's rootdir
+	// that are measured in the boot process. The asset
+	// identifiers correspond to the backward compatible names
+	// recorded in the modeenv (CurrentTrustedBootAssets and
+	// CurrentTrustedRecoveryBootAssets).
+	TrustedAssets() (map[string]string, error)
 
-	// BootChain returns the load chain for run mode.
-	// It should be called on a RoleRecovery bootloader passing the
-	// RoleRunMode bootloader.
-	BootChain(runBl Bootloader, kernelPath string) ([]BootFile, error)
+	// RecoveryBootChains returns the possible load chains for
+	// recovery modes.  It should be called on a RoleRecovery
+	// bootloader.
+	RecoveryBootChains(kernelPath string) ([][]BootFile, error)
+
+	// BootChains returns the possible load chains for run mode.
+	// It should be called on a RoleRecovery bootloader passing
+	// the RoleRunMode bootloader.
+	BootChains(runBl Bootloader, kernelPath string) ([][]BootFile, error)
 }
 
 // NotScriptableBootloader cannot change the bootloader environment

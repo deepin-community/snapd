@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2015-2020 Canonical Ltd
+ * Copyright (C) 2015-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -24,17 +24,18 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os/exec"
 	"sort"
 	"time"
 
 	"github.com/snapcore/snapd/arch"
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/auth"
+	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
@@ -60,14 +61,14 @@ var (
 		Path:        "/v2/changes/{id}",
 		GET:         getChange,
 		POST:        abortChange,
-		ReadAccess:  openAccess{},
+		ReadAccess:  interfaceOpenAccess{Interfaces: []string{"snap-refresh-observe"}},
 		WriteAccess: authenticatedAccess{Polkit: polkitActionManage},
 	}
 
 	stateChangesCmd = &Command{
 		Path:       "/v2/changes",
 		GET:        getChanges,
-		ReadAccess: openAccess{},
+		ReadAccess: interfaceOpenAccess{Interfaces: []string{"snap-refresh-observe"}},
 	}
 
 	warningsCmd = &Command{
@@ -91,7 +92,7 @@ func init() {
 		buildID = bid
 	}
 	// cache systemd-detect-virt output as it's unlikely to change :-)
-	if buf, err := exec.Command("systemd-detect-virt").CombinedOutput(); err == nil {
+	if buf, _, err := osutil.RunSplitOutput("systemd-detect-virt"); err == nil {
 		systemdVirt = string(bytes.TrimSpace(buf))
 	}
 }
@@ -106,6 +107,7 @@ func sysInfo(c *Command, r *http.Request, user *auth.UserState) Response {
 	deviceMgr := c.d.overlord.DeviceManager()
 	st.Lock()
 	defer st.Unlock()
+	tr := config.NewTransaction(st)
 	nextRefresh := snapMgr.NextRefresh()
 	lastRefresh, _ := snapMgr.LastRefresh()
 	refreshHold, _ := snapMgr.EffectiveRefreshHold()
@@ -144,6 +146,7 @@ func sysInfo(c *Command, r *http.Request, user *auth.UserState) Response {
 		"refresh":      refreshInfo,
 		"architecture": arch.DpkgArchitecture(),
 		"system-mode":  deviceMgr.SystemMode(devicestate.SysAny),
+		"features":     features.All(tr),
 	}
 	if systemdVirt != "" {
 		m["virtualization"] = systemdVirt
@@ -224,9 +227,9 @@ func getChanges(c *Command, r *http.Request, user *auth.UserState) Response {
 	case "all":
 		filter = func(*state.Change) bool { return true }
 	case "in-progress":
-		filter = func(chg *state.Change) bool { return !chg.Status().Ready() }
+		filter = func(chg *state.Change) bool { return !chg.IsReady() }
 	case "ready":
-		filter = func(chg *state.Change) bool { return chg.Status().Ready() }
+		filter = func(chg *state.Change) bool { return chg.IsReady() }
 	default:
 		return BadRequest("select should be one of: all,in-progress,ready")
 	}
@@ -295,7 +298,7 @@ func abortChange(c *Command, r *http.Request, user *auth.UserState) Response {
 		return BadRequest("change action %q is unsupported", reqData.Action)
 	}
 
-	if chg.Status().Ready() {
+	if chg.IsReady() {
 		return BadRequest("cannot abort change %s with nothing pending", chID)
 	}
 

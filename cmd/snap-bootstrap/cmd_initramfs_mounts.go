@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,6 +44,7 @@ import (
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/disks"
+	"github.com/snapcore/snapd/osutil/kcmdline"
 	"github.com/snapcore/snapd/snapdtool"
 
 	// to set sysconfig.ApplyFilesystemOnlyDefaultsImpl
@@ -127,7 +127,7 @@ func stampedAction(stamp string, action func() error) error {
 	if err := action(); err != nil {
 		return err
 	}
-	return ioutil.WriteFile(stampFile, nil, 0644)
+	return os.WriteFile(stampFile, nil, 0644)
 }
 
 func generateInitramfsMounts() (err error) {
@@ -245,10 +245,7 @@ func canInstallAndRunAtOnce(mst *initramfsMountsState) (bool, error) {
 		return false, nil
 	}
 
-	// TODO: when install in initrd is finished and it is tested
-	// without fde hook, turn the return into...
-	// return true, nil
-	return kernelHasFdeSetup, nil
+	return true, nil
 }
 
 func readSnapInfo(sysSnaps map[snap.Type]*seed.Snap, snapType snap.Type) (*snap.Info, error) {
@@ -375,7 +372,7 @@ func doInstall(mst *initramfsMountsState, model *asserts.Model, sysSnaps map[sna
 		return err
 	}
 	preseedSeed, ok := currentSeed.(seed.PreseedCapable)
-	if ok {
+	if ok && preseedSeed.HasArtifact("preseed.tgz") {
 		runMode := false
 		if err := installApplyPreseededData(preseedSeed, boot.InitramfsWritableDir(model, runMode)); err != nil {
 			return err
@@ -524,7 +521,7 @@ func disableConsoleConf(dst string) error {
 	if err := os.MkdirAll(filepath.Dir(consoleConfCompleteFile), 0755); err != nil {
 		return err
 	}
-	return ioutil.WriteFile(consoleConfCompleteFile, nil, 0644)
+	return os.WriteFile(consoleConfCompleteFile, nil, 0644)
 }
 
 // copySafeDefaultData will copy to the destination a "safe" set of data for
@@ -669,7 +666,7 @@ func (r *recoverDegradedState) serializeTo(name string) error {
 	}
 
 	// leave the information about degraded state at an ephemeral location
-	return ioutil.WriteFile(filepath.Join(dirs.SnapBootstrapRunDir, name), b, 0644)
+	return os.WriteFile(filepath.Join(dirs.SnapBootstrapRunDir, name), b, 0644)
 }
 
 // stateFunc is a function which executes a state action, returns the next
@@ -1184,7 +1181,7 @@ func (m *recoverModeStateMachine) unlockEncryptedSaveRunKey() (stateFunc, error)
 	// to get to this state, we needed to have mounted ubuntu-data on host, so
 	// if encrypted, we can try to read the run key from host ubuntu-data
 	saveKey := device.SaveKeyUnder(dirs.SnapFDEDirUnder(boot.InitramfsHostWritableDir(m.model)))
-	key, err := ioutil.ReadFile(saveKey)
+	key, err := os.ReadFile(saveKey)
 	if err != nil {
 		// log the error and skip to trying the fallback key
 		m.degradedState.LogErrorf("cannot access run ubuntu-save key: %v", err)
@@ -1572,7 +1569,7 @@ func waitForCandidateByLabelPath(label string) (string, error) {
 }
 
 func getNonUEFISystemDisk(fallbacklabel string) (string, error) {
-	values, err := osutil.KernelCommandLineKeyValues("snapd_system_disk")
+	values, err := kcmdline.KeyValues("snapd_system_disk")
 	if err != nil {
 		return "", err
 	}
@@ -1776,7 +1773,7 @@ func maybeMountSave(disk disks.Disk, rootdir string, encrypted bool, mountOpts *
 			return false, fmt.Errorf("cannot find ubuntu-save encryption key at %v", saveKey)
 		}
 		// we have save.key, volume exists and is encrypted
-		key, err := ioutil.ReadFile(saveKey)
+		key, err := os.ReadFile(saveKey)
 		if err != nil {
 			return true, err
 		}

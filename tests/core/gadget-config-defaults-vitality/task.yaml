@@ -2,6 +2,10 @@ summary: |
    Test that vitality defaults specified in the gadget are picked up
    for first boot snaps
 
+details: |
+    Check that vitality defaults specified in the gadget are applied
+    properly for first boot snaps.
+
 # the test is only meaningful on core devices
 # TODO:UC20: enable for UC20, it assumes /var/lib/snapd/seed/assertions/model
 #            which we don't have currently
@@ -17,8 +21,6 @@ prepare: |
     fi
     #shellcheck source=tests/lib/core-config.sh
     . "$TESTSLIB"/core-config.sh
-    #shellcheck source=tests/lib/systemd.sh
-    . "$TESTSLIB"/systemd.sh
 
     # Stop snapd and remove existing state, modify and repack gadget
     # snap and provide developer assertions in order to force first
@@ -78,8 +80,6 @@ restore: |
 
     SUFFIX="$(get_test_snap_suffix)"
 
-    #shellcheck source=tests/lib/systemd.sh
-    . "$TESTSLIB"/systemd.sh
     systemctl stop snapd.service snapd.socket
     clean_snapd_lib
 

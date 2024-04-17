@@ -22,7 +22,6 @@ package sysconfig
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,7 +59,7 @@ func DisableCloudInit(rootDir string) error {
 	if err := os.MkdirAll(ubuntuDataCloud, 0755); err != nil {
 		return fmt.Errorf("cannot make cloud config dir: %v", err)
 	}
-	if err := ioutil.WriteFile(filepath.Join(ubuntuDataCloud, "cloud-init.disabled"), nil, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(ubuntuDataCloud, "cloud-init.disabled"), nil, 0644); err != nil {
 		return fmt.Errorf("cannot disable cloud-init: %v", err)
 	}
 
@@ -169,14 +168,14 @@ func filterCloudCfgFile(in string, allowedDatasources []string) (string, error) 
 	//   intersect with what we support
 
 	dstFileName := filepath.Base(in)
-	filteredFile, err := ioutil.TempFile("", dstFileName)
+	filteredFile, err := os.CreateTemp("", dstFileName)
 	if err != nil {
 		return "", err
 	}
 	defer filteredFile.Close()
 
 	// open the source and unmarshal it as yaml
-	unfilteredFileBytes, err := ioutil.ReadFile(in)
+	unfilteredFileBytes, err := os.ReadFile(in)
 	if err != nil {
 		return "", err
 	}
@@ -238,7 +237,7 @@ func cloudDatasourcesInUse(configFile string) (*cloudDatasourcesInUseResult, err
 	// TODO: are there other keys in addition to those that we support in
 	// filtering that might mention datasources ?
 
-	b, err := ioutil.ReadFile(configFile)
+	b, err := os.ReadFile(configFile)
 	if err != nil {
 		return nil, err
 	}
@@ -650,7 +649,7 @@ func configureCloudInit(model *asserts.Model, opts *Options) (err error) {
 		// measure
 		yaml := []byte(fmt.Sprintf(genericCloudRestrictYamlPattern, strings.Join(installOpts.AllowedDatasources, ",")))
 		restrictFile := filepath.Join(ubuntuDataCloudDir(WritableDefaultsDir(opts.TargetRootDir)), "cloud.cfg.d/99_snapd_datasource.cfg")
-		return ioutil.WriteFile(restrictFile, yaml, 0644)
+		return os.WriteFile(restrictFile, yaml, 0644)
 	}
 
 	return nil
@@ -749,7 +748,7 @@ func CloudInitStatus() (CloudInitState, error) {
 		return CloudInitNotFound, nil
 	}
 
-	out, err := exec.Command(ciBinary, "status").CombinedOutput()
+	out, stderr, err := osutil.RunSplitOutput(ciBinary, "status")
 
 	// in the case where cloud-init is actually in an error condition, like
 	// where MAAS is the datasource but there is no MAAS server for example,
@@ -762,10 +761,10 @@ func CloudInitStatus() (CloudInitState, error) {
 	if len(match) != 2 {
 		// check if running the command had an error, if it did then return that
 		if err != nil {
-			return CloudInitErrored, osutil.OutputErr(out, err)
+			return CloudInitErrored, osutil.OutputErrCombine(out, stderr, err)
 		}
 		// otherwise we had some sort of malformed output
-		return CloudInitErrored, fmt.Errorf("invalid cloud-init output: %v", osutil.OutputErr(out, err))
+		return CloudInitErrored, fmt.Errorf("invalid cloud-init output: %v", osutil.OutputErrCombine(out, stderr, err))
 	}
 
 	// otherwise we had a successful match, but we need to check if the status
@@ -778,7 +777,7 @@ func CloudInitStatus() (CloudInitState, error) {
 		}
 		// otherwise just ignore the parsing of the output and just return the
 		// error normally
-		return CloudInitErrored, fmt.Errorf("cloud-init errored: %v", osutil.OutputErr(out, err))
+		return CloudInitErrored, fmt.Errorf("cloud-init errored: %v", osutil.OutputErrCombine(out, stderr, err))
 	}
 
 	// otherwise no error from cloud-init
@@ -931,13 +930,13 @@ func RestrictCloudInit(state CloudInitState, opts *CloudInitRestrictOptions) (Cl
 		// labels to use as datasources, i.e. a USB drive inserted by an
 		// attacker with label CIDATA will defeat security measures on Ubuntu
 		// Core, so with the additional fs_label spec, we disable that import.
-		err = ioutil.WriteFile(cloudInitRestrictFile, nocloudRestrictYaml, 0644)
+		err = os.WriteFile(cloudInitRestrictFile, nocloudRestrictYaml, 0644)
 	default:
 		// all other cases are either not local on UC20, or not NoCloud and as
 		// such we simply restrict cloud-init to the specific datasource used so
 		// that an attack via NoCloud is protected against
 		yaml := []byte(fmt.Sprintf(genericCloudRestrictYamlPattern, res.DataSource))
-		err = ioutil.WriteFile(cloudInitRestrictFile, yaml, 0644)
+		err = os.WriteFile(cloudInitRestrictFile, yaml, 0644)
 	}
 
 	return res, err

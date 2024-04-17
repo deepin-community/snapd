@@ -22,7 +22,6 @@ package apparmor_test
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -292,7 +291,7 @@ func (s *backendSuite) TestInstallingDevmodeSnapNeitherSnapdNorCoreSnapInstalled
 	devMode := interfaces.ConfinementOptions{DevMode: true}
 	c.Assert(func() {
 		s.InstallSnap(c, devMode, "", ifacetest.SambaYamlV1, 1)
-	}, PanicMatches, "neither snapd nor core snap available while preparing apparmor profile for devmode snap samba, panicing to restart snapd to continue seeding")
+	}, PanicMatches, "neither snapd nor core snap available while preparing apparmor profile for devmode snap samba, panicking to restart snapd to continue seeding")
 }
 
 func (s *backendSuite) TestInstallingSnapWritesAndLoadsProfiles(c *C) {
@@ -373,7 +372,8 @@ func (s *backendSuite) TestTimings(c *C) {
 		meas := perf.StartSpan("", "")
 
 		snapInfo := s.InstallSnap(c, opts, "", ifacetest.SambaYamlV1, 1)
-		c.Assert(s.Backend.Setup(snapInfo, opts, s.Repo, meas), IsNil)
+		appSet := interfaces.NewSnapAppSet(snapInfo)
+		c.Assert(s.Backend.Setup(appSet, opts, s.Repo, meas), IsNil)
 
 		st := state.New(nil)
 		st.Lock()
@@ -401,7 +401,9 @@ func (s *backendSuite) TestProfilesAreAlwaysLoaded(c *C) {
 	for _, opts := range testedConfinementOpts {
 		snapInfo := s.InstallSnap(c, opts, "", ifacetest.SambaYamlV1, 1)
 		s.loadProfilesCalls = nil
-		err := s.Backend.Setup(snapInfo, opts, s.Repo, s.meas)
+
+		appSet := interfaces.NewSnapAppSet(snapInfo)
+		err := s.Backend.Setup(appSet, opts, s.Repo, s.meas)
 		c.Assert(err, IsNil)
 		updateNSProfile := filepath.Join(dirs.SnapAppArmorDir, "snap-update-ns.samba")
 		profile := filepath.Join(dirs.SnapAppArmorDir, "snap.samba.smbd")
@@ -543,10 +545,12 @@ func (s *backendSuite) TestSetupManyProfilesAreAlwaysLoaded(c *C) {
 	for _, opts := range testedConfinementOpts {
 		snapInfo1 := s.InstallSnap(c, opts, "", ifacetest.SambaYamlV1, 1)
 		snapInfo2 := s.InstallSnap(c, opts, "", ifacetest.SomeSnapYamlV1, 1)
+		appSet1 := interfaces.NewSnapAppSet(snapInfo1)
+		appSet2 := interfaces.NewSnapAppSet(snapInfo2)
 		s.loadProfilesCalls = nil
 		setupManyInterface, ok := s.Backend.(interfaces.SecurityBackendSetupMany)
 		c.Assert(ok, Equals, true)
-		err := setupManyInterface.SetupMany([]*snap.Info{snapInfo1, snapInfo2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
+		err := setupManyInterface.SetupMany([]*interfaces.SnapAppSet{appSet1, appSet2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
 		c.Assert(err, IsNil)
 		snap1nsProfile := filepath.Join(dirs.SnapAppArmorDir, "snap-update-ns.samba")
 		snap1AAprofile := filepath.Join(dirs.SnapAppArmorDir, "snap.samba.smbd")
@@ -564,6 +568,8 @@ func (s *backendSuite) TestSetupManyProfilesWithChanged(c *C) {
 	for _, opts := range testedConfinementOpts {
 		snapInfo1 := s.InstallSnap(c, opts, "", ifacetest.SambaYamlV1, 1)
 		snapInfo2 := s.InstallSnap(c, opts, "", ifacetest.SomeSnapYamlV1, 1)
+		appSet1 := interfaces.NewSnapAppSet(snapInfo1)
+		appSet2 := interfaces.NewSnapAppSet(snapInfo2)
 		s.loadProfilesCalls = nil
 
 		snap1nsProfile := filepath.Join(dirs.SnapAppArmorDir, "snap-update-ns.samba")
@@ -572,12 +578,12 @@ func (s *backendSuite) TestSetupManyProfilesWithChanged(c *C) {
 		snap2AAprofile := filepath.Join(dirs.SnapAppArmorDir, "snap.some-snap.someapp")
 
 		// simulate outdated profiles by changing their data on the disk
-		c.Assert(ioutil.WriteFile(snap1AAprofile, []byte("# an outdated profile"), 0644), IsNil)
-		c.Assert(ioutil.WriteFile(snap2AAprofile, []byte("# an outdated profile"), 0644), IsNil)
+		c.Assert(os.WriteFile(snap1AAprofile, []byte("# an outdated profile"), 0644), IsNil)
+		c.Assert(os.WriteFile(snap2AAprofile, []byte("# an outdated profile"), 0644), IsNil)
 
 		setupManyInterface, ok := s.Backend.(interfaces.SecurityBackendSetupMany)
 		c.Assert(ok, Equals, true)
-		err := setupManyInterface.SetupMany([]*snap.Info{snapInfo1, snapInfo2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
+		err := setupManyInterface.SetupMany([]*interfaces.SnapAppSet{appSet1, appSet2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
 		c.Assert(err, IsNil)
 
 		// expect two batch executions - one for changed profiles, second for unchanged profiles.
@@ -615,13 +621,15 @@ func (s *backendSuite) TestSetupManyApparmorBatchProcessingPermanentError(c *C) 
 		// note, InstallSnap here uses s.parserCmd which mocks happy apparmor_parser
 		snapInfo1 := s.InstallSnap(c, opts, "", ifacetest.SambaYamlV1, 1)
 		snapInfo2 := s.InstallSnap(c, opts, "", ifacetest.SomeSnapYamlV1, 1)
+		appSet1 := interfaces.NewSnapAppSet(snapInfo1)
+		appSet2 := interfaces.NewSnapAppSet(snapInfo2)
 		s.loadProfilesCalls = nil
 		setupManyInterface, ok := s.Backend.(interfaces.SecurityBackendSetupMany)
 		c.Assert(ok, Equals, true)
 
 		// mock apparmor_parser again with a failing one (and restore immediately for the next iteration of the test)
 		s.loadProfilesReturn = errors.New("apparmor_parser crash")
-		errs := setupManyInterface.SetupMany([]*snap.Info{snapInfo1, snapInfo2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
+		errs := setupManyInterface.SetupMany([]*interfaces.SnapAppSet{appSet1, appSet2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
 		s.loadProfilesReturn = nil
 
 		s.checkSetupManyCallsWithFallback(c, s.loadProfilesCalls)
@@ -648,6 +656,8 @@ func (s *backendSuite) TestSetupManyApparmorBatchProcessingErrorWithFallbackOK(c
 		// note, InstallSnap here uses s.parserCmd which mocks happy apparmor_parser
 		snapInfo1 := s.InstallSnap(c, opts, "", ifacetest.SambaYamlV1, 1)
 		snapInfo2 := s.InstallSnap(c, opts, "", ifacetest.SomeSnapYamlV1, 1)
+		appSet1 := interfaces.NewSnapAppSet(snapInfo1)
+		appSet2 := interfaces.NewSnapAppSet(snapInfo2)
 		s.loadProfilesCalls = nil
 		setupManyInterface, ok := s.Backend.(interfaces.SecurityBackendSetupMany)
 		c.Assert(ok, Equals, true)
@@ -663,7 +673,7 @@ func (s *backendSuite) TestSetupManyApparmorBatchProcessingErrorWithFallbackOK(c
 			}
 			return nil
 		})
-		errs := setupManyInterface.SetupMany([]*snap.Info{snapInfo1, snapInfo2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
+		errs := setupManyInterface.SetupMany([]*interfaces.SnapAppSet{appSet1, appSet2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
 		r()
 
 		s.checkSetupManyCallsWithFallback(c, s.loadProfilesCalls)
@@ -689,6 +699,8 @@ func (s *backendSuite) TestSetupManyApparmorBatchProcessingErrorWithFallbackPart
 		// note, InstallSnap here uses s.parserCmd which mocks happy apparmor_parser
 		snapInfo1 := s.InstallSnap(c, opts, "", ifacetest.SambaYamlV1, 1)
 		snapInfo2 := s.InstallSnap(c, opts, "", ifacetest.SomeSnapYamlV1, 1)
+		appSet1 := interfaces.NewSnapAppSet(snapInfo1)
+		appSet2 := interfaces.NewSnapAppSet(snapInfo2)
 		s.loadProfilesCalls = nil
 		setupManyInterface, ok := s.Backend.(interfaces.SecurityBackendSetupMany)
 		c.Assert(ok, Equals, true)
@@ -708,7 +720,7 @@ func (s *backendSuite) TestSetupManyApparmorBatchProcessingErrorWithFallbackPart
 			}
 			return nil
 		})
-		errs := setupManyInterface.SetupMany([]*snap.Info{snapInfo1, snapInfo2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
+		errs := setupManyInterface.SetupMany([]*interfaces.SnapAppSet{appSet1, appSet2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
 		r()
 
 		s.checkSetupManyCallsWithFallback(c, s.loadProfilesCalls)
@@ -796,11 +808,12 @@ func (s *backendSuite) TestDefaultCoreRuntimesTemplateOnlyUsed(c *C) {
 		testYaml := ifacetest.SambaYamlV1 + base + "\n"
 
 		snapInfo := snaptest.MockInfo(c, testYaml, nil)
+		appSet := interfaces.NewSnapAppSet(snapInfo)
 		// NOTE: we don't call apparmor.MockTemplate()
-		err := s.Backend.Setup(snapInfo, interfaces.ConfinementOptions{}, s.Repo, s.meas)
+		err := s.Backend.Setup(appSet, interfaces.ConfinementOptions{}, s.Repo, s.meas)
 		c.Assert(err, IsNil)
 		profile := filepath.Join(dirs.SnapAppArmorDir, "snap.samba.smbd")
-		data, err := ioutil.ReadFile(profile)
+		data, err := os.ReadFile(profile)
 		c.Assert(err, IsNil)
 		for _, line := range []string{
 			// preamble
@@ -835,11 +848,12 @@ func (s *backendSuite) TestBaseDefaultTemplateOnlyUsed(c *C) {
 	testYaml := ifacetest.SambaYamlV1 + "base: other\n"
 
 	snapInfo := snaptest.MockInfo(c, testYaml, nil)
+	appSet := interfaces.NewSnapAppSet(snapInfo)
 	// NOTE: we don't call apparmor.MockTemplate()
-	err := s.Backend.Setup(snapInfo, interfaces.ConfinementOptions{}, s.Repo, s.meas)
+	err := s.Backend.Setup(appSet, interfaces.ConfinementOptions{}, s.Repo, s.meas)
 	c.Assert(err, IsNil)
 	profile := filepath.Join(dirs.SnapAppArmorDir, "snap.samba.smbd")
-	data, err := ioutil.ReadFile(profile)
+	data, err := os.ReadFile(profile)
 	c.Assert(err, IsNil)
 	for _, line := range []string{
 		// preamble
@@ -992,33 +1006,33 @@ const commonPrefix = `
 var combineSnippetsScenarios = []combineSnippetsScenario{{
 	// By default apparmor is enforcing mode.
 	opts:    interfaces.ConfinementOptions{},
-	content: commonPrefix + "\nprofile \"snap.samba.smbd\" (attach_disconnected,mediate_deleted) {\n\n}\n",
+	content: commonPrefix + "\nprofile \"snap.samba.smbd\" flags=(attach_disconnected,mediate_deleted) {\n\n}\n",
 }, {
 	// Snippets are injected in the space between "{" and "}"
 	opts:    interfaces.ConfinementOptions{},
 	snippet: "snippet",
-	content: commonPrefix + "\nprofile \"snap.samba.smbd\" (attach_disconnected,mediate_deleted) {\nsnippet\n}\n",
+	content: commonPrefix + "\nprofile \"snap.samba.smbd\" flags=(attach_disconnected,mediate_deleted) {\nsnippet\n}\n",
 }, {
 	// DevMode switches apparmor to non-enforcing (complain) mode.
 	opts:    interfaces.ConfinementOptions{DevMode: true},
 	snippet: "snippet",
-	content: commonPrefix + "\nprofile \"snap.samba.smbd\" (attach_disconnected,mediate_deleted,complain) {\nsnippet\n}\n",
+	content: commonPrefix + "\nprofile \"snap.samba.smbd\" flags=(attach_disconnected,mediate_deleted,complain) {\nsnippet\n}\n",
 }, {
 	// JailMode switches apparmor to enforcing mode even in the presence of DevMode.
 	opts:    interfaces.ConfinementOptions{DevMode: true},
 	snippet: "snippet",
-	content: commonPrefix + "\nprofile \"snap.samba.smbd\" (attach_disconnected,mediate_deleted,complain) {\nsnippet\n}\n",
+	content: commonPrefix + "\nprofile \"snap.samba.smbd\" flags=(attach_disconnected,mediate_deleted,complain) {\nsnippet\n}\n",
 }, {
 	// Classic confinement (without jailmode) uses apparmor in complain mode by default and ignores all snippets.
 	opts:    interfaces.ConfinementOptions{Classic: true},
 	snippet: "snippet",
-	content: "\n#classic" + commonPrefix + "\nprofile \"snap.samba.smbd\" (attach_disconnected,mediate_deleted,complain) {\n\n}\n",
+	content: "\n#classic" + commonPrefix + "\nprofile \"snap.samba.smbd\" flags=(attach_disconnected,mediate_deleted,complain) {\n\n}\n",
 }, {
 	// Classic confinement in JailMode uses enforcing apparmor.
 	opts:    interfaces.ConfinementOptions{Classic: true, JailMode: true},
 	snippet: "snippet",
 	content: commonPrefix + `
-profile "snap.samba.smbd" (attach_disconnected,mediate_deleted) {
+profile "snap.samba.smbd" flags=(attach_disconnected,mediate_deleted) {
 
   # Read-only access to the core snap.
   @{INSTALL_DIR}/core/** r,
@@ -1037,7 +1051,7 @@ snippet
 func (s *backendSuite) TestCombineSnippets(c *C) {
 	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 	restore = osutil.MockIsRootWritableOverlay(func() (string, error) { return "", nil })
 	defer restore()
@@ -1045,14 +1059,14 @@ func (s *backendSuite) TestCombineSnippets(c *C) {
 	// NOTE: replace the real template with a shorter variant
 	restoreTemplate := apparmor.MockTemplate("\n" +
 		"###VAR###\n" +
-		"###PROFILEATTACH### (attach_disconnected,mediate_deleted) {\n" +
+		"###PROFILEATTACH### ###FLAGS### {\n" +
 		"###SNIPPETS###\n" +
 		"}\n")
 	defer restoreTemplate()
 	restoreClassicTemplate := apparmor.MockClassicTemplate("\n" +
 		"#classic\n" +
 		"###VAR###\n" +
-		"###PROFILEATTACH### (attach_disconnected,mediate_deleted) {\n" +
+		"###PROFILEATTACH### ###FLAGS### {\n" +
 		"###SNIPPETS###\n" +
 		"}\n")
 	defer restoreClassicTemplate()
@@ -1074,10 +1088,68 @@ func (s *backendSuite) TestCombineSnippets(c *C) {
 	}
 }
 
+func (s *backendSuite) TestUnconfinedFlag(c *C) {
+	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
+	defer restore()
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
+	defer restore()
+	restore = osutil.MockIsRootWritableOverlay(func() (string, error) { return "", nil })
+	defer restore()
+
+	// NOTE: replace the real template with a shorter variant
+	restoreTemplate := apparmor.MockTemplate("\n" +
+		"###VAR###\n" +
+		"###PROFILEATTACH### ###FLAGS### {\n" +
+		"###SNIPPETS###\n" +
+		"}\n")
+	defer restoreTemplate()
+	restoreClassicTemplate := apparmor.MockClassicTemplate("\n" +
+		"#classic\n" +
+		"###VAR###\n" +
+		"###PROFILEATTACH### ###FLAGS### {\n" +
+		"###SNIPPETS###\n" +
+		"}\n")
+	defer restoreClassicTemplate()
+	s.Iface.InterfaceStaticInfo.AppArmorUnconfinedSlots = true
+	// will only be enabled if the interface also enables unconfined
+	s.Iface.AppArmorPermanentSlotCallback = func(spec *apparmor.Specification, slot *snap.SlotInfo) error {
+		err := spec.SetUnconfinedEnabled()
+		c.Assert(err, IsNil)
+		return nil
+	}
+	// test both classic and non-classic confinement
+	options := []interfaces.ConfinementOptions{
+		{},
+		{Classic: true},
+	}
+	restore = apparmor.MockParserFeatures(func() ([]string, error) { return []string{"unconfined"}, nil })
+	defer restore()
+	restore = apparmor.MockKernelFeatures(func() ([]string, error) { return []string{"policy:unconfined_restrictions"}, nil })
+	defer restore()
+
+	for i, opts := range options {
+		snapInfo := s.InstallSnap(c, opts, "", ifacetest.SambaYamlV1, 1)
+		profile := filepath.Join(dirs.SnapAppArmorDir, "snap.samba.smbd")
+		flags := []string{"attach_disconnected", "mediate_deleted", "unconfined"}
+		prefix := commonPrefix
+		if opts.Classic {
+			prefix = "\n#classic" + commonPrefix
+		}
+		contents := fmt.Sprintf(prefix+"\nprofile \"snap.samba.smbd\" flags=(%s) {\n\n}\n",
+			strings.Join(flags, ","))
+		c.Check(profile, testutil.FileEquals, contents, Commentf("scenario %d: %#v", i, opts))
+		stat, err := os.Stat(profile)
+		c.Assert(err, IsNil)
+		c.Check(stat.Mode(), Equals, os.FileMode(0644))
+		s.RemoveSnap(c, snapInfo)
+
+	}
+}
+
 func (s *backendSuite) TestCombineSnippetsChangeProfile(c *C) {
 	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 	restore = osutil.MockIsRootWritableOverlay(func() (string, error) { return "", nil })
 	defer restore()
@@ -1115,7 +1187,7 @@ func (s *backendSuite) TestCombineSnippetsChangeProfile(c *C) {
 func (s *backendSuite) TestCombineSnippetsIncludeIfExists(c *C) {
 	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 	restore = osutil.MockIsRootWritableOverlay(func() (string, error) { return "", nil })
 	defer restore()
@@ -1150,10 +1222,44 @@ func (s *backendSuite) TestCombineSnippetsIncludeIfExists(c *C) {
 	}
 }
 
+func (s *backendSuite) TestCombineSnippetsIncludeEtcTunables(c *C) {
+	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
+	defer restore()
+
+	restoreTemplate := apparmor.MockTemplate("###INCLUDE_SYSTEM_TUNABLES_HOME_D_WITH_VENDORED_APPARMOR###")
+	defer restoreTemplate()
+
+	type includeIfExistsScenario struct {
+		features []string
+		expected string
+	}
+
+	var includeIfExistsScenarios = []includeIfExistsScenario{{
+		features: []string{},
+		expected: "",
+	}, {
+		features: []string{"snapd-internal"},
+		expected: `#include if exists "/etc/apparmor.d/tunables/home.d"`,
+	}}
+
+	for i, scenario := range includeIfExistsScenarios {
+		restore = apparmor.MockParserFeatures(func() ([]string, error) { return scenario.features, nil })
+		defer restore()
+
+		snapInfo := s.InstallSnap(c, interfaces.ConfinementOptions{}, "", ifacetest.SambaYamlV1, 1)
+		profile := filepath.Join(dirs.SnapAppArmorDir, "snap.samba.smbd")
+		c.Check(profile, testutil.FileEquals, scenario.expected, Commentf("scenario %d: %#v", i, scenario))
+		stat, err := os.Stat(profile)
+		c.Assert(err, IsNil)
+		c.Check(stat.Mode(), Equals, os.FileMode(0644))
+		s.RemoveSnap(c, snapInfo)
+	}
+}
+
 func (s *backendSuite) TestParallelInstallCombineSnippets(c *C) {
 	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 	restore = osutil.MockIsRootWritableOverlay(func() (string, error) { return "", nil })
 	defer restore()
@@ -1161,14 +1267,14 @@ func (s *backendSuite) TestParallelInstallCombineSnippets(c *C) {
 	// NOTE: replace the real template with a shorter variant
 	restoreTemplate := apparmor.MockTemplate("\n" +
 		"###VAR###\n" +
-		"###PROFILEATTACH### (attach_disconnected,mediate_deleted) {\n" +
+		"###PROFILEATTACH### ###FLAGS### {\n" +
 		"###SNIPPETS###\n" +
 		"}\n")
 	defer restoreTemplate()
 	restoreClassicTemplate := apparmor.MockClassicTemplate("\n" +
 		"#classic\n" +
 		"###VAR###\n" +
-		"###PROFILEATTACH### (attach_disconnected,mediate_deleted) {\n" +
+		"###PROFILEATTACH### ###FLAGS### {\n" +
 		"###SNIPPETS###\n" +
 		"}\n")
 	defer restoreClassicTemplate()
@@ -1185,7 +1291,7 @@ func (s *backendSuite) TestParallelInstallCombineSnippets(c *C) {
 @{SNAP_REVISION}="1"
 @{PROFILE_DBUS}="snap_2esamba_5ffoo_2esmbd"
 @{INSTALL_DIR}="/{,var/lib/snapd/}snap"
-profile "snap.samba_foo.smbd" (attach_disconnected,mediate_deleted) {
+profile "snap.samba_foo.smbd" flags=(attach_disconnected,mediate_deleted) {
 
 }
 `
@@ -1202,14 +1308,14 @@ profile "snap.samba_foo.smbd" (attach_disconnected,mediate_deleted) {
 func (s *backendSuite) TestTemplateVarsWithHook(c *C) {
 	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 	restore = osutil.MockIsRootWritableOverlay(func() (string, error) { return "", nil })
 	defer restore()
 	// NOTE: replace the real template with a shorter variant
 	restoreTemplate := apparmor.MockTemplate("\n" +
 		"###VAR###\n" +
-		"###PROFILEATTACH### (attach_disconnected,mediate_deleted) {\n" +
+		"###PROFILEATTACH### ###FLAGS### {\n" +
 		"###SNIPPETS###\n" +
 		"}\n")
 	defer restoreTemplate()
@@ -1224,7 +1330,7 @@ func (s *backendSuite) TestTemplateVarsWithHook(c *C) {
 @{SNAP_REVISION}="1"
 @{PROFILE_DBUS}="snap_2efoo_2ehook_2econfigure"
 @{INSTALL_DIR}="/{,var/lib/snapd/}snap"
-profile "snap.foo.hook.configure" (attach_disconnected,mediate_deleted) {
+profile "snap.foo.hook.configure" flags=(attach_disconnected,mediate_deleted) {
 
 }
 `
@@ -1260,7 +1366,7 @@ func (s *backendSuite) writeVanillaSnapConfineProfile(c *C, coreOrSnapdInfo *sna
 }
 `)
 	c.Assert(os.MkdirAll(filepath.Dir(vanillaProfilePath), 0755), IsNil)
-	c.Assert(ioutil.WriteFile(vanillaProfilePath, vanillaProfileText, 0644), IsNil)
+	c.Assert(os.WriteFile(vanillaProfilePath, vanillaProfileText, 0644), IsNil)
 }
 
 func (s *backendSuite) TestSnapConfineProfile(c *C) {
@@ -1360,6 +1466,40 @@ func (s *backendSuite) TestSnapConfineFromSnapProfileCreatesAllDirs(c *C) {
 	c.Assert(osutil.IsDirectory(dirs.SnapAppArmorDir), Equals, true)
 }
 
+func (s *backendSuite) TestSnapConfineProfileIncludesEtcTunables(c *C) {
+	// Mock vendored apparmor
+	r := apparmor.MockParserFeatures(func() ([]string, error) { return []string{"snapd-internal"}, nil })
+	defer r()
+
+	// Let's say we're working with the core snap at revision 111.
+	coreInfo := snaptest.MockInfo(c, coreYaml, &snap.SideInfo{Revision: snap.R(111)})
+	s.writeVanillaSnapConfineProfile(c, coreInfo)
+
+	// Expect #include if exists "/etc/apparmor.d/tunables/home.d/" to be added
+	// right below #include <tunables/global>
+	expectedProfileName := "snap-confine.core.111"
+	expectedProfileText := fmt.Sprintf(`#include <tunables/global>
+#include if exists "/etc/apparmor.d/tunables/home.d/"
+%s/usr/lib/snapd/snap-confine (attach_disconnected) {
+    #include "%s/var/lib/snapd/apparmor/snap-confine"
+
+    # We run privileged, so be fanatical about what we include and don't use
+    # any abstractions
+    /etc/ld.so.cache r,
+}
+`, coreInfo.MountDir(), dirs.GlobalRootDir)
+
+	// Compute the profile and see if it matches.
+	_, _, content, err := apparmor.SnapConfineFromSnapProfile(coreInfo)
+	c.Assert(err, IsNil)
+	c.Assert(content, DeepEquals, map[string]osutil.FileState{
+		expectedProfileName: &osutil.MemoryFileState{
+			Content: []byte(expectedProfileText),
+			Mode:    0644,
+		},
+	})
+}
+
 func (s *backendSuite) TestSetupHostSnapConfineApparmorForReexecCleans(c *C) {
 	restorer := release.MockOnClassic(true)
 	defer restorer()
@@ -1373,7 +1513,7 @@ func (s *backendSuite) TestSetupHostSnapConfineApparmorForReexecCleans(c *C) {
 	canary := filepath.Join(dirs.SnapAppArmorDir, canaryName)
 	err := os.MkdirAll(filepath.Dir(canary), 0755)
 	c.Assert(err, IsNil)
-	err = ioutil.WriteFile(canary, nil, 0644)
+	err = os.WriteFile(canary, nil, 0644)
 	c.Assert(err, IsNil)
 
 	// install the new core snap on classic triggers cleanup
@@ -1429,13 +1569,14 @@ func (s *backendSuite) TestSnapConfineProfileDiscardedLateSnapd(c *C) {
 	defer restorer()
 	// snapd snap at revision 222.
 	snapdInfo := snaptest.MockInfo(c, snapdYaml, &snap.SideInfo{Revision: snap.R(222)})
+	appSet := interfaces.NewSnapAppSet(snapdInfo)
 	s.writeVanillaSnapConfineProfile(c, snapdInfo)
-	err := s.Backend.Setup(snapdInfo, interfaces.ConfinementOptions{}, s.Repo, s.perf)
+	err := s.Backend.Setup(appSet, interfaces.ConfinementOptions{}, s.Repo, s.perf)
 	c.Assert(err, IsNil)
 	// precondition
 	c.Assert(filepath.Join(dirs.SnapAppArmorDir, "snap-confine.snapd.222"), testutil.FilePresent)
 	// place a canary
-	c.Assert(ioutil.WriteFile(filepath.Join(dirs.SnapAppArmorDir, "snap-confine.snapd.111"), nil, 0644), IsNil)
+	c.Assert(os.WriteFile(filepath.Join(dirs.SnapAppArmorDir, "snap-confine.snapd.111"), nil, 0644), IsNil)
 
 	// backed implements the right interface
 	late, ok := s.Backend.(interfaces.SecurityBackendDiscardingLate)
@@ -1467,26 +1608,26 @@ func (s *backendSuite) testCoreOrSnapdOnCoreCleansApparmorCache(c *C, coreOrSnap
 	c.Assert(err, IsNil)
 	// the canary file in the cache will be removed
 	canaryPath := filepath.Join(apparmor_sandbox.SystemCacheDir, "meep")
-	err = ioutil.WriteFile(canaryPath, nil, 0644)
+	err = os.WriteFile(canaryPath, nil, 0644)
 	c.Assert(err, IsNil)
 	// and the snap-confine profiles are removed
 	scCanaryPath := filepath.Join(apparmor_sandbox.SystemCacheDir, "usr.lib.snapd.snap-confine.real")
-	err = ioutil.WriteFile(scCanaryPath, nil, 0644)
+	err = os.WriteFile(scCanaryPath, nil, 0644)
 	c.Assert(err, IsNil)
 	scCanaryPath = filepath.Join(apparmor_sandbox.SystemCacheDir, "usr.lib.snapd.snap-confine")
-	err = ioutil.WriteFile(scCanaryPath, nil, 0644)
+	err = os.WriteFile(scCanaryPath, nil, 0644)
 	c.Assert(err, IsNil)
 	scCanaryPath = filepath.Join(apparmor_sandbox.SystemCacheDir, "snap-confine.core.6405")
-	err = ioutil.WriteFile(scCanaryPath, nil, 0644)
+	err = os.WriteFile(scCanaryPath, nil, 0644)
 	c.Assert(err, IsNil)
 	scCanaryPath = filepath.Join(apparmor_sandbox.SystemCacheDir, "snap-confine.snapd.6405")
-	err = ioutil.WriteFile(scCanaryPath, nil, 0644)
+	err = os.WriteFile(scCanaryPath, nil, 0644)
 	c.Assert(err, IsNil)
 	scCanaryPath = filepath.Join(apparmor_sandbox.SystemCacheDir, "snap.core.4938.usr.lib.snapd.snap-confine")
-	err = ioutil.WriteFile(scCanaryPath, nil, 0644)
+	err = os.WriteFile(scCanaryPath, nil, 0644)
 	c.Assert(err, IsNil)
 	scCanaryPath = filepath.Join(apparmor_sandbox.SystemCacheDir, "var.lib.snapd.snap.core.1234.usr.lib.snapd.snap-confine")
-	err = ioutil.WriteFile(scCanaryPath, nil, 0644)
+	err = os.WriteFile(scCanaryPath, nil, 0644)
 	c.Assert(err, IsNil)
 	// but non-regular entries in the cache dir are kept
 	dirsAreKept := filepath.Join(apparmor_sandbox.SystemCacheDir, "dir")
@@ -1497,14 +1638,14 @@ func (s *backendSuite) testCoreOrSnapdOnCoreCleansApparmorCache(c *C, coreOrSnap
 	c.Assert(err, IsNil)
 	// and the snap profiles are kept
 	snapCanaryKept := filepath.Join(apparmor_sandbox.SystemCacheDir, "snap.canary.meep")
-	err = ioutil.WriteFile(snapCanaryKept, nil, 0644)
+	err = os.WriteFile(snapCanaryKept, nil, 0644)
 	c.Assert(err, IsNil)
 	sunCanaryKept := filepath.Join(apparmor_sandbox.SystemCacheDir, "snap-update-ns.canary")
-	err = ioutil.WriteFile(sunCanaryKept, nil, 0644)
+	err = os.WriteFile(sunCanaryKept, nil, 0644)
 	c.Assert(err, IsNil)
 	// and the .features file is kept
 	dotKept := filepath.Join(apparmor_sandbox.SystemCacheDir, ".features")
-	err = ioutil.WriteFile(dotKept, nil, 0644)
+	err = os.WriteFile(dotKept, nil, 0644)
 	c.Assert(err, IsNil)
 
 	// install the new core snap on classic triggers a new snap-confine
@@ -1518,17 +1659,17 @@ func (s *backendSuite) testCoreOrSnapdOnCoreCleansApparmorCache(c *C, coreOrSnap
 }
 
 // Ensure that both names of the snap-confine apparmor profile are supported.
-func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithNFS1(c *C) {
-	s.testSetupSnapConfineGeneratedPolicyWithNFS(c, "usr.lib.snapd.snap-confine")
+func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithRemoteFS1(c *C) {
+	s.testSetupSnapConfineGeneratedPolicyWithRemoteFS(c, "usr.lib.snapd.snap-confine")
 }
 
-func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithNFS2(c *C) {
-	s.testSetupSnapConfineGeneratedPolicyWithNFS(c, "usr.lib.snapd.snap-confine.real")
+func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithRemoteFS2(c *C) {
+	s.testSetupSnapConfineGeneratedPolicyWithRemoteFS(c, "usr.lib.snapd.snap-confine.real")
 }
 
-func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithNFSNoProfileFiles(c *C) {
-	// Make it appear as if NFS workaround was needed.
-	restore := osutil.MockIsHomeUsingNFS(func() (bool, error) { return true, nil })
+func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithRemoteFSNoProfileFiles(c *C) {
+	// Make it appear as if remote file system workaround was needed.
+	restore := osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return true, nil })
 	defer restore()
 	// Make it appear as if overlay was not used.
 	restore = osutil.MockIsRootWritableOverlay(func() (string, error) { return "", nil })
@@ -1548,10 +1689,10 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithNFSNoProfileFiles(
 	c.Assert(cmd.Calls(), HasLen, 0)
 }
 
-// snap-confine policy when NFS is used and snapd has not re-executed.
-func (s *backendSuite) testSetupSnapConfineGeneratedPolicyWithNFS(c *C, profileFname string) {
-	// Make it appear as if NFS workaround was needed.
-	restore := osutil.MockIsHomeUsingNFS(func() (bool, error) { return true, nil })
+// snap-confine policy when remote file system is used and snapd has not re-executed.
+func (s *backendSuite) testSetupSnapConfineGeneratedPolicyWithRemoteFS(c *C, profileFname string) {
+	// Make it appear as if remote file system  workaround was needed.
+	restore := osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return true, nil })
 	defer restore()
 
 	// Make it appear as if overlay was not used.
@@ -1573,18 +1714,20 @@ func (s *backendSuite) testSetupSnapConfineGeneratedPolicyWithNFS(c *C, profileF
 	// Create the directory where system apparmor profiles are stored and write
 	// the system apparmor profile of snap-confine.
 	c.Assert(os.MkdirAll(apparmor_sandbox.ConfDir, 0755), IsNil)
-	c.Assert(ioutil.WriteFile(profilePath, []byte(""), 0644), IsNil)
+	c.Assert(os.WriteFile(profilePath, []byte(""), 0644), IsNil)
 
 	// Setup generated policy for snap-confine.
 	err = (&apparmor.Backend{}).Initialize(ifacetest.DefaultInitializeOpts)
 	c.Assert(err, IsNil)
 
-	// Because NFS is being used, we have the extra policy file.
-	files, err := ioutil.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
+	// Because remote file system is being used, we have the extra policy file.
+	files, err := os.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
 	c.Assert(err, IsNil)
 	c.Assert(files, HasLen, 1)
 	c.Assert(files[0].Name(), Equals, "nfs-support")
-	c.Assert(files[0].Mode(), Equals, os.FileMode(0644))
+	fi, err := files[0].Info()
+	c.Assert(err, IsNil)
+	c.Assert(fi.Mode().Perm(), Equals, os.FileMode(0644))
 	c.Assert(files[0].IsDir(), Equals, false)
 
 	// The policy allows network access.
@@ -1600,10 +1743,10 @@ func (s *backendSuite) testSetupSnapConfineGeneratedPolicyWithNFS(c *C, profileF
 	}})
 }
 
-// snap-confine policy when NFS is used and snapd has re-executed.
-func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithNFSAndReExec(c *C) {
-	// Make it appear as if NFS workaround was needed.
-	restore := osutil.MockIsHomeUsingNFS(func() (bool, error) { return true, nil })
+// snap-confine policy when remote file system  is used and snapd has re-executed.
+func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithRemoteFSAndReExec(c *C) {
+	// Make it appear as if remote file system workaround was needed.
+	restore := osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return true, nil })
 	defer restore()
 
 	// Make it appear as if overlay was not used.
@@ -1627,12 +1770,14 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithNFSAndReExec(c *C)
 	err = (&apparmor.Backend{}).Initialize(ifacetest.DefaultInitializeOpts)
 	c.Assert(err, IsNil)
 
-	// Because NFS is being used, we have the extra policy file.
-	files, err := ioutil.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
+	// Because remote file system is being used, we have the extra policy file.
+	files, err := os.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
 	c.Assert(err, IsNil)
 	c.Assert(files, HasLen, 1)
 	c.Assert(files[0].Name(), Equals, "nfs-support")
-	c.Assert(files[0].Mode(), Equals, os.FileMode(0644))
+	fi, err := files[0].Info()
+	c.Assert(err, IsNil)
+	c.Assert(fi.Mode().Perm(), Equals, os.FileMode(0644))
 	c.Assert(files[0].IsDir(), Equals, false)
 
 	// The policy allows network access.
@@ -1647,8 +1792,8 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithNFSAndReExec(c *C)
 
 // Test behavior when os.Readlink "/proc/self/exe" fails.
 func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyError1(c *C) {
-	// Make it appear as if NFS workaround was needed.
-	restore := osutil.MockIsHomeUsingNFS(func() (bool, error) { return true, nil })
+	// Make it appear as if remote file system workaround was needed.
+	restore := osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return true, nil })
 	defer restore()
 
 	// Make it appear as if overlay was not used.
@@ -1670,7 +1815,7 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyError1(c *C) {
 	c.Assert(err, ErrorMatches, "cannot read .*corrupt-proc-self-exe: .*")
 
 	// We didn't create the policy file.
-	files, err := ioutil.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
+	files, err := os.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
 	c.Assert(err, IsNil)
 	c.Assert(files, HasLen, 0)
 
@@ -1680,8 +1825,8 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyError1(c *C) {
 
 // Test behavior when exec.Command "apparmor_parser" fails
 func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyError2(c *C) {
-	// Make it appear as if NFS workaround was needed.
-	restore := osutil.MockIsHomeUsingNFS(func() (bool, error) { return true, nil })
+	// Make it appear as if remote file system  workaround was needed.
+	restore := osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return true, nil })
 	defer restore()
 
 	// Make it appear as if overlay was not used.
@@ -1701,7 +1846,7 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyError2(c *C) {
 	// Create the directory where system apparmor profiles are stored and Write
 	// the system apparmor profile of snap-confine.
 	c.Assert(os.MkdirAll(apparmor_sandbox.ConfDir, 0755), IsNil)
-	c.Assert(ioutil.WriteFile(filepath.Join(apparmor_sandbox.ConfDir, "usr.lib.snapd.snap-confine"), []byte(""), 0644), IsNil)
+	c.Assert(os.WriteFile(filepath.Join(apparmor_sandbox.ConfDir, "usr.lib.snapd.snap-confine"), []byte(""), 0644), IsNil)
 
 	// Setup generated policy for snap-confine.
 	err = (&apparmor.Backend{}).Initialize(ifacetest.DefaultInitializeOpts)
@@ -1709,7 +1854,7 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyError2(c *C) {
 
 	// While created the policy file initially we also removed it so that
 	// no side-effects remain.
-	files, err := ioutil.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
+	files, err := os.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
 	c.Assert(err, IsNil)
 	c.Assert(files, HasLen, 0)
 
@@ -1730,8 +1875,8 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithOverlayNoProfileFi
 	// Make it appear as if overlay workaround was needed.
 	restore := osutil.MockIsRootWritableOverlay(func() (string, error) { return "/upper", nil })
 	defer restore()
-	// No NFS workaround
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	// No remote file system workaround
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 
 	// Intercept interaction with apparmor_parser
@@ -1753,7 +1898,7 @@ func (s *backendSuite) testSetupSnapConfineGeneratedPolicyWithOverlay(c *C, prof
 	// Make it appear as if overlay workaround was needed.
 	restore := osutil.MockIsRootWritableOverlay(func() (string, error) { return "/upper", nil })
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 
 	// Intercept the /proc/self/exe symlink and point it to the distribution
@@ -1771,22 +1916,24 @@ func (s *backendSuite) testSetupSnapConfineGeneratedPolicyWithOverlay(c *C, prof
 	// Create the directory where system apparmor profiles are stored and write
 	// the system apparmor profile of snap-confine.
 	c.Assert(os.MkdirAll(apparmor_sandbox.ConfDir, 0755), IsNil)
-	c.Assert(ioutil.WriteFile(profilePath, []byte(""), 0644), IsNil)
+	c.Assert(os.WriteFile(profilePath, []byte(""), 0644), IsNil)
 
 	// Setup generated policy for snap-confine.
 	err = (&apparmor.Backend{}).Initialize(ifacetest.DefaultInitializeOpts)
 	c.Assert(err, IsNil)
 
 	// Because overlay is being used, we have the extra policy file.
-	files, err := ioutil.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
+	files, err := os.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
 	c.Assert(err, IsNil)
 	c.Assert(files, HasLen, 1)
 	c.Assert(files[0].Name(), Equals, "overlay-root")
-	c.Assert(files[0].Mode(), Equals, os.FileMode(0644))
+	fi, err := files[0].Info()
+	c.Assert(err, IsNil)
+	c.Assert(fi.Mode().Perm(), Equals, os.FileMode(0644))
 	c.Assert(files[0].IsDir(), Equals, false)
 
 	// The policy allows upperdir access.
-	data, err := ioutil.ReadFile(filepath.Join(apparmor_sandbox.SnapConfineAppArmorDir, files[0].Name()))
+	data, err := os.ReadFile(filepath.Join(apparmor_sandbox.SnapConfineAppArmorDir, files[0].Name()))
 	c.Assert(err, IsNil)
 	c.Assert(string(data), testutil.Contains, "\"/upper/{,**/}\" r,")
 
@@ -1804,7 +1951,7 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithOverlayAndReExec(c
 	restore := osutil.MockIsRootWritableOverlay(func() (string, error) { return "/upper", nil })
 	defer restore()
 
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 
 	// Intercept interaction with apparmor_parser
@@ -1825,15 +1972,17 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithOverlayAndReExec(c
 	c.Assert(err, IsNil)
 
 	// Because overlay is being used, we have the extra policy file.
-	files, err := ioutil.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
+	files, err := os.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
 	c.Assert(err, IsNil)
 	c.Assert(files, HasLen, 1)
 	c.Assert(files[0].Name(), Equals, "overlay-root")
-	c.Assert(files[0].Mode(), Equals, os.FileMode(0644))
+	fi, err := files[0].Info()
+	c.Assert(err, IsNil)
+	c.Assert(fi.Mode().Perm(), Equals, os.FileMode(0644))
 	c.Assert(files[0].IsDir(), Equals, false)
 
 	// The policy allows upperdir access
-	data, err := ioutil.ReadFile(filepath.Join(apparmor_sandbox.SnapConfineAppArmorDir, files[0].Name()))
+	data, err := os.ReadFile(filepath.Join(apparmor_sandbox.SnapConfineAppArmorDir, files[0].Name()))
 	c.Assert(err, IsNil)
 	c.Assert(string(data), testutil.Contains, "\"/upper/{,**/}\" r,")
 
@@ -1845,7 +1994,7 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithOverlayAndReExec(c
 func (s *backendSuite) testSetupSnapConfineGeneratedPolicyWithBPFCapability(c *C, reexec bool) {
 	restore := osutil.MockIsRootWritableOverlay(func() (string, error) { return "", nil })
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 	// Pretend apparmor_parser supports bpf capability
 	apparmor_sandbox.MockFeatures(nil, nil, []string{"cap-bpf"}, nil)
@@ -1871,7 +2020,7 @@ func (s *backendSuite) testSetupSnapConfineGeneratedPolicyWithBPFCapability(c *C
 	// Create the directory where system apparmor profiles are stored and write
 	// the system apparmor profile of snap-confine.
 	c.Assert(os.MkdirAll(apparmor_sandbox.ConfDir, 0755), IsNil)
-	c.Assert(ioutil.WriteFile(profilePath, []byte(""), 0644), IsNil)
+	c.Assert(os.WriteFile(profilePath, []byte(""), 0644), IsNil)
 
 	// Setup generated policy for snap-confine.
 	err := (&apparmor.Backend{}).Initialize(ifacetest.DefaultInitializeOpts)
@@ -1879,11 +2028,13 @@ func (s *backendSuite) testSetupSnapConfineGeneratedPolicyWithBPFCapability(c *C
 
 	// Capability bpf is supported by the parser, so an extra policy file
 	// for snap-confine is present
-	files, err := ioutil.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
+	files, err := os.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
 	c.Assert(err, IsNil)
 	c.Assert(files, HasLen, 1)
 	c.Assert(files[0].Name(), Equals, "cap-bpf")
-	c.Assert(files[0].Mode(), Equals, os.FileMode(0644))
+	fi, err := files[0].Info()
+	c.Assert(err, IsNil)
+	c.Assert(fi.Mode().Perm(), Equals, os.FileMode(0644))
 	c.Assert(files[0].IsDir(), Equals, false)
 
 	c.Assert(filepath.Join(apparmor_sandbox.SnapConfineAppArmorDir, files[0].Name()),
@@ -1919,7 +2070,7 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithBPFProbeError(c *C
 	defer restore()
 	restore = osutil.MockIsRootWritableOverlay(func() (string, error) { return "", nil })
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 	// Probing for apparmor_parser features failed
 	apparmor_sandbox.MockFeatures(nil, nil, nil, fmt.Errorf("mock probe error"))
@@ -1939,7 +2090,7 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithBPFProbeError(c *C
 	// Create the directory where system apparmor profiles are stored and write
 	// the system apparmor profile of snap-confine.
 	c.Assert(os.MkdirAll(apparmor_sandbox.ConfDir, 0755), IsNil)
-	c.Assert(ioutil.WriteFile(profilePath, []byte(""), 0644), IsNil)
+	c.Assert(os.WriteFile(profilePath, []byte(""), 0644), IsNil)
 
 	// Setup generated policy for snap-confine.
 	err = (&apparmor.Backend{}).Initialize(ifacetest.DefaultInitializeOpts)
@@ -1947,7 +2098,7 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithBPFProbeError(c *C
 
 	// Probing apparmor_parser capabilities failed, so nothing gets written
 	// to the snap-confine policy directory
-	files, err := ioutil.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
+	files, err := os.ReadDir(apparmor_sandbox.SnapConfineAppArmorDir)
 	c.Assert(err, IsNil)
 	c.Assert(files, HasLen, 0)
 
@@ -1958,46 +2109,46 @@ func (s *backendSuite) TestSetupSnapConfineGeneratedPolicyWithBPFProbeError(c *C
 	c.Assert(log.String(), testutil.Contains, "cannot determine apparmor_parser features: mock probe error")
 }
 
-type nfsAndOverlaySnippetsScenario struct {
-	opts           interfaces.ConfinementOptions
-	overlaySnippet string
-	nfsSnippet     string
+type remoteFSAndOverlaySnippetsScenario struct {
+	opts            interfaces.ConfinementOptions
+	overlaySnippet  string
+	remoteFSSnippet string
 }
 
-var nfsAndOverlaySnippetsScenarios = []nfsAndOverlaySnippetsScenario{{
+var remoteFSAndOverlaySnippetsScenarios = []remoteFSAndOverlaySnippetsScenario{{
 	// By default apparmor is enforcing mode.
-	opts:           interfaces.ConfinementOptions{},
-	overlaySnippet: `"/upper/{,**/}" r,`,
-	nfsSnippet:     "network inet,\n  network inet6,",
+	opts:            interfaces.ConfinementOptions{},
+	overlaySnippet:  `"/upper/{,**/}" r,`,
+	remoteFSSnippet: "network inet,\n  network inet6,",
 }, {
 	// DevMode switches apparmor to non-enforcing (complain) mode.
-	opts:           interfaces.ConfinementOptions{DevMode: true},
-	overlaySnippet: `"/upper/{,**/}" r,`,
-	nfsSnippet:     "network inet,\n  network inet6,",
+	opts:            interfaces.ConfinementOptions{DevMode: true},
+	overlaySnippet:  `"/upper/{,**/}" r,`,
+	remoteFSSnippet: "network inet,\n  network inet6,",
 }, {
 	// JailMode switches apparmor to enforcing mode even in the presence of DevMode.
-	opts:           interfaces.ConfinementOptions{DevMode: true, JailMode: true},
-	overlaySnippet: `"/upper/{,**/}" r,`,
-	nfsSnippet:     "network inet,\n  network inet6,",
+	opts:            interfaces.ConfinementOptions{DevMode: true, JailMode: true},
+	overlaySnippet:  `"/upper/{,**/}" r,`,
+	remoteFSSnippet: "network inet,\n  network inet6,",
 }, {
 	// Classic confinement (without jailmode) uses apparmor in complain mode by default and ignores all snippets.
-	opts:           interfaces.ConfinementOptions{Classic: true},
-	overlaySnippet: "",
-	nfsSnippet:     "",
+	opts:            interfaces.ConfinementOptions{Classic: true},
+	overlaySnippet:  "",
+	remoteFSSnippet: "",
 }, {
 	// Classic confinement in JailMode uses enforcing apparmor.
 	opts: interfaces.ConfinementOptions{Classic: true, JailMode: true},
 	// FIXME: logic in backend.addContent is wrong for this case
 	//overlaySnippet: `"/upper/{,**/}" r,`,
-	//nfsSnippet: "network inet,\n  network inet6,",
-	overlaySnippet: "",
-	nfsSnippet:     "",
+	//remoteFSSnippet: "network inet,\n  network inet6,",
+	overlaySnippet:  "",
+	remoteFSSnippet: "",
 }}
 
-func (s *backendSuite) TestNFSAndOverlaySnippets(c *C) {
+func (s *backendSuite) TestRemoteFSAndOverlaySnippets(c *C) {
 	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return true, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return true, nil })
 	defer restore()
 	restore = osutil.MockIsRootWritableOverlay(func() (string, error) { return "/upper", nil })
 	defer restore()
@@ -2005,18 +2156,18 @@ func (s *backendSuite) TestNFSAndOverlaySnippets(c *C) {
 		return nil
 	}
 
-	for _, scenario := range nfsAndOverlaySnippetsScenarios {
+	for _, scenario := range remoteFSAndOverlaySnippetsScenarios {
 		snapInfo := s.InstallSnap(c, scenario.opts, "", ifacetest.SambaYamlV1, 1)
 		profile := filepath.Join(dirs.SnapAppArmorDir, "snap.samba.smbd")
 		c.Check(profile, testutil.FileContains, scenario.overlaySnippet)
-		c.Check(profile, testutil.FileContains, scenario.nfsSnippet)
+		c.Check(profile, testutil.FileContains, scenario.remoteFSSnippet)
 		updateNSProfile := filepath.Join(dirs.SnapAppArmorDir, "snap-update-ns.samba")
 		c.Check(updateNSProfile, testutil.FileContains, scenario.overlaySnippet)
 		s.RemoveSnap(c, snapInfo)
 	}
 }
 
-var casperOverlaySnippetsScenarios = []nfsAndOverlaySnippetsScenario{{
+var casperOverlaySnippetsScenarios = []remoteFSAndOverlaySnippetsScenario{{
 	// By default apparmor is enforcing mode.
 	opts:           interfaces.ConfinementOptions{},
 	overlaySnippet: `"/upper/{,**/}" r,`,
@@ -2043,7 +2194,7 @@ var casperOverlaySnippetsScenarios = []nfsAndOverlaySnippetsScenario{{
 func (s *backendSuite) TestCasperOverlaySnippets(c *C) {
 	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 	restore = osutil.MockIsRootWritableOverlay(func() (string, error) { return "/upper", nil })
 	defer restore()
@@ -2126,7 +2277,7 @@ func (s *backendSuite) TestPtraceTraceRule(c *C) {
 	defer restoreTemplate()
 	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 
 	needle := `deny ptrace (trace),`
@@ -2248,12 +2399,13 @@ func (s *backendSuite) TestPtraceTraceRule(c *C) {
 		}
 
 		snapInfo := s.InstallSnap(c, tc.opts, "", ifacetest.SambaYamlV1, 1)
+		appSet := interfaces.NewSnapAppSet(snapInfo)
 
-		err := s.Backend.Setup(snapInfo, tc.opts, s.Repo, s.meas)
+		err := s.Backend.Setup(appSet, tc.opts, s.Repo, s.meas)
 		c.Assert(err, IsNil)
 
 		profile := filepath.Join(dirs.SnapAppArmorDir, "snap.samba.smbd")
-		data, err := ioutil.ReadFile(profile)
+		data, err := os.ReadFile(profile)
 		c.Assert(err, IsNil)
 
 		if tc.expected {
@@ -2270,7 +2422,7 @@ func (s *backendSuite) TestHomeIxRule(c *C) {
 	defer restoreTemplate()
 	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
 	defer restore()
-	restore = osutil.MockIsHomeUsingNFS(func() (bool, error) { return false, nil })
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
 	defer restore()
 
 	for _, tc := range []struct {
@@ -2299,10 +2451,51 @@ func (s *backendSuite) TestHomeIxRule(c *C) {
 
 		snapInfo := s.InstallSnap(c, tc.opts, "", ifacetest.SambaYamlV1, 1)
 		profile := filepath.Join(dirs.SnapAppArmorDir, "snap.samba.smbd")
-		data, err := ioutil.ReadFile(profile)
+		data, err := os.ReadFile(profile)
 		c.Assert(err, IsNil)
 
 		c.Assert(string(data), testutil.Contains, tc.expected)
+		s.RemoveSnap(c, snapInfo)
+	}
+}
+
+func (s *backendSuite) TestPycacheDenyRule(c *C) {
+	restoreTemplate := apparmor.MockTemplate("template\n###PYCACHEDENY###\n")
+	defer restoreTemplate()
+	restore := apparmor_sandbox.MockLevel(apparmor_sandbox.Full)
+	defer restore()
+	restore = osutil.MockIsHomeUsingRemoteFS(func() (bool, error) { return false, nil })
+	defer restore()
+
+	for _, tc := range []struct {
+		opts     interfaces.ConfinementOptions
+		suppress bool
+		expected Checker
+	}{
+		{
+			opts:     interfaces.ConfinementOptions{},
+			suppress: true,
+			expected: Not(testutil.Contains),
+		},
+		{
+			opts:     interfaces.ConfinementOptions{},
+			suppress: false,
+			expected: testutil.Contains,
+		},
+	} {
+		s.Iface.AppArmorPermanentSlotCallback = func(spec *apparmor.Specification, slot *snap.SlotInfo) error {
+			if tc.suppress {
+				spec.SetSuppressPycacheDeny()
+			}
+			return nil
+		}
+
+		snapInfo := s.InstallSnap(c, tc.opts, "", ifacetest.SambaYamlV1, 1)
+		profile := filepath.Join(dirs.SnapAppArmorDir, "snap.samba.smbd")
+		data, err := os.ReadFile(profile)
+		c.Assert(err, IsNil)
+
+		c.Assert(string(data), tc.expected, "deny /usr/lib/python3*/{,**/}__pycache__/ w,")
 		s.RemoveSnap(c, snapInfo)
 	}
 }
@@ -2324,7 +2517,7 @@ apps:
 
 	snapInfo := s.InstallSnap(c, interfaces.ConfinementOptions{}, "", snapYaml, 1)
 	profile := filepath.Join(dirs.SnapAppArmorDir, "snap.app.cmd")
-	data, err := ioutil.ReadFile(profile)
+	data, err := os.ReadFile(profile)
 	c.Assert(err, IsNil)
 	c.Assert(string(data), testutil.Contains, "capability setuid,")
 	c.Assert(string(data), testutil.Contains, "capability setgid,")
@@ -2347,7 +2540,7 @@ apps:
 
 	snapInfo := s.InstallSnap(c, interfaces.ConfinementOptions{}, "", snapYaml, 1)
 	profile := filepath.Join(dirs.SnapAppArmorDir, "snap.app.cmd")
-	data, err := ioutil.ReadFile(profile)
+	data, err := os.ReadFile(profile)
 	c.Assert(err, IsNil)
 	c.Assert(string(data), Not(testutil.Contains), "capability setuid,")
 	c.Assert(string(data), Not(testutil.Contains), "capability setgid,")
@@ -2407,6 +2600,8 @@ func (s *backendSuite) TestSetupManyInPreseedMode(c *C) {
 	for _, opts := range testedConfinementOpts {
 		snapInfo1 := s.InstallSnap(c, opts, "", ifacetest.SambaYamlV1, 1)
 		snapInfo2 := s.InstallSnap(c, opts, "", ifacetest.SomeSnapYamlV1, 1)
+		appSet1 := interfaces.NewSnapAppSet(snapInfo1)
+		appSet2 := interfaces.NewSnapAppSet(snapInfo2)
 		s.loadProfilesCalls = nil
 
 		snap1nsProfile := filepath.Join(dirs.SnapAppArmorDir, "snap-update-ns.samba")
@@ -2415,12 +2610,12 @@ func (s *backendSuite) TestSetupManyInPreseedMode(c *C) {
 		snap2AAprofile := filepath.Join(dirs.SnapAppArmorDir, "snap.some-snap.someapp")
 
 		// simulate outdated profiles by changing their data on the disk
-		c.Assert(ioutil.WriteFile(snap1AAprofile, []byte("# an outdated profile"), 0644), IsNil)
-		c.Assert(ioutil.WriteFile(snap2AAprofile, []byte("# an outdated profile"), 0644), IsNil)
+		c.Assert(os.WriteFile(snap1AAprofile, []byte("# an outdated profile"), 0644), IsNil)
+		c.Assert(os.WriteFile(snap2AAprofile, []byte("# an outdated profile"), 0644), IsNil)
 
 		setupManyInterface, ok := s.Backend.(interfaces.SecurityBackendSetupMany)
 		c.Assert(ok, Equals, true)
-		err := setupManyInterface.SetupMany([]*snap.Info{snapInfo1, snapInfo2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
+		err := setupManyInterface.SetupMany([]*interfaces.SnapAppSet{appSet1, appSet2}, func(snapName string) interfaces.ConfinementOptions { return opts }, s.Repo, s.meas)
 		c.Assert(err, IsNil)
 
 		// expect two batch executions - one for changed profiles, second for unchanged profiles.
