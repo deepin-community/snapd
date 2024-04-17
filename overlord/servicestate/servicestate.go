@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -43,11 +44,94 @@ import (
 )
 
 type Instruction struct {
-	Action string   `json:"action"`
-	Names  []string `json:"names"`
+	Action string               `json:"action"`
+	Names  []string             `json:"names"`
+	Scope  client.ScopeSelector `json:"scope"`
+	Users  client.UserSelector  `json:"users"`
 	client.StartOptions
 	client.StopOptions
 	client.RestartOptions
+}
+
+func (i *Instruction) ServiceScope() wrappers.ServiceScope {
+	var hasUser, hasSystem bool
+	for _, opt := range i.Scope {
+		switch opt {
+		case "user":
+			hasUser = true
+		case "system":
+			hasSystem = true
+		}
+	}
+	switch {
+	case hasSystem && !hasUser:
+		return wrappers.ServiceScopeSystem
+	case hasUser && !hasSystem:
+		return wrappers.ServiceScopeUser
+	default:
+		return wrappers.ServiceScopeAll
+	}
+}
+
+func (i *Instruction) hasUserService(apps []*snap.AppInfo) bool {
+	for _, app := range apps {
+		if app.IsService() && app.DaemonScope == snap.UserDaemon {
+			return true
+		}
+	}
+	return false
+}
+
+// EnsureDefaultScopeForUser sets up default scopes based on the type of user
+// if none were provided.
+// Make sure to call Instruction.Validate() before calling this.
+func (i *Instruction) EnsureDefaultScopeForUser(u *user.User) {
+	// Set default scopes if not provided
+	if len(i.Scope) == 0 {
+		// If root is making this request, implied scopes are all
+		if u.Uid == "0" {
+			i.Scope = client.ScopeSelector{"system", "user"}
+		} else {
+			// Otherwise imply the service scope only
+			i.Scope = client.ScopeSelector{"system"}
+		}
+	}
+}
+
+func (i *Instruction) validateScope(u *user.User, apps []*snap.AppInfo) error {
+	if len(i.Scope) == 0 {
+		// Providing no scope is only an issue for non-root users if the
+		// target is user-daemons.
+		if u.Uid != "0" && i.hasUserService(apps) {
+			return fmt.Errorf("non-root users must specify service scope when targeting user services")
+		}
+	}
+	return nil
+}
+
+func (i *Instruction) validateUsers(u *user.User, apps []*snap.AppInfo) error {
+	// Perform some additional user checks
+	if i.Users.Selector == client.UserSelectionList && len(i.Users.Names) == 0 {
+		// It is an error for a non-root to not specify any users if we are targeting
+		// user daemons
+		if u.Uid != "0" && i.hasUserService(apps) {
+			return fmt.Errorf("non-root users must specify users when targeting user services")
+		}
+	}
+	return nil
+}
+
+// Validate validates the some of the data members in the Instruction. Currently
+// this validates user-list and scope. This should only be called once when the structure
+// is initialized/deserialized.
+func (i *Instruction) Validate(u *user.User, apps []*snap.AppInfo) error {
+	if err := i.validateScope(u, apps); err != nil {
+		return err
+	}
+	if err := i.validateUsers(u, apps); err != nil {
+		return err
+	}
+	return nil
 }
 
 type ServiceActionConflictError struct{ error }
@@ -75,7 +159,7 @@ func computeExplicitServices(appInfos []*snap.AppInfo, names []string) map[strin
 }
 
 // serviceControlTs creates "service-control" task for every snap derived from appInfos.
-func serviceControlTs(st *state.State, appInfos []*snap.AppInfo, inst *Instruction) (*state.TaskSet, error) {
+func serviceControlTs(st *state.State, appInfos []*snap.AppInfo, inst *Instruction, cu *user.User) (*state.TaskSet, error) {
 	servicesBySnap := make(map[string][]string, len(appInfos))
 	explicitServices := computeExplicitServices(appInfos, inst.Names)
 	sortedNames := make([]string, 0, len(appInfos))
@@ -101,7 +185,18 @@ func serviceControlTs(st *state.State, appInfos []*snap.AppInfo, inst *Instructi
 			return nil, err
 		}
 
-		cmd := &ServiceAction{SnapName: snapName}
+		users, err := inst.Users.UserList(cu)
+		if err != nil {
+			return nil, err
+		}
+
+		cmd := &ServiceAction{
+			SnapName: snapName,
+			ScopeOptions: wrappers.ScopeOptions{
+				Scope: inst.ServiceScope(),
+				Users: users,
+			},
+		}
 		switch {
 		case inst.Action == "start":
 			cmd.Action = "start"
@@ -167,7 +262,7 @@ type Flags struct {
 // The appInfos and inst define the services and the command to execute.
 // Context is used to determine change conflicts - we will not conflict with
 // tasks from same change as that of context's.
-func Control(st *state.State, appInfos []*snap.AppInfo, inst *Instruction, flags *Flags, context *hookstate.Context) ([]*state.TaskSet, error) {
+func Control(st *state.State, appInfos []*snap.AppInfo, inst *Instruction, cu *user.User, flags *Flags, context *hookstate.Context) ([]*state.TaskSet, error) {
 	var tts []*state.TaskSet
 	var ctlcmds []string
 
@@ -237,7 +332,7 @@ func Control(st *state.State, appInfos []*snap.AppInfo, inst *Instruction, flags
 
 	// XXX: serviceControlTs could be merged with above logic at the cost of
 	// slightly more complicated logic.
-	ts, err := serviceControlTs(st, appInfos, inst)
+	ts, err := serviceControlTs(st, appInfos, inst, cu)
 	if err != nil {
 		return nil, err
 	}
@@ -265,6 +360,18 @@ func NewStatusDecorator(rep interface {
 		sysd:           systemd.New(systemd.SystemMode, rep),
 		globalUserSysd: systemd.New(systemd.GlobalUserMode, rep),
 	}
+}
+
+func (sd *StatusDecorator) hasEnabledActivator(appInfo *client.AppInfo) bool {
+	// Just one activator should be enabled in order for the service to be able
+	// to become enabled. For slot activated services this is always true as we
+	// have no way currently of disabling this.
+	for _, act := range appInfo.Activators {
+		if act.Enabled {
+			return true
+		}
+	}
+	return false
 }
 
 // DecorateWithStatus adds service status information to the given
@@ -355,7 +462,12 @@ func (sd *StatusDecorator) DecorateWithStatus(appInfo *client.AppInfo, snapApp *
 			Type:    "dbus",
 		})
 	}
-
+	// For activated services, the service tends to be reported as Static, meaning
+	// it can't be disabled. However, if all the activators are disabled, then we change
+	// this to appear disabled.
+	if len(appInfo.Activators) > 0 {
+		appInfo.Enabled = sd.hasEnabledActivator(appInfo)
+	}
 	return nil
 }
 

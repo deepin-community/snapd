@@ -21,7 +21,7 @@ package main_test
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -59,7 +59,7 @@ func writeSeqFile(c *C, name string, current snap.Revision, seq []*snap.SideInfo
 	})
 	c.Assert(err, IsNil)
 
-	err = ioutil.WriteFile(seqPath, b, 0644)
+	err = os.WriteFile(seqPath, b, 0644)
 	c.Assert(err, IsNil)
 }
 
@@ -73,9 +73,15 @@ func (r *failureSuite) TestCallPrevSnapdFromSnap(c *C) {
 		{Revision: snap.R(123)},
 	})
 
+	mockScript := `
+set -eu
+
+[ -L '%[1]s/snapd/current' ]
+[ "$(readlink '%[1]s/snapd/current')" = 100 ]
+[ "${SNAPD_REVERT_TO_REV}" = 100 ]
+`
 	// mock snapd command from 'previous' revision
-	snapdCmd := testutil.MockCommand(c, filepath.Join(dirs.SnapMountDir, "snapd", "100", "/usr/lib/snapd/snapd"),
-		`test "$SNAPD_REVERT_TO_REV" = "100"`)
+	snapdCmd := testutil.MockCommand(c, filepath.Join(dirs.SnapMountDir, "snapd", "100", "/usr/lib/snapd/snapd"), fmt.Sprintf(mockScript, dirs.SnapMountDir))
 	defer snapdCmd.Restore()
 
 	systemctlCmd := testutil.MockCommand(c, "systemctl", "")
@@ -165,9 +171,9 @@ fi
 	// mock the sockets re-appearing
 	err := os.MkdirAll(filepath.Dir(dirs.SnapdSocket), 0755)
 	c.Assert(err, IsNil)
-	err = ioutil.WriteFile(dirs.SnapdSocket, nil, 0755)
+	err = os.WriteFile(dirs.SnapdSocket, nil, 0755)
 	c.Assert(err, IsNil)
-	err = ioutil.WriteFile(dirs.SnapSocket, nil, 0755)
+	err = os.WriteFile(dirs.SnapSocket, nil, 0755)
 	c.Assert(err, IsNil)
 
 	os.Args = []string{"snap-failure", "snapd"}
@@ -338,7 +344,7 @@ func (r *failureSuite) TestGarbageSeq(c *C) {
 	err := os.MkdirAll(dirs.SnapSeqDir, 0755)
 	c.Assert(err, IsNil)
 
-	err = ioutil.WriteFile(seqPath, []byte("this is garbage"), 0644)
+	err = os.WriteFile(seqPath, []byte("this is garbage"), 0644)
 	c.Assert(err, IsNil)
 
 	snapdCmd := testutil.MockCommand(c, filepath.Join(dirs.SnapMountDir, "snapd", "100", "/usr/lib/snapd/snapd"),
@@ -421,7 +427,7 @@ func (r *failureSuite) TestStickySnapdSocket(c *C) {
 
 	err := os.MkdirAll(filepath.Dir(dirs.SnapdSocket), 0755)
 	c.Assert(err, IsNil)
-	err = ioutil.WriteFile(dirs.SnapdSocket, []byte{}, 0755)
+	err = os.WriteFile(dirs.SnapdSocket, []byte{}, 0755)
 	c.Assert(err, IsNil)
 
 	// mock snapd in the core snap

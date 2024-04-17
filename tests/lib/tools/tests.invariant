@@ -104,6 +104,11 @@ check_stray_dbus_daemon() {
 			if [ "$user" = "external" ]; then
 				continue
 			fi
+                        # On qemu backend, sudo from user "ubuntu" is used. So the session
+                        # for user "ubuntu" is expected to exist.
+			if [ "$user" = "ubuntu" ]; then
+				continue
+			fi
 			# Report stray dbus-daemon.
 			failed+=("pid:$pid user:$user cmdline:$cmdline")
 		done
@@ -186,7 +191,7 @@ check_cgroup_scopes() {
 check_segmentation_violations() {
 	n="$1" # invariant name
 
-	"$TESTSTOOLS"/journal-state get-log -unit snapd | grep "segmentation violation" > "$TESTSTMP/tests.invariant.$n"
+	"$TESTSTOOLS"/journal-state get-log -u snapd | grep "segmentation violation" > "$TESTSTMP/tests.invariant.$n"
 	if [ -s "$TESTSTMP/tests.invariant.$n" ]; then
 		echo "tests.invariant: segmentation violation found" >&2
 		cat "$TESTSTMP/tests.invariant.$n" >&2
