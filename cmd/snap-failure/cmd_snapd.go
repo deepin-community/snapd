@@ -112,7 +112,6 @@ var (
 	restartSnapdCoolOffWait = 12500 * time.Millisecond
 )
 
-// FIXME: also do error reporting via errtracker
 func (c *cmdSnapd) Execute(args []string) error {
 	var snapdPath string
 	// find previous the snapd snap
@@ -140,12 +139,22 @@ func (c *cmdSnapd) Execute(args []string) error {
 	}
 	logger.Noticef("stopping snapd socket")
 	// stop the socket unit so that we can start snapd on its own
-	output, err := exec.Command("systemctl", "stop", "snapd.socket").CombinedOutput()
+	stdout, stderr, err := osutil.RunSplitOutput("systemctl", "stop", "snapd.socket")
 	if err != nil {
-		return osutil.OutputErr(output, err)
+		return osutil.OutputErrCombine(stdout, stderr, err)
 	}
 
 	logger.Noticef("restoring invoking snapd from: %v", snapdPath)
+	if prevRev != "0" {
+		// if prevRev was "0" it means we did *not* find a
+		// previous revision and we would obey the current
+		// symlink. So we overwrite the symlink only if
+		// prevRev != "0".
+		currentSymlink := filepath.Join(dirs.SnapMountDir, "snapd", "current")
+		if err := osutil.AtomicSymlink(prevRev, currentSymlink); err != nil {
+			return fmt.Errorf("cannot create symlink %s: %v", currentSymlink, err)
+		}
+	}
 	// start previous snapd
 	cmd := runCmd(snapdPath, nil, []string{"SNAPD_REVERT_TO_REV=" + prevRev, "SNAPD_DEBUG=1"})
 	if err = cmd.Run(); err != nil {
