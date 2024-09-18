@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2021 Canonical Ltd
+ * Copyright (C) 2014-2023 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -29,7 +29,9 @@ import (
 
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/image"
+	"github.com/snapcore/snapd/interfaces/builtin"
 	"github.com/snapcore/snapd/seed/seedwriter"
+	"github.com/snapcore/snapd/snap"
 )
 
 type cmdPrepareImage struct {
@@ -53,6 +55,7 @@ type cmdPrepareImage struct {
 
 	// TODO: introduce SnapWithChannel?
 	Snaps              []string `long:"snap" value-name:"<snap>[=<channel>]"`
+	Components         []string `long:"comp" value-name:"<snap>+<comp>"`
 	ExtraSnaps         []string `long:"extra-snaps" hidden:"yes"` // DEPRECATED
 	RevisionsFile      string   `long:"revisions"`
 	WriteRevisionsFile string   `long:"write-revisions" optional:"true" optional-value:"./seed.manifest"`
@@ -86,6 +89,8 @@ For preparing classic images it supports a --classic mode`),
 			// TRANSLATORS: This should not start with a lowercase letter.
 			"snap": i18n.G("Include the given snap from the store or a local file and/or specify the channel to track for the given snap"),
 			// TRANSLATORS: This should not start with a lowercase letter.
+			"comp": i18n.G("Include the given component from the store or a local file"),
+			// TRANSLATORS: This should not start with a lowercase letter.
 			"extra-snaps": i18n.G("Extra snaps to be installed (DEPRECATED)"),
 			// TRANSLATORS: This should not start with a lowercase letter.
 			"revisions": i18n.G("Specify a seeds.manifest file referencing the exact revisions of the provided snaps which should be installed"),
@@ -114,8 +119,14 @@ var imagePrepare = image.Prepare
 var seedwriterReadManifest = seedwriter.ReadManifest
 
 func (x *cmdPrepareImage) Execute(args []string) error {
+	// plug/slot sanitization is disabled (no-op) by default at the package
+	// level for "snap" command, for seed/seedwriter used by image however
+	// we want real validation.
+	snap.SanitizePlugsSlots = builtin.SanitizePlugsSlots
+
 	opts := &image.Options{
 		Snaps:            x.ExtraSnaps,
+		Components:       x.Components,
 		ModelFile:        x.Positional.ModelAssertionFn,
 		Channel:          x.Channel,
 		Architecture:     x.Architecture,

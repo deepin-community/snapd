@@ -21,40 +21,27 @@ package backend
 
 import (
 	"os"
-	"os/exec"
 
+	"github.com/snapcore/snapd/kernel"
 	"github.com/snapcore/snapd/osutil/sys"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/testutil"
 	"github.com/snapcore/snapd/wrappers"
 )
 
 var (
-	AddMountUnit    = addMountUnit
-	RemoveMountUnit = removeMountUnit
-	RemoveIfEmpty   = removeIfEmpty
+	AddMountUnit       = addMountUnit
+	RemoveMountUnit    = removeMountUnit
+	RemoveIfEmpty      = removeIfEmpty
+	SnapDataDirs       = snapDataDirs
+	SnapCommonDataDirs = snapCommonDataDirs
 )
 
-func MockWrappersAddSnapdSnapServices(f func(s *snap.Info, opts *wrappers.AddSnapdSnapServicesOptions, inter wrappers.Interacter) error) (restore func()) {
+func MockWrappersAddSnapdSnapServices(f func(s *snap.Info, opts *wrappers.AddSnapdSnapServicesOptions, inter wrappers.Interacter) (wrappers.SnapdRestart, error)) (restore func()) {
 	old := wrappersAddSnapdSnapServices
 	wrappersAddSnapdSnapServices = f
 	return func() {
 		wrappersAddSnapdSnapServices = old
-	}
-}
-
-func MockUpdateFontconfigCaches(f func() error) (restore func()) {
-	oldUpdateFontconfigCaches := updateFontconfigCaches
-	updateFontconfigCaches = f
-	return func() {
-		updateFontconfigCaches = oldUpdateFontconfigCaches
-	}
-}
-
-func MockCommandFromSystemSnap(f func(string, ...string) (*exec.Cmd, error)) (restore func()) {
-	old := commandFromSystemSnap
-	commandFromSystemSnap = f
-	return func() {
-		commandFromSystemSnap = old
 	}
 }
 
@@ -72,4 +59,8 @@ func MockMkdirAllChown(f func(string, os.FileMode, sys.UserID, sys.GroupID) erro
 	return func() {
 		mkdirAllChown = old
 	}
+}
+
+func MockKernelEnsureKernelDriversTree(f func(kMntPts kernel.MountPoints, compsMntPts []kernel.ModulesCompMountPoints, destDir string, opts *kernel.KernelDriversTreeOptions) (err error)) func() {
+	return testutil.Mock(&kernelEnsureKernelDriversTree, f)
 }

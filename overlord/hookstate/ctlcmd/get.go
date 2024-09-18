@@ -21,15 +21,22 @@ package ctlcmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/interfaces"
+	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/configstate"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/hookstate"
+	"github.com/snapcore/snapd/overlord/ifacestate/ifacerepo"
+	"github.com/snapcore/snapd/overlord/registrystate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/registry"
+	"github.com/snapcore/snapd/snap"
 )
 
 type getCommand struct {
@@ -38,6 +45,7 @@ type getCommand struct {
 	// these two options are mutually exclusive
 	ForceSlotSide bool `long:"slot" description:"return attribute values from the slot side of the connection"`
 	ForcePlugSide bool `long:"plug" description:"return attribute values from the plug side of the connection"`
+	View          bool `long:"view" description:"return registry values from the view declared in the plug"`
 
 	Positional struct {
 		PlugOrSlotSpec string   `positional-args:"true" positional-arg-name:":<plug|slot>"`
@@ -103,9 +111,15 @@ func (c *getCommand) printValues(getByKey func(string) (interface{}, bool, error
 		}
 	}
 
+	return c.printPatch(patch)
+}
+
+func (c *getCommand) printPatch(patch interface{}) error {
 	var confToPrint interface{} = patch
 	if !c.Document && len(c.Positional.Keys) == 1 {
-		confToPrint = patch[c.Positional.Keys[0]]
+		if confMap, ok := patch.(map[string]interface{}); ok {
+			confToPrint = confMap[c.Positional.Keys[0]]
+		}
 	}
 
 	if c.Typed && confToPrint == nil {
@@ -134,7 +148,7 @@ func (c *getCommand) printValues(getByKey func(string) (interface{}, bool, error
 
 func (c *getCommand) Execute(args []string) error {
 	if len(c.Positional.Keys) == 0 && c.Positional.PlugOrSlotSpec == "" {
-		return fmt.Errorf(i18n.G("get which option?"))
+		return errors.New(i18n.G("get which option?"))
 	}
 
 	context, err := c.ensureContext()
@@ -155,10 +169,15 @@ func (c *getCommand) Execute(args []string) error {
 		if snap != "" {
 			return fmt.Errorf(`"snapctl get %s" not supported, use "snapctl get :%s" instead`, c.Positional.PlugOrSlotSpec, parts[1])
 		}
-		if len(c.Positional.Keys) == 0 {
-			return fmt.Errorf(i18n.G("get which attribute?"))
+		// registry views can be read without fields
+		if !c.View && len(c.Positional.Keys) == 0 {
+			return errors.New(i18n.G("get which attribute?"))
 		}
 
+		if c.View {
+			requests := c.Positional.Keys
+			return c.getRegistryValues(context, name, requests)
+		}
 		return c.getInterfaceSetting(context, name)
 	}
 
@@ -250,7 +269,7 @@ func validatePlugOrSlot(attrsTask *state.Task, plugSide bool, plugOrSlot string)
 		}
 	}
 	if err != nil {
-		return fmt.Errorf(i18n.G("internal error: cannot find plug or slot data in the appropriate task"))
+		return errors.New(i18n.G("internal error: cannot find plug or slot data in the appropriate task"))
 	}
 	if name != plugOrSlot {
 		return fmt.Errorf(i18n.G("unknown plug or slot %q"), plugOrSlot)
@@ -271,7 +290,7 @@ func attributesTask(context *hookstate.Context) (*state.Task, error) {
 
 	attrsTask := st.Task(attrsTaskID)
 	if attrsTask == nil {
-		return nil, fmt.Errorf(i18n.G("internal error: cannot find attrs task"))
+		return nil, errors.New(i18n.G("internal error: cannot find attrs task"))
 	}
 
 	return attrsTask, nil
@@ -281,11 +300,10 @@ func (c *getCommand) getInterfaceSetting(context *hookstate.Context, plugOrSlot 
 	// Make sure get :<plug|slot> is only supported during the execution of interface hooks
 	hookType, err := interfaceHookType(context.HookName())
 	if err != nil {
-		return fmt.Errorf(i18n.G("interface attributes can only be read during the execution of interface hooks"))
+		return errors.New(i18n.G("interface attributes can only be read during the execution of interface hooks"))
 	}
 
-	var attrsTask *state.Task
-	attrsTask, err = attributesTask(context)
+	attrsTask, err := attributesTask(context)
 	if err != nil {
 		return err
 	}
@@ -337,4 +355,63 @@ func (c *getCommand) getInterfaceSetting(context *hookstate.Context, plugOrSlot 
 		}
 		return nil, false, err
 	})
+}
+
+func (c *getCommand) getRegistryValues(ctx *hookstate.Context, plugName string, requests []string) error {
+	if c.ForcePlugSide || c.ForceSlotSide {
+		return errors.New(i18n.G("cannot use --plug or --slot with --view"))
+	}
+	ctx.Lock()
+	defer ctx.Unlock()
+
+	view, err := getRegistryView(ctx, plugName)
+	if err != nil {
+		return fmt.Errorf("cannot get registry: %v", err)
+	}
+
+	tx, err := registrystate.RegistryTransaction(ctx, view.Registry())
+	if err != nil {
+		return err
+	}
+
+	res, err := registrystate.GetViaViewInTx(tx, view, requests)
+	if err != nil {
+		return err
+	}
+
+	return c.printPatch(res)
+}
+
+func getRegistryView(ctx *hookstate.Context, plugName string) (*registry.View, error) {
+	repo := ifacerepo.Get(ctx.State())
+
+	plug := repo.Plug(ctx.InstanceName(), plugName)
+	if plug == nil {
+		return nil, fmt.Errorf(i18n.G("cannot find plug :%s for snap %q"), plugName, ctx.InstanceName())
+	}
+
+	if plug.Interface != "registry" {
+		return nil, fmt.Errorf(i18n.G("cannot use --view with non-registry plug :%s"), plugName)
+	}
+
+	account, registryName, viewName, err := snap.RegistryPlugAttrs(plug)
+	if err != nil {
+		return nil, fmt.Errorf(i18n.G("invalid plug :%s: %w"), plugName, err)
+	}
+
+	registryAssert, err := assertstate.Registry(ctx.State(), account, registryName)
+	if err != nil {
+		if errors.Is(err, &asserts.NotFoundError{}) {
+			return nil, fmt.Errorf(i18n.G("registry assertion %s/%s not found"), account, registryName)
+		}
+		return nil, err
+	}
+	reg := registryAssert.Registry()
+
+	view := reg.View(viewName)
+	if view == nil {
+		return nil, fmt.Errorf(i18n.G("view %q not found in registry %s/%s"), viewName, account, registryName)
+	}
+
+	return view, nil
 }

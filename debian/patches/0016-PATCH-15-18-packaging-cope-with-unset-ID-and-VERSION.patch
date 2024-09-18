@@ -1,0 +1,28 @@
+From: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+Date: Thu, 30 May 2024 11:45:20 +0200
+Subject: packaging: cope with unset ID and VERSION_ID
+
+There is no guarantee that ID and VERSION_ID are set in /etc/os-release.
+Provide defaults for ID and VERSION_ID so that spread runs with _some_ system
+name. Spread rejects system names with two consecutive dashes, so use a
+special-case for unset VERSION_ID since we know it is used in a context of the
+Debian archive.
+
+Signed-off-by: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+---
+ packaging/debian-sid/tests/integrationtests | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/packaging/debian-sid/tests/integrationtests b/packaging/debian-sid/tests/integrationtests
+index eee0d33..3751b71 100644
+--- a/packaging/debian-sid/tests/integrationtests
++++ b/packaging/debian-sid/tests/integrationtests
+@@ -44,7 +44,7 @@ snap install --classic go
+ . /etc/os-release
+ export GOPATH=/tmp/go
+ /snap/bin/go install github.com/snapcore/spread/cmd/spread@latest
+-/tmp/go/bin/spread -v "autopkgtest:${ID}-${VERSION_ID}-$(dpkg --print-architecture)":tests/smoke/
++/tmp/go/bin/spread -v "autopkgtest:${ID:-linux}-${VERSION_ID:-sid}-$(dpkg --print-architecture)":tests/smoke/
+ 
+ # store journal info for inspectsion
+ journalctl --sync

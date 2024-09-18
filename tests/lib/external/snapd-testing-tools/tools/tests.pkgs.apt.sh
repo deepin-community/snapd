@@ -22,6 +22,15 @@ remap_one() {
         test-snapd-pkg-2)
             echo "robotfindskitten"
             ;;
+        test-snapd-pkg-3)
+            if os.query is-debian || os.query is-trusty; then
+                echo cpp:i386
+            elif os.query is-xenial || os.query is-bionic; then
+                echo cpp-5:i386
+            else
+                echo cpp-9:i386
+            fi
+            ;;
         *)
             echo "$1"
             ;;
@@ -30,12 +39,25 @@ remap_one() {
 
 cmd_install() {
     apt-get update
-    # shellcheck disable=SC2068
-    apt-get install --yes $@
+
+    local APT_FLAGS="--yes"
+    while [ -n "$1" ]; do
+        case "$1" in
+            --no-install-recommends)
+                APT_FLAGS="$APT_FLAGS --no-install-recommends"
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    # shellcheck disable=SC2086
+    apt-get install $APT_FLAGS "$@"
 }
 
 cmd_is_installed() {
-    dpkg -S "$1" >/dev/null 2>&1
+    dpkg -l "$1" | grep -E "ii +$1" >/dev/null 2>&1
 }
 
 cmd_query() {
@@ -43,10 +65,17 @@ cmd_query() {
 }
 
 cmd_list_installed() {
-    apt list --installed | cut -d/ -f1 | sort
+    apt list --installed | cut -d ' ' -f 1,3 | sed -e 's@/.*\s@:@g' | sort
 }
 
 cmd_remove() {
-    # shellcheck disable=SC2068
-    apt-get remove --yes $@
+    # Allow removing essential packages, that may get installed when using i386
+    # packages on amd64 system. Normally they would be really essential but in
+    # this case they are not really as essential.
+    local REMOVE_FLAGS="--allow-remove-essential"
+    if os.query is-trusty; then
+        REMOVE_FLAGS=""
+    fi
+    # shellcheck disable=SC2086
+    apt-get remove --yes $REMOVE_FLAGS "$@"
 }

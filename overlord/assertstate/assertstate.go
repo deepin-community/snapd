@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2019 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -33,6 +33,7 @@ import (
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/registry"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
 )
@@ -385,7 +386,68 @@ func AutoRefreshAssertions(s *state.State, userID int) error {
 	if err := RefreshSnapDeclarations(s, userID, opts); err != nil {
 		return err
 	}
-	return RefreshValidationSetAssertions(s, userID, opts)
+	if err := RefreshValidationSetAssertions(s, userID, opts); err != nil {
+		return err
+	}
+
+	return autoRefreshRegistryAssertions(s, userID, opts)
+}
+
+// autoRefreshRegistryAssertions fetches the newest revision of all stored
+// registry assertions.
+func autoRefreshRegistryAssertions(st *state.State, userID int, opts *RefreshAssertionsOptions) error {
+	db := cachedDB(st)
+	regAsserts, err := db.FindMany(asserts.RegistryType, nil)
+	if err != nil {
+		if errors.Is(err, &asserts.NotFoundError{}) {
+			return nil
+		}
+		return err
+	}
+
+	var registries []*registry.Registry
+	for _, regAs := range regAsserts {
+		reg := regAs.(*asserts.Registry).Registry()
+		registries = append(registries, reg)
+	}
+
+	return refreshRegistryAssertions(st, registries, userID, opts)
+}
+
+// refreshRegistryAssertions fetches new revisions for the registry assertions
+// referenced by the provided registries. It attempts a bulk refresh and if that
+// fails, it falls back to fetching the assertions one by one.
+func refreshRegistryAssertions(st *state.State, registries []*registry.Registry, userID int, opts *RefreshAssertionsOptions) error {
+	if opts == nil {
+		opts = &RefreshAssertionsOptions{}
+	}
+
+	deviceCtx, err := snapstate.DevicePastSeeding(st, nil)
+	if err != nil {
+		return err
+	}
+
+	err = bulkRefreshRegistries(st, registries, userID, deviceCtx, opts)
+	if err == nil {
+		return nil
+	}
+
+	if _, ok := err.(*bulkAssertionFallbackError); !ok {
+		// not an error that indicates the server rejecting/failing
+		// the bulk request itself
+		return err
+	}
+	logger.Noticef("bulk refresh of registry assertions failed, falling back to one-by-one assertion fetching: %v", err)
+
+	return doFetch(st, userID, deviceCtx, nil, func(f asserts.Fetcher) error {
+		for _, registry := range registries {
+			if err := snapasserts.FetchRegistry(f, registry.Account, registry.Name); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 }
 
 // RefreshSnapAssertions tries to refresh all snap-centered assertions
@@ -486,7 +548,7 @@ func RefreshValidationSetAssertions(s *state.State, userID int, opts *RefreshAss
 
 			vsass, ok := as.(*asserts.ValidationSet)
 			if !ok {
-				return fmt.Errorf("internal error: unexpected assertion type %s for %s", vsass.Type().Name, ValidationSetKey(vs.AccountID, vs.Name))
+				return fmt.Errorf("internal error: unexpected assertion type %s for %s", as.Type().Name, ValidationSetKey(vs.AccountID, vs.Name))
 			}
 			if err := vsets.Add(vsass); err != nil {
 				return fmt.Errorf("internal error: cannot check validation sets conflicts: %v", err)
@@ -1128,4 +1190,117 @@ func MonitorValidationSet(st *state.State, accountID, name string, sequence int,
 func TemporaryDB(st *state.State) *asserts.Database {
 	db := cachedDB(st)
 	return db.WithStackedBackstore(asserts.NewMemoryBackstore())
+}
+
+// FetchValidationSetsOptions contains options for FetchValidationSets.
+type FetchValidationSetsOptions struct {
+	// Offline should be set to true if the store should not be accessed. Any
+	// assertions will be retrieved from the existing assertions database. If
+	// the assertions are not present in the database, an error will be
+	// returned.
+	Offline bool
+}
+
+// FetchValidationSets fetches the given validation set assertions from either
+// the store or the existing assertions database. The validation sets are added
+// to a snapasserts.ValidationSets, checked for any conflicts, and returned.
+func FetchValidationSets(st *state.State, toFetch []*asserts.AtSequence, opts FetchValidationSetsOptions, deviceCtx snapstate.DeviceContext) (*snapasserts.ValidationSets, error) {
+	var sets []*asserts.ValidationSet
+	save := func(a asserts.Assertion) error {
+		if vs, ok := a.(*asserts.ValidationSet); ok {
+			sets = append(sets, vs)
+		}
+
+		if err := Add(st, a); err != nil {
+			if err, ok := err.(*asserts.RevisionError); ok {
+				logger.Noticef("assertion not added due to same or newer revision already present: %d", err.Current)
+				return nil
+			}
+			return err
+		}
+
+		return nil
+	}
+
+	db := DB(st)
+
+	store := snapstate.Store(st, deviceCtx)
+
+	retrieve := func(ref *asserts.Ref) (asserts.Assertion, error) {
+		if opts.Offline {
+			return ref.Resolve(db.Find)
+		}
+
+		st.Unlock()
+		defer st.Lock()
+
+		return store.Assertion(ref.Type, ref.PrimaryKey, nil)
+	}
+
+	retrieveSeq := func(ref *asserts.AtSequence) (asserts.Assertion, error) {
+		if opts.Offline {
+			return resolveValidationSetAssertion(ref, db)
+		}
+
+		st.Unlock()
+		defer st.Lock()
+
+		return store.SeqFormingAssertion(ref.Type, ref.SequenceKey, ref.Sequence, nil)
+	}
+
+	fetcher := asserts.NewSequenceFormingFetcher(db, retrieve, retrieveSeq, save)
+
+	for _, vs := range toFetch {
+		if err := fetcher.FetchSequence(vs); err != nil {
+			return nil, err
+		}
+	}
+
+	vSets := snapasserts.NewValidationSets()
+	for _, vs := range sets {
+		vSets.Add(vs)
+	}
+
+	if err := vSets.Conflict(); err != nil {
+		return nil, err
+	}
+
+	return vSets, nil
+}
+
+// ValidationSetsFromModel takes in a model and creates a
+// snapasserts.ValidationSets from any validation sets that the model includes.
+func ValidationSetsFromModel(st *state.State, model *asserts.Model, opts FetchValidationSetsOptions, deviceCtx snapstate.DeviceContext) (*snapasserts.ValidationSets, error) {
+	toFetch := make([]*asserts.AtSequence, 0, len(model.ValidationSets()))
+	for _, vs := range model.ValidationSets() {
+		toFetch = append(toFetch, vs.AtSequence())
+	}
+
+	return FetchValidationSets(st, toFetch, opts, deviceCtx)
+}
+
+func resolveValidationSetAssertion(seq *asserts.AtSequence, db asserts.RODatabase) (asserts.Assertion, error) {
+	if seq.Sequence <= 0 {
+		hdrs, err := asserts.HeadersFromSequenceKey(seq.Type, seq.SequenceKey)
+		if err != nil {
+			return nil, err
+		}
+		return db.FindSequence(seq.Type, hdrs, -1, seq.Type.MaxSupportedFormat())
+	}
+	return seq.Resolve(db.Find)
+}
+
+// Registry returns the registry for the given account and registry name,
+// if it's present in the system assertion database.
+func Registry(s *state.State, account, registryName string) (*asserts.Registry, error) {
+	db := DB(s)
+	as, err := db.Find(asserts.RegistryType, map[string]string{
+		"account-id": account,
+		"name":       registryName,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return as.(*asserts.Registry), nil
 }

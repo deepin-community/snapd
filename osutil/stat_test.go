@@ -21,7 +21,6 @@ package osutil_test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,7 +41,7 @@ func (ts *StatTestSuite) TestFileDoesNotExist(c *C) {
 
 func (ts *StatTestSuite) TestFileExistsSimple(c *C) {
 	fname := filepath.Join(c.MkDir(), "foo")
-	err := ioutil.WriteFile(fname, []byte(fname), 0644)
+	err := os.WriteFile(fname, []byte(fname), 0644)
 	c.Assert(err, IsNil)
 
 	c.Assert(osutil.FileExists(fname), Equals, true)
@@ -50,7 +49,7 @@ func (ts *StatTestSuite) TestFileExistsSimple(c *C) {
 
 func (ts *StatTestSuite) TestFileExistsExistsOddPermissions(c *C) {
 	fname := filepath.Join(c.MkDir(), "foo")
-	err := ioutil.WriteFile(fname, []byte(fname), 0100)
+	err := os.WriteFile(fname, []byte(fname), 0100)
 	c.Assert(err, IsNil)
 
 	c.Assert(osutil.FileExists(fname), Equals, true)
@@ -88,7 +87,7 @@ func (ts *StatTestSuite) TestExecutableExists(c *C) {
 	c.Check(osutil.ExecutableExists("xyzzy"), Equals, false)
 
 	fname := filepath.Join(d, "xyzzy")
-	c.Assert(ioutil.WriteFile(fname, []byte{}, 0644), IsNil)
+	c.Assert(os.WriteFile(fname, []byte{}, 0644), IsNil)
 	c.Check(osutil.ExecutableExists("xyzzy"), Equals, false)
 
 	c.Assert(os.Chmod(fname, 0755), IsNil)
@@ -121,7 +120,7 @@ func makeTestPathInDir(c *C, dir, path string, mode os.FileMode) string {
 	} else {
 		// request for a file
 		c.Assert(os.MkdirAll(filepath.Dir(path), 0755), IsNil)
-		c.Assert(ioutil.WriteFile(path, nil, mode), IsNil)
+		c.Assert(os.WriteFile(path, nil, mode), IsNil)
 	}
 
 	return path
@@ -232,7 +231,7 @@ func (ts *StatTestSuite) TestIsExecutable(c *C) {
 		err := os.Remove(p)
 		c.Check(err == nil || os.IsNotExist(err), Equals, true)
 
-		err = ioutil.WriteFile(p, []byte(""), tc.mode)
+		err = os.WriteFile(p, []byte(""), tc.mode)
 		c.Assert(err, IsNil)
 		c.Check(osutil.IsExecutable(p), Equals, tc.is)
 	}
@@ -281,7 +280,7 @@ func (ts *StatTestSuite) TestRegularFileExists(c *C) {
 				c.Assert(err, IsNil, comment)
 			} else {
 				// make it a normal file
-				err := ioutil.WriteFile(fullpath, nil, 0644)
+				err := os.WriteFile(fullpath, nil, 0644)
 				c.Assert(err, IsNil, comment)
 			}
 		}
@@ -294,4 +293,72 @@ func (ts *StatTestSuite) TestRegularFileExists(c *C) {
 		c.Assert(exists, Equals, t.expExists, comment)
 		c.Assert(isReg, Equals, t.expIsReg, comment)
 	}
+}
+
+func (ts *StatTestSuite) TestComparePathsByDeviceInodeHappy(c *C) {
+	base := c.MkDir()
+
+	// Same file
+	path_a := filepath.Join(base, "file-a")
+	c.Assert(os.WriteFile(path_a, nil, 0644), IsNil)
+	match, err := osutil.ComparePathsByDeviceInode(path_a, path_a)
+	c.Assert(err, IsNil)
+	c.Assert(match, Equals, true)
+
+	// Different files
+	path_b := filepath.Join(base, "file-b")
+	c.Assert(os.WriteFile(path_b, nil, 0644), IsNil)
+	match, err = osutil.ComparePathsByDeviceInode(path_a, path_b)
+	c.Assert(err, IsNil)
+	c.Assert(match, Equals, false)
+
+	// Same directory
+	match, err = osutil.ComparePathsByDeviceInode(base, base)
+	c.Assert(err, IsNil)
+	c.Assert(match, Equals, true)
+
+	// Different directories
+	path_a = filepath.Join(base, "dir-a")
+	c.Assert(os.Mkdir(path_a, 0644), IsNil)
+	match, err = osutil.ComparePathsByDeviceInode(base, path_a)
+	c.Assert(err, IsNil)
+	c.Assert(match, Equals, false)
+
+	// Symlink to directory and directory
+	path_b = filepath.Join(base, "symlink-to-dir-a")
+	c.Assert(os.Symlink(path_a, path_b), IsNil)
+	match, err = osutil.ComparePathsByDeviceInode(path_b, path_b)
+	c.Assert(err, IsNil)
+	c.Assert(match, Equals, true)
+
+	// Different symlinks to same directory
+	path_c := filepath.Join(base, "another-symlink-to-dir-a")
+	c.Assert(os.Symlink(path_a, path_c), IsNil)
+	match, err = osutil.ComparePathsByDeviceInode(path_b, path_c)
+	c.Assert(err, IsNil)
+	c.Assert(match, Equals, true)
+
+	// Path including symlink to directory and directory
+	path_a = filepath.Join(base, "dir-b/dir-c/dir-e/dir-f")
+	c.Assert(os.MkdirAll(path_a, 0755), IsNil)
+	path_b = filepath.Join(base, "dir-b/dir-c")
+	path_c = filepath.Join(base, "symlink-to-dir-c")
+	c.Assert(os.Symlink(path_b, path_c), IsNil)
+	match, err = osutil.ComparePathsByDeviceInode(path_a, filepath.Join(path_c, "dir-e/dir-f"))
+	c.Assert(err, IsNil)
+	c.Assert(match, Equals, true)
+}
+
+func (ts *StatTestSuite) TestComparePathsByDeviceInodeErrorPathNotExist(c *C) {
+	base := c.MkDir()
+
+	// Path a does not exist
+	match, err := osutil.ComparePathsByDeviceInode(filepath.Join(base, "missing-dir"), base)
+	c.Assert(err, ErrorMatches, "*: no such file or directory")
+	c.Assert(match, Equals, false)
+
+	// Path b does not exist
+	match, err = osutil.ComparePathsByDeviceInode(base, filepath.Join(base, "missing-dir"))
+	c.Assert(err, ErrorMatches, "*: no such file or directory")
+	c.Assert(match, Equals, false)
 }

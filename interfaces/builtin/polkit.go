@@ -22,15 +22,17 @@ package builtin
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/polkit"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/polkit/validate"
 	"github.com/snapcore/snapd/snap"
+	"golang.org/x/sys/unix"
 )
 
 const polkitSummary = `allows access to polkitd to check authorisation`
@@ -95,7 +97,7 @@ func (iface *polkitInterface) getActionPrefix(attribs interfaces.Attrer) (string
 }
 
 func loadPolkitPolicy(filename, actionPrefix string) (polkit.Policy, error) {
-	content, err := ioutil.ReadFile(filename)
+	content, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf(`cannot read file %q: %v`, filename, err)
 	}
@@ -148,12 +150,42 @@ func (iface *polkitInterface) BeforePreparePlug(plug *snap.PlugInfo) error {
 	return err
 }
 
+var (
+	// polkitDaemonPath1 is the path of polkitd on core<24.
+	polkitDaemonPath1 = "/usr/libexec/polkitd"
+	// polkitDaemonPath2 is the path of polkid on core>=24.
+	polkitDaemonPath2 = "/usr/lib/polkit-1/polkitd"
+)
+
+// hasPolkitDaemonExecutable checks known paths on core for the presence of
+// the polkit daemon executable. This function can be shortened but keep it like
+// this for readability.
+func hasPolkitDaemonExecutable() bool {
+	return osutil.IsExecutable(polkitDaemonPath1) || osutil.IsExecutable(polkitDaemonPath2)
+}
+
+func canWriteToPolkitActionsDir() bool {
+	return unix.Access(dirs.SnapPolkitPolicyDir, unix.W_OK) == nil
+}
+
+func polkitPoliciesSupported() bool {
+	// We must have the polkit daemon present on the system and be able to write
+	// to the polkit actions directory.
+	return hasPolkitDaemonExecutable() && canWriteToPolkitActionsDir()
+}
+
+func (iface *polkitInterface) StaticInfo() interfaces.StaticInfo {
+	info := iface.commonInterface.StaticInfo()
+	info.ImplicitOnCore = polkitPoliciesSupported()
+	return info
+}
+
 func init() {
 	registerIface(&polkitInterface{
 		commonInterface{
-			name:                  "polkit",
-			summary:               polkitSummary,
-			implicitOnCore:        osutil.IsExecutable("/usr/libexec/polkitd"),
+			name:    "polkit",
+			summary: polkitSummary,
+			// implicitOnCore is computed dynamically
 			implicitOnClassic:     true,
 			baseDeclarationPlugs:  polkitBaseDeclarationPlugs,
 			baseDeclarationSlots:  polkitBaseDeclarationSlots,

@@ -20,6 +20,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/jessevdk/go-flags"
@@ -47,11 +48,11 @@ recovery system.
 When called without a system label and without a mode it will just
 trigger a regular reboot.
 
-When called without a system label but with a mode it will use the
-current system to enter the given mode.
+When called without a label, the current system will be used for "run" mode. The
+default recovery system will be used for "recover", "factory-reset" and
+"install" modes.
 
-Note that "recover", "factory-reset" and "run" modes are only available for the
-current system.
+Note that the "run" mode is only available for the current system.
 `)
 
 func init() {
@@ -92,7 +93,7 @@ func (x *cmdReboot) modeFromCommandline() (string, error) {
 			continue
 		}
 		if mode != "" {
-			return "", fmt.Errorf(i18n.G("Please specify a single mode"))
+			return "", errors.New(i18n.G("Please specify a single mode"))
 		}
 		mode = arg.mode
 	}
@@ -122,7 +123,7 @@ func (x *cmdReboot) Execute(args []string) error {
 	case mode != "":
 		fmt.Fprintf(Stdout, i18n.G("Reboot into %q mode.\n"), mode)
 	default:
-		fmt.Fprintf(Stdout, i18n.G("Reboot\n"))
+		fmt.Fprint(Stdout, i18n.G("Reboot\n"))
 	}
 
 	return nil

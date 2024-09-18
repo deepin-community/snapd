@@ -231,7 +231,7 @@ func validateInfoAndFlags(info *snap.Info, snapst *SnapState, flags Flags) error
 var openSnapFile = backend.OpenSnapFile
 
 func validateContainer(c snap.Container, s *snap.Info, logf func(format string, v ...interface{})) error {
-	err := snap.ValidateContainer(c, s, logf)
+	err := snap.ValidateSnapContainer(c, s, logf)
 	if err == nil {
 		return nil
 	}
@@ -469,10 +469,14 @@ func earlyEpochCheck(info *snap.Info, snapst *SnapState) error {
 	return checkEpochs(nil, info, cur, nil, Flags{}, nil)
 }
 
-func earlyChecks(st *state.State, snapst *SnapState, update *snap.Info, flags Flags) (Flags, error) {
+func earlyChecks(st *state.State, snapst *SnapState, update *snap.Info, comps []snap.ComponentSideInfo, flags Flags) (Flags, error) {
 	flags, err := ensureInstallPreconditions(st, update, flags, snapst)
 	if err != nil {
 		return flags, err
+	}
+
+	if err := ensureSnapAndComponentsAssertionStatus(update.SideInfo, comps); err != nil {
+		return Flags{}, err
 	}
 
 	if err := earlyEpochCheck(update, snapst); err != nil {
@@ -481,8 +485,22 @@ func earlyChecks(st *state.State, snapst *SnapState, update *snap.Info, flags Fl
 	return flags, nil
 }
 
+func ensureSnapAndComponentsAssertionStatus(si snap.SideInfo, comps []snap.ComponentSideInfo) error {
+	snapAsserted := si.SnapID != ""
+	for _, comp := range comps {
+		compAsserted := comp.Revision.Store()
+		if snapAsserted && !compAsserted {
+			return errors.New("cannot mix asserted snap and unasserted components")
+		}
+		if !snapAsserted && compAsserted {
+			return errors.New("cannot mix unasserted snap and asserted components")
+		}
+	}
+	return nil
+}
+
 // check that the listed system users are valid
-var osutilEnsureUserGroup = osutil.EnsureUserGroup
+var osutilEnsureSnapUserGroup = osutil.EnsureSnapUserGroup
 
 func validateSystemUsernames(si *snap.Info) error {
 	for _, user := range si.SystemUsernames {
@@ -553,12 +571,12 @@ func checkAndCreateSystemUsernames(si *snap.Info) error {
 			// base (see above)
 			rangeStart := id & 0xFFFF0000
 			rangeName := fmt.Sprintf("snapd-range-%d-root", rangeStart)
-			if err := osutilEnsureUserGroup(rangeName, rangeStart, extrausers); err != nil {
+			if err := osutilEnsureSnapUserGroup(rangeName, rangeStart, extrausers); err != nil {
 				return fmt.Errorf(`cannot ensure users for snap %q required system username "%s": %v`, si.InstanceName(), user.Name, err)
 			}
 
 			// Create the requested user and group
-			if err := osutilEnsureUserGroup(user.Name, id, extrausers); err != nil {
+			if err := osutilEnsureSnapUserGroup(user.Name, id, extrausers); err != nil {
 				return fmt.Errorf(`cannot ensure users for snap %q required system username "%s": %v`, si.InstanceName(), user.Name, err)
 			}
 		}

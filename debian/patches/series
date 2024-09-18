@@ -1,5 +1,16 @@
 0003-cmd-snap-seccomp-skip-tests-that-use-m32.patch
 0004-cmd-snap-skip-tests-depending-on-text-wrapping.patch
-0005-advisor-errtracker-use-upstream-bolt-package.patch
 0007-i18n-use-dummy-localizations-to-avoid-dependencies.patch
 0010-man-page-sections.patch
+0009-PATCH-08-18-packaging-set-LANG-C.utf-8-during-tests.patch
+0010-PATCH-09-18-packaging-add-source-lintian-overrides-f.patch
+0011-PATCH-10-18-packaging-rewrite-lintian-overrides.patch
+0012-PATCH-11-18-packaging-spread.yaml-use-needs-sudo-to-.patch
+0013-PATCH-12-18-packaging-and-needs-internet-test-restri.patch
+0014-PATCH-13-18-packaging-use-go-install-to-install-spre.patch
+0015-PATCH-14-18-packaging-do-not-hard-code-the-ubuntu-us.patch
+0016-PATCH-15-18-packaging-cope-with-unset-ID-and-VERSION.patch
+0017-PATCH-16-18-spread.yaml-add-autopkgtest-entries-for-.patch
+0018-PATCH-17-18-packaging-update-to-compat-level-13.patch
+0021-PATCH-tests-create-test-user-for-autopkgtests.patch
+0022-tests-enable-the-snapd-socket-in-autopkgtest.patch

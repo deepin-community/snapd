@@ -20,13 +20,13 @@
 package main
 
 import (
-	"fmt"
+	"errors"
 	"strings"
 
 	"github.com/jessevdk/go-flags"
 
+	"github.com/snapcore/snapd/client/clientutil"
 	"github.com/snapcore/snapd/i18n"
-	"github.com/snapcore/snapd/jsonutil"
 )
 
 var shortSetHelp = i18n.G("Change configuration options")
@@ -46,6 +46,12 @@ Configuration option may be unset with exclamation mark:
     $ snap set snap-name author!
 `)
 
+var longRegistrySetHelp = i18n.G(`
+If the first argument passed into set is a registry identifier matching the
+format <account-id>/<registry>/<view>, set will use the registry API. In this
+case, the command sets the values as provided for the dot-separated view paths.
+`)
+
 type cmdSet struct {
 	waitMixin
 	Positional struct {
@@ -58,6 +64,10 @@ type cmdSet struct {
 }
 
 func init() {
+	if err := validateRegistryFeatureFlag(); err == nil {
+		longSetHelp += longRegistrySetHelp
+	}
+
 	addCommand("set", shortSetHelp, longSetHelp, func() flags.Commander { return &cmdSet{} },
 		waitDescs.also(map[string]string{
 			// TRANSLATORS: This should not start with a lowercase letter.
@@ -78,50 +88,59 @@ func init() {
 		})
 }
 
-func (x *cmdSet) Execute(args []string) error {
+func (x *cmdSet) Execute([]string) error {
 	if x.String && x.Typed {
-		return fmt.Errorf(i18n.G("cannot use -t and -s together"))
+		return errors.New(i18n.G("cannot use -t and -s together"))
 	}
 
-	patchValues := make(map[string]interface{})
-	for _, patchValue := range x.Positional.ConfValues {
-		parts := strings.SplitN(patchValue, "=", 2)
-		if len(parts) == 1 && strings.HasSuffix(patchValue, "!") {
-			patchValues[strings.TrimSuffix(patchValue, "!")] = nil
-			continue
-		}
-		if len(parts) != 2 {
-			return fmt.Errorf(i18n.G("invalid configuration: %q (want key=value)"), patchValue)
-		}
-
-		if x.String {
-			patchValues[parts[0]] = parts[1]
-		} else {
-			var value interface{}
-			if err := jsonutil.DecodeWithNumber(strings.NewReader(parts[1]), &value); err != nil {
-				if x.Typed {
-					return fmt.Errorf("failed to parse JSON: %w", err)
-				}
-
-				// Not valid JSON-- just save the string as-is.
-				patchValues[parts[0]] = parts[1]
-			} else {
-				patchValues[parts[0]] = value
-			}
-		}
-	}
-
-	snapName := string(x.Positional.Snap)
-	id, err := x.client.SetConf(snapName, patchValues)
+	opts := &clientutil.ParseConfigOptions{String: x.String, Typed: x.Typed}
+	patchValues, _, err := clientutil.ParseConfigValues(x.Positional.ConfValues, opts)
 	if err != nil {
 		return err
 	}
 
-	if _, err := x.wait(id); err != nil {
+	snapName := string(x.Positional.Snap)
+	var chgID string
+	if isRegistryViewID(snapName) {
+		if err := validateRegistryFeatureFlag(); err != nil {
+			return err
+		}
+
+		// first argument is a registryViewID, use the registry API
+		registryViewID := snapName
+		if err := validateRegistryViewID(registryViewID); err != nil {
+			return err
+		}
+
+		chgID, err = x.client.RegistrySetViaView(registryViewID, patchValues)
+	} else {
+		chgID, err = x.client.SetConf(snapName, patchValues)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if _, err := x.wait(chgID); err != nil {
 		if err == noWait {
 			return nil
 		}
 		return err
+	}
+
+	return nil
+}
+
+func isRegistryViewID(s string) bool {
+	return len(strings.Split(s, "/")) == 3
+}
+
+func validateRegistryViewID(id string) error {
+	parts := strings.Split(id, "/")
+	for _, part := range parts {
+		if part == "" {
+			return errors.New(i18n.G("registry identifier must conform to format: <account-id>/<registry>/<view>"))
+		}
 	}
 
 	return nil

@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2020 Canonical Ltd
+ * Copyright (C) 2020-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -30,6 +30,7 @@ import (
 	"github.com/snapcore/snapd/asserts/snapasserts"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/registry"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/store"
 )
@@ -139,6 +140,26 @@ func bulkRefreshSnapDeclarations(s *state.State, snapStates map[string]*snapstat
 	}
 
 	return nil
+}
+
+func bulkRefreshRegistries(s *state.State, registries []*registry.Registry, userID int, deviceCtx snapstate.DeviceContext, opts *RefreshAssertionsOptions) error {
+	db := cachedDB(s)
+
+	// all assertion refs will be in the same group
+	pool := asserts.NewPool(db, maxGroups)
+	for _, registry := range registries {
+		account, name := registry.Account, registry.Name
+		ref := &asserts.Ref{
+			Type:       asserts.RegistryType,
+			PrimaryKey: []string{account, name},
+		}
+
+		if err := pool.AddToUpdate(ref, storeGroup); err != nil {
+			return fmt.Errorf("cannot prepare registry assertion %s/%s for refresh: %v", account, name, err)
+		}
+	}
+
+	return resolvePool(s, pool, nil, userID, deviceCtx, opts)
 }
 
 func bulkRefreshValidationSetAsserts(s *state.State, vsets map[string]*ValidationSetTracking, beforeCommitChecker func(*asserts.Database, asserts.Backstore) error, userID int, deviceCtx snapstate.DeviceContext, opts *RefreshAssertionsOptions) error {
@@ -256,7 +277,7 @@ func resolvePool(s *state.State, pool *asserts.Pool, checkBeforeCommit func(*ass
 	unsupported := handleUnsupported(db)
 
 	for {
-		storeOpts := &store.RefreshOptions{IsAutoRefresh: opts.IsAutoRefresh}
+		storeOpts := &store.RefreshOptions{Scheduled: opts.IsAutoRefresh}
 		s.Unlock()
 		_, aresults, err := sto.SnapAction(context.TODO(), nil, nil, pool, user, storeOpts)
 		s.Lock()

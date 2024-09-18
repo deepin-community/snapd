@@ -23,6 +23,7 @@ package seedwriter
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/snapcore/snapd/asserts"
@@ -65,15 +66,25 @@ func (opts *Options) manifest() *Manifest {
 	return opts.Manifest
 }
 
-// OptionsSnap represents an options-referred snap with its option values.
-// E.g. a snap passed to ubuntu-image via --snap.
-// If Name is set the snap is from the store. If Path is set the snap
-// is local at Path location.
+// OptionsComponent represents an options-referred snap with its option values.
+// E.g. a component passed to ubuntu-image via --comp <snap_name>+<comp_name>.
+type OptionsComponent struct {
+	Name string
+	// Path is set when a file is passed around.
+	Path string
+}
+
+// OptionsSnap represents an options-referred snap with its option values. E.g.
+// a snap passed to ubuntu-image via --snap. If Name is set the snap is from
+// the store. If Path is set the snap is local at Path location. Components are
+// the components passed via the --comp option. If there is a component option
+// but no matching snap option, an implicit OptionsSnap is created.
 type OptionsSnap struct {
-	Name    string
-	SnapID  string
-	Path    string
-	Channel string
+	Name       string
+	SnapID     string
+	Path       string
+	Channel    string
+	Components []OptionsComponent
 }
 
 func (s *OptionsSnap) SnapName() string {
@@ -84,6 +95,19 @@ func (s *OptionsSnap) ID() string {
 	return s.SnapID
 }
 
+func (s *OptionsSnap) Component(compName string) *OptionsComponent {
+	for _, optComp := range s.Components {
+		if optComp.Name == compName {
+			return &optComp
+		}
+	}
+	return nil
+}
+
+func (s *OptionsSnap) HasComponent(compName string) bool {
+	return s.Component(compName) != nil
+}
+
 var _ naming.SnapRef = (*OptionsSnap)(nil)
 
 // SeedSnap holds details of a snap being added to a seed.
@@ -92,6 +116,11 @@ type SeedSnap struct {
 	Channel string
 	Path    string
 
+	// Components are the components of the snap to be copied to the seed.
+	// If using local components, the slice will be set by
+	// Writer.AddComponentsToSnap(), as we don't know initially which ones
+	// are being included in this way.
+	Components []SeedComponent
 	// Info is the *snap.Info for the seed snap, filling this is
 	// delegated to the Writer using code, via Writer.SetInfo.
 	Info *snap.Info
@@ -104,6 +133,14 @@ type SeedSnap struct {
 	local      bool
 	modelSnap  *asserts.ModelSnap
 	optionSnap *OptionsSnap
+}
+
+// SeedComponent holds details of a component being added to a seed.
+type SeedComponent struct {
+	naming.ComponentRef
+	Path string
+
+	Info *snap.ComponentInfo
 }
 
 func (sn *SeedSnap) modes() []string {
@@ -201,6 +238,7 @@ type Writer struct {
 
 	availableSnaps  *naming.SnapSet
 	availableByMode map[string]*naming.SnapSet
+	byModeSnaps     map[string][]*SeedSnap
 
 	// toDownload tracks which set of snaps SnapsToDownload should compute
 	// next
@@ -236,8 +274,6 @@ type policy interface {
 
 	checkBase(s *snap.Info, modes []string, availableByMode map[string]*naming.SnapSet) error
 
-	checkAvailable(snpRef naming.SnapRef, modes []string, availableByMode map[string]*naming.SnapSet) bool
-
 	checkClassicSnap(sn *SeedSnap) error
 
 	needsImplicitSnaps(availableByMode map[string]*naming.SnapSet) (bool, error)
@@ -252,8 +288,10 @@ type tree interface {
 	mkFixedDirs() error
 
 	snapPath(*SeedSnap) (string, error)
+	componentPath(*SeedSnap, *SeedComponent) (string, error)
 
 	localSnapPath(*SeedSnap) (string, error)
+	localComponentPath(*SeedComponent) (string, error)
 
 	writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Ref, snapsFromModel []*SeedSnap, extraSnaps []*SeedSnap) error
 
@@ -380,6 +418,26 @@ func (w *Writer) warningf(format string, a ...interface{}) {
 	w.warnings = append(w.warnings, fmt.Sprintf(format, a...))
 }
 
+func validateComponent(optComp *OptionsComponent) error {
+	if optComp.Name != "" {
+		if optComp.Path != "" {
+			return fmt.Errorf("cannot specify both name and path for component %q",
+				optComp.Name)
+		}
+		if err := snap.ValidateName(optComp.Name); err != nil {
+			return err
+		}
+	} else {
+		if !strings.HasSuffix(optComp.Path, ".comp") {
+			return fmt.Errorf("local option component %q does not end in .comp", optComp.Path)
+		}
+		if !osutil.FileExists(optComp.Path) {
+			return fmt.Errorf("local option component %q does not exist", optComp.Path)
+		}
+	}
+	return nil
+}
+
 // SetOptionsSnaps accepts options-referred snaps represented as OptionsSnap.
 func (w *Writer) SetOptionsSnaps(optSnaps []*OptionsSnap) error {
 	if err := w.checkStep(setOptionsSnapsStep); err != nil {
@@ -428,6 +486,11 @@ func (w *Writer) SetOptionsSnaps(optSnaps []*OptionsSnap) error {
 				return fmt.Errorf("cannot use option channel for snap %q: %v", whichSnap, err)
 			}
 			if err := w.policy.checkSnapChannel(ch, whichSnap); err != nil {
+				return err
+			}
+		}
+		for _, comp := range sn.Components {
+			if err := validateComponent(&comp); err != nil {
 				return err
 			}
 		}
@@ -653,9 +716,11 @@ func (w *Writer) InfoDerived() error {
 	return nil
 }
 
-// SetInfo sets Info of the SeedSnap and possibly computes its
-// destination Path.
-func (w *Writer) SetInfo(sn *SeedSnap, info *snap.Info) error {
+// SetInfo sets info and seedComps (which is a map of component names
+// to SeedComponent) in the SeedSnap sn and computes destination paths
+// for all if coming from the store. If the components do not come
+// from the store, some additional checks are performed.
+func (w *Writer) SetInfo(sn *SeedSnap, info *snap.Info, seedComps map[string]*SeedComponent) error {
 	if info.NeedsDevMode() {
 		if err := w.policy.allowsDangerousFeatures(); err != nil {
 			return err
@@ -665,8 +730,22 @@ func (w *Writer) SetInfo(sn *SeedSnap, info *snap.Info) error {
 
 	if sn.local {
 		sn.SnapRef = info
-		// nothing more to do
-		return nil
+		return w.assignLocalComponents(sn, seedComps)
+	}
+
+	for i := range sn.Components {
+		seedComp, ok := seedComps[sn.Components[i].ComponentName]
+		if !ok {
+			return fmt.Errorf("store did not return information about %s",
+				sn.Components[i].ComponentName)
+		}
+		sn.Components[i] = *seedComp
+		// Fill the path as this is a non-local component
+		compPath, err := w.tree.componentPath(sn, &sn.Components[i])
+		if err != nil {
+			return err
+		}
+		sn.Components[i].Path = compPath
 	}
 
 	p, err := w.tree.snapPath(sn)
@@ -674,6 +753,38 @@ func (w *Writer) SetInfo(sn *SeedSnap, info *snap.Info) error {
 		return err
 	}
 	sn.Path = p
+
+	return nil
+}
+
+type byCompName []SeedComponent
+
+func (c byCompName) Len() int           { return len(c) }
+func (c byCompName) Less(i, j int) bool { return c[i].ComponentName < c[j].ComponentName }
+func (c byCompName) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
+
+func (w *Writer) assignLocalComponents(sn *SeedSnap, seedComps map[string]*SeedComponent) error {
+	for _, seedComp := range seedComps {
+		// Check if the component is defined by the snap
+		compInSnap, ok := sn.Info.Components[seedComp.ComponentName]
+		if !ok {
+			return fmt.Errorf("component %s is not defined by snap %s",
+				seedComp.ComponentName, sn.SnapName())
+		}
+		// and if types match
+		if compInSnap.Type != seedComp.Info.Type {
+			return fmt.Errorf("component %s has type %s while snap %s defines type %s for it",
+				seedComp.ComponentName, seedComp.Info.Type,
+				sn.SnapName(), compInSnap.Type)
+		}
+
+		// now we can add to the snap
+		sn.Components = append(sn.Components, *seedComp)
+	}
+
+	// Sort for deterministic download order and tests
+	sort.Sort(byCompName(sn.Components))
+
 	return nil
 }
 
@@ -727,11 +838,41 @@ func (w *Writer) modelSnapToSeed(modSnap *asserts.ModelSnap) (*SeedSnap, error) 
 			// by an OptionsSnap entry is skipped
 			return nil, errSkipOptional
 		}
+		seedCompsMap := make(map[string]SeedComponent, len(modSnap.Components))
+		for comp, modComp := range modSnap.Components {
+			// optional snap not confirmed (no options or not in options), skipping
+			if modComp.Presence == "optional" &&
+				(optSnap == nil || !optSnap.HasComponent(comp)) {
+				continue
+			}
+			seedCompsMap[comp] = SeedComponent{
+				ComponentRef: naming.NewComponentRef(modSnap.Name, comp),
+			}
+		}
+		// We add also components in command options if the model allows it
+		if optSnap != nil {
+			for _, comp := range optSnap.Components {
+				if _, ok := seedCompsMap[comp.Name]; ok {
+					continue
+				}
+				if err := w.policy.allowsDangerousFeatures(); err != nil {
+					return nil, err
+				}
+				seedCompsMap[comp.Name] = SeedComponent{
+					ComponentRef: naming.NewComponentRef(modSnap.Name, comp.Name),
+				}
+			}
+		}
+		seedComps := make([]SeedComponent, 0, len(seedCompsMap))
+		for _, sc := range seedCompsMap {
+			seedComps = append(seedComps, sc)
+		}
 		sn = &SeedSnap{
 			SnapRef: modSnap,
 
 			local:      false,
 			optionSnap: optSnap,
+			Components: seedComps,
 		}
 	} else {
 		optSnap = sn.optionSnap
@@ -1090,6 +1231,7 @@ func (w *Writer) downloaded(seedSnaps []*SeedSnap, fetchAsserts AssertsFetchFunc
 		w.availableSnaps = naming.NewSnapSet(nil)
 		w.availableByMode = make(map[string]*naming.SnapSet)
 		w.availableByMode["run"] = naming.NewSnapSet(nil)
+		w.byModeSnaps = make(map[string][]*SeedSnap)
 	}
 
 	for _, sn := range seedSnaps {
@@ -1103,7 +1245,11 @@ func (w *Writer) downloaded(seedSnaps []*SeedSnap, fetchAsserts AssertsFetchFunc
 				byMode = naming.NewSnapSet(nil)
 				w.availableByMode[mode] = byMode
 			}
+			if byMode.Contains(sn) {
+				continue
+			}
 			byMode.Add(sn)
+			w.byModeSnaps[mode] = append(w.byModeSnaps[mode], sn)
 		}
 	}
 
@@ -1142,13 +1288,6 @@ func (w *Writer) downloaded(seedSnaps []*SeedSnap, fetchAsserts AssertsFetchFunc
 
 		if err := w.checkBase(info, modes); err != nil {
 			return err
-		}
-		// error about missing default providers
-		for dp := range snap.NeededDefaultProviders(info) {
-			if !w.policy.checkAvailable(naming.Snap(dp), modes, w.availableByMode) {
-				// TODO: have a way to ignore this issue on a snap by snap basis?
-				return fmt.Errorf("cannot use snap %q without its default content provider %q being added explicitly%s", info.SnapName(), dp, errorMsgForModesSuffix(modes))
-			}
 		}
 	}
 
@@ -1225,7 +1364,79 @@ func (w *Writer) Downloaded(fetchAsserts AssertsFetchFunc) (complete bool, err e
 	if err := w.ensureARefs(nil, fetchAsserts); err != nil {
 		return false, err
 	}
+
+	if err := w.checkPrereqs(); err != nil {
+		return false, err
+	}
+
 	return true, nil
+}
+
+func (w *Writer) checkPrereqs() error {
+	// as we error on the first problem we want to check snaps mode by mode
+	// in a fixed order; we start with run then
+	// ephemeral as snaps marked as such need to be self-contained
+	// then specific modes sorted
+	modes := make([]string, 0, len(w.availableByMode))
+	modes = append(modes, "run")
+	fixed := 1
+	if _, ok := w.availableByMode["ephemeral"]; ok {
+		modes = append(modes, "ephemeral")
+		fixed = 2
+	}
+	for m := range w.availableByMode {
+		if m == "run" || m == "ephemeral" {
+			continue
+		}
+		modes = append(modes, m)
+	}
+	sort.Strings(modes[fixed:])
+	for _, m := range modes {
+		if err := w.checkPrereqsInMode(m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *Writer) checkPrereqsInMode(mode string) error {
+	nmode := len(w.byModeSnaps[mode])
+	nephemeral := len(w.byModeSnaps["ephemeral"])
+	var snaps []*snap.Info
+	if mode != "run" && mode != "ephemeral" {
+		// mode is a concrete ephemeral mode
+		// (not run, not ephemeral which is the set of snaps
+		//  shared by all ephemeral modes)
+		// so we include snap marked for any ephemeral mode
+		snaps = make([]*snap.Info, 0, nmode+nephemeral)
+		for _, sn := range w.byModeSnaps["ephemeral"] {
+			snaps = append(snaps, sn.Info)
+		}
+	} else {
+		snaps = make([]*snap.Info, 0, nmode)
+	}
+	for _, sn := range w.byModeSnaps[mode] {
+		snaps = append(snaps, sn.Info)
+	}
+	warns, errs := snap.ValidateBasesAndProviders(snaps)
+	if errs != nil {
+		var errPrefix string
+		// XXX TODO: return an error that subsumes all the errors
+		if mode == "run" {
+			errPrefix = "prerequisites need to be added explicitly"
+		} else {
+			errPrefix = fmt.Sprintf("prerequisites need to be added explicitly for relevant mode %s", mode)
+		}
+		return fmt.Errorf("%s: %v", errPrefix, errs[0])
+	}
+	wfmt := "%v"
+	if mode != "run" {
+		wfmt = fmt.Sprintf("prerequisites for mode %s: %%v", mode)
+	}
+	for _, warn := range warns {
+		w.warningf(wfmt, warn)
+	}
+	return nil
 }
 
 func (w *Writer) checkPublisher(sn *SeedSnap) error {
@@ -1387,12 +1598,17 @@ func (w *Writer) SeedSnaps(copySnap func(name, src, dst string) error) error {
 				}
 			} else {
 				var snapPath func(*SeedSnap) (string, error)
+				var compPath func(*SeedComponent) (string, error)
 				if sn.Info.ID() != "" {
 					// actually asserted
 					snapPath = w.tree.snapPath
+					compPath = func(sc *SeedComponent) (string, error) {
+						return w.tree.componentPath(sn, sc)
+					}
 				} else {
 					// purely local
 					snapPath = w.tree.localSnapPath
+					compPath = w.tree.localComponentPath
 				}
 				dst, err := snapPath(sn)
 				if err != nil {
@@ -1400,6 +1616,16 @@ func (w *Writer) SeedSnaps(copySnap func(name, src, dst string) error) error {
 				}
 				if err := copySnap(info.SnapName(), sn.Path, dst); err != nil {
 					return err
+				}
+				// copy components
+				for _, comp := range sn.Components {
+					compDst, err := compPath(&comp)
+					if err != nil {
+						return err
+					}
+					if err := copySnap(comp.ComponentRef.String(), comp.Path, compDst); err != nil {
+						return err
+					}
 				}
 				// record final destination path
 				sn.Path = dst

@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2018 Canonical Ltd
+ * Copyright (C) 2018-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -22,13 +22,15 @@ package ifacestate_test
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	. "gopkg.in/check.v1"
 
+	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/assertstest"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/ifacetest"
@@ -37,6 +39,7 @@ import (
 	"github.com/snapcore/snapd/overlord"
 	"github.com/snapcore/snapd/overlord/ifacestate"
 	"github.com/snapcore/snapd/overlord/snapstate"
+	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snaptest"
@@ -45,6 +48,7 @@ import (
 )
 
 type helpersSuite struct {
+	testutil.BaseTest
 	st *state.State
 }
 
@@ -53,10 +57,28 @@ var _ = Suite(&helpersSuite{})
 func (s *helpersSuite) SetUpTest(c *C) {
 	s.st = state.New(nil)
 	dirs.SetRootDir(c.MkDir())
+
+	s.MockModel(c, nil)
 }
 
 func (s *helpersSuite) TearDownTest(c *C) {
 	dirs.SetRootDir("")
+}
+
+func (s *helpersSuite) MockModel(c *C, extraHeaders map[string]interface{}) {
+	model := assertstest.FakeAssertion(map[string]interface{}{
+		"type":         "model",
+		"authority-id": "my-brand",
+		"series":       "16",
+		"brand-id":     "my-brand",
+		"model":        "my-model",
+		"gadget":       "gadget",
+		"kernel":       "krnl",
+		"architecture": "amd64",
+		"timestamp":    time.Now().Format(time.RFC3339),
+	}, extraHeaders).(*asserts.Model)
+
+	s.AddCleanup(snapstatetest.MockDeviceModel(model))
 }
 
 func (s *helpersSuite) TestIdentityMapper(c *C) {
@@ -303,7 +325,7 @@ func (s *helpersSuite) TestCheckIsSystemSnapPresentWithCore(c *C) {
 
 	snapstate.Set(s.st, snapInfo.InstanceName(), &snapstate.SnapState{
 		Active:      true,
-		Sequence:    []*snap.SideInfo{sideInfo},
+		Sequence:    snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{sideInfo}),
 		Current:     sideInfo.Revision,
 		SnapType:    string(snapInfo.Type()),
 		InstanceKey: snapInfo.InstanceKey,
@@ -333,7 +355,7 @@ func (s *helpersSuite) TestCheckIsSystemSnapPresentWithSnapd(c *C) {
 
 	snapstate.Set(s.st, snapInfo.InstanceName(), &snapstate.SnapState{
 		Active:      true,
-		Sequence:    []*snap.SideInfo{sideInfo},
+		Sequence:    snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{sideInfo}),
 		Current:     sideInfo.Revision,
 		SnapType:    string(snapInfo.Type()),
 		InstanceKey: snapInfo.InstanceKey,
@@ -359,7 +381,7 @@ func (s *helpersSuite) TestSystemKeyAndFailingProfileRegeneration(c *C) {
 	// test backends with empty name for convenience.
 	backend := &ifacetest.TestSecurityBackend{
 		BackendName: "BROKEN",
-		SetupCallback: func(snapInfo *snap.Info, opts interfaces.ConfinementOptions, repo *interfaces.Repository) error {
+		SetupCallback: func(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, repo *interfaces.Repository) error {
 			return errors.New("FAILED")
 		},
 	}
@@ -384,7 +406,7 @@ apps:
 	st.Lock()
 	snapst := &snapstate.SnapState{
 		SnapType: string(snap.TypeApp),
-		Sequence: []*snap.SideInfo{si},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si}),
 		Active:   true,
 		Current:  snap.R(1),
 	}
@@ -393,14 +415,14 @@ apps:
 
 	// Pretend that security profiles are out of date and mock the
 	// function that writes the new system key with one always panics.
-	restore = ifacestate.MockProfilesNeedRegeneration(func() bool { return true })
+	restore = ifacestate.MockProfilesNeedRegeneration(func(m *ifacestate.InterfaceManager) bool { return true })
 	defer restore()
-	restore = ifacestate.MockWriteSystemKey(func() error { panic("should not attempt to write system key") })
+	restore = ifacestate.MockWriteSystemKey(func(extraData interfaces.SystemKeyExtraData) error { panic("should not attempt to write system key") })
 	defer restore()
 	// Put a fake system key in place, we just want to see that file being removed.
 	err := os.MkdirAll(filepath.Dir(dirs.SnapSystemKeyFile), 0755)
 	c.Assert(err, IsNil)
-	err = ioutil.WriteFile(dirs.SnapSystemKeyFile, []byte("system-key"), 0755)
+	err = os.WriteFile(dirs.SnapSystemKeyFile, []byte("system-key"), 0755)
 	c.Assert(err, IsNil)
 
 	// Put up a fake logger to capture logged messages.
@@ -433,7 +455,7 @@ apps:
 		st.Lock()
 		snapst := &snapstate.SnapState{
 			SnapType: string(snap.TypeApp),
-			Sequence: []*snap.SideInfo{si},
+			Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si}),
 			Active:   true,
 			Current:  snap.R(1),
 		}
@@ -452,8 +474,8 @@ func (s *helpersSuite) TestProfileRegenerationSetupMany(c *C) {
 	// Create a fake security backend
 	backend := &ifacetest.TestSecurityBackendSetupMany{
 		TestSecurityBackend: ifacetest.TestSecurityBackend{BackendName: "fake"},
-		SetupManyCallback: func(snaps []*snap.Info, confinement func(snapName string) interfaces.ConfinementOptions, repo *interfaces.Repository, tm timings.Measurer) []error {
-			c.Check(snaps, HasLen, 2)
+		SetupManyCallback: func(appSets []*interfaces.SnapAppSet, confinement func(snapName string) interfaces.ConfinementOptions, repo *interfaces.Repository, tm timings.Measurer) []error {
+			c.Check(appSets, HasLen, 2)
 			setupManyCalls++
 			return nil
 		},
@@ -468,9 +490,9 @@ func (s *helpersSuite) TestProfileRegenerationSetupMany(c *C) {
 	mockSnaps(c, st)
 
 	// Pretend that security profiles are out of date.
-	restore = ifacestate.MockProfilesNeedRegeneration(func() bool { return true })
+	restore = ifacestate.MockProfilesNeedRegeneration(func(m *ifacestate.InterfaceManager) bool { return true })
 	defer restore()
-	restore = ifacestate.MockWriteSystemKey(func() error {
+	restore = ifacestate.MockWriteSystemKey(func(extraData interfaces.SystemKeyExtraData) error {
 		writeKey = true
 		return nil
 	})
@@ -496,8 +518,8 @@ func (s *helpersSuite) TestProfileRegenerationSetupManyFailsSystemKeyNotWritten(
 	// Create a fake security backend
 	backend := &ifacetest.TestSecurityBackendSetupMany{
 		TestSecurityBackend: ifacetest.TestSecurityBackend{BackendName: "fake"},
-		SetupManyCallback: func(snaps []*snap.Info, confinement func(snapName string) interfaces.ConfinementOptions, repo *interfaces.Repository, tm timings.Measurer) []error {
-			c.Check(snaps, HasLen, 2)
+		SetupManyCallback: func(appSets []*interfaces.SnapAppSet, confinement func(snapName string) interfaces.ConfinementOptions, repo *interfaces.Repository, tm timings.Measurer) []error {
+			c.Check(appSets, HasLen, 2)
 			setupManyCalls++
 			return []error{fmt.Errorf("FAILED")}
 		},
@@ -516,9 +538,9 @@ func (s *helpersSuite) TestProfileRegenerationSetupManyFailsSystemKeyNotWritten(
 	mockSnaps(c, st)
 
 	// Pretend that security profiles are out of date.
-	restore = ifacestate.MockProfilesNeedRegeneration(func() bool { return true })
+	restore = ifacestate.MockProfilesNeedRegeneration(func(m *ifacestate.InterfaceManager) bool { return true })
 	defer restore()
-	restore = ifacestate.MockWriteSystemKey(func() error {
+	restore = ifacestate.MockWriteSystemKey(func(extraData interfaces.SystemKeyExtraData) error {
 		writeKey = true
 		return nil
 	})
@@ -668,12 +690,13 @@ func (s *helpersSuite) TestAddHotplugSlot(c *C) {
 	c.Check(stateSlots, HasLen, 0)
 
 	si := &snap.SideInfo{Revision: snap.R(1)}
-	coreInfo := snaptest.MockSnap(c, coreSnapYaml, si)
+	coreAppSet := ifacetest.MockInfoAndAppSet(c, coreSnapYaml, nil, si)
+	c.Assert(repo.AddAppSet(coreAppSet), IsNil)
 
 	slot := &snap.SlotInfo{
 		Name:       "slot",
 		Label:      "label",
-		Snap:       coreInfo,
+		Snap:       coreAppSet.Info(),
 		Interface:  "test",
 		Attrs:      map[string]interface{}{"foo": "bar"},
 		HotplugKey: "key",
@@ -736,7 +759,7 @@ func (s *helpersSuite) TestDiscardLateBackendViaSnapstate(c *C) {
 	defer dirs.SetRootDir("")
 
 	// security profiles do not need regeneration when crating the manager
-	restore := ifacestate.MockProfilesNeedRegeneration(func() bool { return false })
+	restore := ifacestate.MockProfilesNeedRegeneration(func(m *ifacestate.InterfaceManager) bool { return false })
 	defer restore()
 
 	backend := &ifacetest.TestSecurityBackendDiscardingLate{
@@ -769,4 +792,22 @@ func (s *helpersSuite) TestDiscardLateBackendViaSnapstate(c *C) {
 		{"snapd", "1234", "snapd"},
 		{"this-fails", "12", "app"},
 	})
+}
+
+func (s *helpersSuite) TestHasActiveConnection(c *C) {
+	s.st.Lock()
+	defer s.st.Unlock()
+
+	s.st.Set("conns", map[string]map[string]string{
+		"consumer-1:browser-support core:browser-support": {"interface": "browser-support"},
+		"consumer-2:home core:home":                       {"interface": "home"},
+	})
+
+	active, err := ifacestate.HasActiveConnection(s.st, "snap-refresh-observe")
+	c.Assert(err, IsNil)
+	c.Check(active, Equals, false)
+
+	active, err = ifacestate.HasActiveConnection(s.st, "browser-support")
+	c.Assert(err, IsNil)
+	c.Check(active, Equals, true)
 }

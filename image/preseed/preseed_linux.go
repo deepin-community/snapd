@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +34,7 @@ import (
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/squashfs"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snapdtool"
 	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/timings"
@@ -126,11 +126,14 @@ var systemSnapFromSeed = func(seedDir, sysLabel string) (systemSnap string, base
 	if model.Classic() {
 		fmt.Fprintf(Stdout, "ubuntu classic preseeding\n")
 	} else {
-		if model.Base() == "core20" {
+		coreVersion, err := naming.CoreVersion(model.Base())
+		if err != nil {
+			return "", "", fmt.Errorf("preseeding of ubuntu core with base %s is not supported: %v", model.Base(), err)
+		}
+		if coreVersion >= 20 {
 			fmt.Fprintf(Stdout, "UC20+ preseeding\n")
 		} else {
-			// TODO: support uc20+
-			return "", "", fmt.Errorf("preseeding of ubuntu core with base %s is not supported", model.Base())
+			return "", "", fmt.Errorf("preseeding of ubuntu core with base %s is not supported: core20 or later is expected", model.Base())
 		}
 	}
 
@@ -239,7 +242,19 @@ func prepareCore20Mountpoints(opts *preseedCoreOptions) (cleanupMounts func(), e
 		}
 	}
 
+	underWritable := func(path string) string {
+		return filepath.Join(opts.WritableDir, path)
+	}
+
+	currentLink := underWritable("system-data/snap/snapd/current")
+	currentSnapdMountPoint := underWritable("system-data/snap/snapd/preseeding")
+
 	cleanupMounts = func() {
+		path, err := os.Readlink(currentLink)
+		if err == nil && path == "preseeding" {
+			os.Remove(currentLink)
+		}
+
 		// unmount all the mounts but the first one, which is the base
 		// and it is cleaned up last
 		for i := len(mounted) - 1; i > 0; i-- {
@@ -263,6 +278,9 @@ func prepareCore20Mountpoints(opts *preseedCoreOptions) (cleanupMounts func(), e
 		if len(mounted) > 0 {
 			doUnmount(mounted[0])
 		}
+
+		// Remove mount point if empty
+		os.Remove(currentSnapdMountPoint)
 	}
 
 	cleanupOnError := func() {
@@ -328,9 +346,23 @@ func prepareCore20Mountpoints(opts *preseedCoreOptions) (cleanupMounts func(), e
 		}
 	}
 
-	underWritable := func(path string) string {
-		return filepath.Join(opts.WritableDir, path)
+	// because of the way snapd snap is built, we need the
+	// 'current' symlink to exist when the snapd binary is
+	// invoked, so that any runtime libraries will be correctly
+	// resolved, so we bind-mount the snapd snap at a side
+	// location, and create the symlink 'current' to point to that
+	// location This symlink can then be easily replaced by snapd
+	// as it preseeds the image
+	if err := os.MkdirAll(filepath.Dir(currentLink), 0755); err != nil {
+		return nil, err
 	}
+	if err := os.MkdirAll(currentSnapdMountPoint, 0755); err != nil {
+		return nil, err
+	}
+	if err := os.Symlink("preseeding", currentLink); err != nil {
+		return nil, err
+	}
+
 	mounts = [][]string{
 		{"--bind", underWritable("system-data/var/lib/snapd"), underPreseed("var/lib/snapd")},
 		{"--bind", underWritable("system-data/var/cache/snapd"), underPreseed("var/cache/snapd")},
@@ -342,6 +374,7 @@ func prepareCore20Mountpoints(opts *preseedCoreOptions) (cleanupMounts func(), e
 		{"--bind", underWritable("system-data/etc/udev/rules.d"), underPreseed("etc/udev/rules.d")},
 		{"--bind", underWritable("system-data/var/lib/extrausers"), underPreseed("var/lib/extrausers")},
 		{"--bind", filepath.Join(snapdMountPath, "/usr/lib/snapd"), underPreseed("/usr/lib/snapd")},
+		{"--bind", snapdMountPath, underPreseed("/snap/snapd/preseeding")},
 		{"--bind", filepath.Join(opts.PrepareImageDir, "system-seed"), underPreseed("var/lib/snapd/seed")},
 	}
 
@@ -372,11 +405,11 @@ func systemForPreseeding(systemsDir string) (label string, err error) {
 }
 
 var makePreseedTempDir = func() (string, error) {
-	return ioutil.TempDir("", "preseed-")
+	return os.MkdirTemp("", "preseed-")
 }
 
 var makeWritableTempDir = func() (string, error) {
-	return ioutil.TempDir("", "writable-")
+	return os.MkdirTemp("", "writable-")
 }
 
 func prepareCore20Chroot(opts *CoreOptions) (popts *preseedCoreOptions, cleanup func(), err error) {
@@ -487,7 +520,7 @@ func getSnapdVersion(rootDir string) (string, error) {
 	return ver, nil
 }
 
-func prepareClassicChroot(preseedChroot string) (*targetSnapdInfo, func(), error) {
+func prepareClassicChroot(preseedChroot string, reset bool) (*targetSnapdInfo, func(), error) {
 	if err := syscallChroot(preseedChroot); err != nil {
 		return nil, nil, fmt.Errorf("cannot chroot into %s: %v", preseedChroot, err)
 	}
@@ -555,6 +588,30 @@ func prepareClassicChroot(preseedChroot string) (*targetSnapdInfo, func(), error
 		return nil, nil, err
 	}
 	addCleanup(unmountSnapd)
+
+	// because of the way snapd snap is built, we need the
+	// 'current' symlink to exist when the snapd binary is
+	// invoked, so that any runtime libraries will be correctly
+	// resolved, so we bind-mount the snapd snap at a side
+	// location, and create the symlink 'current' to point to that
+	// location This symlink can then be easily replaced by snapd
+	// as it preseeds the image
+	currentLink := filepath.Join(rootDir, "snap/snapd/current")
+	if err := os.MkdirAll(filepath.Dir(currentLink), 0755); err != nil {
+		return nil, nil, err
+	}
+	if reset {
+		os.Remove(currentLink)
+	}
+	if err := os.Symlink(snapdMountPath, currentLink); err != nil {
+		return nil, nil, err
+	}
+	addCleanup(func() {
+		path, err := os.Readlink(currentLink)
+		if err == nil && path == snapdMountPath {
+			os.Remove(currentLink)
+		}
+	})
 
 	targetSnapd, err := chooseTargetSnapdVersion()
 	if err != nil {
@@ -715,7 +772,8 @@ func Classic(chrootDir string) error {
 	// beginning of prepareClassicChroot), then we could have a single
 	// runPreseedMode/runUC20PreseedMode function that handles both classic
 	// and core20.
-	targetSnapd, cleanup, err := prepareClassicChroot(chrootDir)
+	const reset = false
+	targetSnapd, cleanup, err := prepareClassicChroot(chrootDir, reset)
 	if err != nil {
 		return err
 	}
@@ -744,7 +802,8 @@ func ClassicReset(chrootDir string) error {
 		return ResetPreseededChroot(chrootDir)
 	}
 
-	targetSnapd, cleanup, err := prepareClassicChroot(chrootDir)
+	const reset = true
+	targetSnapd, cleanup, err := prepareClassicChroot(chrootDir, reset)
 	if err != nil {
 		return err
 	}

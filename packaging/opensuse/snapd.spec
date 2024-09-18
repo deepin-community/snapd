@@ -82,7 +82,7 @@
 
 
 Name:           snapd
-Version:        2.60.2
+Version:        2.65.1
 Release:        0
 Summary:        Tools enabling systems to work with .snap files
 License:        GPL-3.0
@@ -91,6 +91,7 @@ Url:            https://%{import_path}
 Source0:        https://github.com/snapcore/snapd/releases/download/%{version}/%{name}_%{version}.vendor.tar.xz
 Source1:        snapd-rpmlintrc
 BuildRequires:  autoconf
+BuildRequires:  autoconf-archive
 BuildRequires:  automake
 BuildRequires:  fakeroot
 BuildRequires:  glib2-devel
@@ -203,6 +204,8 @@ with_core_bits = 0
 with_alt_snap_mount_dir = %{!?with_alt_snap_mount_dir:0}%{?with_alt_snap_mount_dir:1}
 with_apparmor = %{with apparmor}
 with_testkeys = %{with_testkeys}
+# Disable DWARF and symbol table
+EXTRA_GO_LDFLAGS = -w -s
 __DEFINES__
 
 # Set the version that is compiled into the various executables/
@@ -285,11 +288,6 @@ done
 %make_install -f %{indigo_srcdir}/packaging/snapd.mk \
             GOPATH=%{indigo_gopath}:$GOPATH SNAPD_DEFINES_DIR=%{_builddir} \
             install
-%if ! %{with apparmor}
-rm %{buildroot}%{_unitdir}/snapd.aa-prompt-listener.service
-rm %{buildroot}%{_userunitdir}/snapd.aa-prompt-ui.service
-rm %{buildroot}%{_datadir}/dbus-1/services/io.snapcraft.Prompt.service
-%endif
 
 # Undo special permissions of the void directory. We handle that in RPM files
 # section below.
@@ -309,10 +307,6 @@ ln -sf %{_sbindir}/service %{buildroot}%{_sbindir}/rcsnapd.seeded
 %if %{with apparmor}
 ln -sf %{_sbindir}/service %{buildroot}%{_sbindir}/rcsnapd.apparmor
 %endif
-
-# Install Polkit configuration.
-# TODO: This should be handled by data makefile.
-install -m 644 -D %{indigo_srcdir}/data/polkit/io.snapcraft.snapd.policy %{buildroot}%{_datadir}/polkit-1/actions
 
 # Install the "info" data file with snapd version
 # TODO: This should be handled by data makefile.
@@ -400,12 +394,14 @@ fi
 %dir %{_sharedstatedir}/snapd/assertions
 %dir %{_sharedstatedir}/snapd/cache
 %dir %{_sharedstatedir}/snapd/cookie
+%dir %{_sharedstatedir}/snapd/cgroup
 %dir %{_sharedstatedir}/snapd/dbus-1
 %dir %{_sharedstatedir}/snapd/dbus-1/services
 %dir %{_sharedstatedir}/snapd/dbus-1/system-services
 %dir %{_sharedstatedir}/snapd/desktop
 %dir %{_sharedstatedir}/snapd/desktop/applications
 %dir %{_sharedstatedir}/snapd/device
+%dir %{_sharedstatedir}/snapd/environment
 %dir %{_sharedstatedir}/snapd/hostfs
 %dir %{_sharedstatedir}/snapd/inhibit
 %dir %{_sharedstatedir}/snapd/lib
@@ -492,13 +488,10 @@ fi
 # When apparmor is enabled there are some additional entries.
 %if %{with apparmor}
 %config %{_sysconfdir}/apparmor.d
-%{_datadir}/dbus-1/services/io.snapcraft.Prompt.service
 %{_libexecdir}/snapd/snapd-apparmor
 %{_sbindir}/rcsnapd.apparmor
 %{_sysconfdir}/apparmor.d/%{apparmor_snapconfine_profile}
 %{_unitdir}/snapd.apparmor.service
-%{_unitdir}/snapd.aa-prompt-listener.service
-%{_userunitdir}/snapd.aa-prompt-ui.service
 %endif
 
 %changelog

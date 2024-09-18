@@ -20,7 +20,6 @@
 package builtin_test
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +31,6 @@ import (
 	"github.com/snapcore/snapd/interfaces/apparmor"
 	"github.com/snapcore/snapd/interfaces/builtin"
 	"github.com/snapcore/snapd/interfaces/polkit"
-	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/testutil"
@@ -46,11 +44,26 @@ type polkitInterfaceSuite struct {
 	slotInfo *snap.SlotInfo
 	plug     *interfaces.ConnectedPlug
 	plugInfo *snap.PlugInfo
+
+	daemonPath1  string
+	daemonPath2  string
+	restorePaths func()
 }
 
 var _ = Suite(&polkitInterfaceSuite{
 	iface: builtin.MustInterface("polkit"),
 })
+
+func (s *polkitInterfaceSuite) SetUpSuite(c *C) {
+	d := c.MkDir()
+	s.daemonPath1 = filepath.Join(d, "polkitd-1")
+	s.daemonPath2 = filepath.Join(d, "polkitd-2")
+	s.restorePaths = builtin.MockPolkitDaemonPaths(s.daemonPath1, s.daemonPath2)
+}
+
+func (s *polkitInterfaceSuite) TearDownSuite(c *C) {
+	s.restorePaths()
+}
 
 func (s *polkitInterfaceSuite) SetUpTest(c *C) {
 	s.BaseTest.SetUpTest(c)
@@ -59,7 +72,7 @@ func (s *polkitInterfaceSuite) SetUpTest(c *C) {
 		dirs.SetRootDir("/")
 	})
 
-	const mockPlugSnapInfo = `name: other
+	const mockPlugSnapInfoYaml = `name: other
 version: 1.0
 plugs:
  polkit:
@@ -69,18 +82,20 @@ apps:
   command: foo
   plugs: [polkit]
 `
-	s.slotInfo = &snap.SlotInfo{
-		Snap:      &snap.Info{SuggestedName: "core", SnapType: snap.TypeOS},
-		Name:      "polkit",
-		Interface: "polkit",
-	}
-	s.slot = interfaces.NewConnectedSlot(s.slotInfo, nil, nil)
-	plugSnap := snaptest.MockSnap(c, mockPlugSnapInfo, &snap.SideInfo{
-		RealName: "other",
-		Revision: snap.R(1),
-	})
-	s.plugInfo = plugSnap.Plugs["polkit"]
-	s.plug = interfaces.NewConnectedPlug(s.plugInfo, nil, nil)
+	const mockSlotSnapInfoYaml = `name: core
+version: 1.0
+type: os
+slots:
+ polkit:
+  interface: polkit
+`
+
+	s.slot, s.slotInfo = MockConnectedSlot(c, mockSlotSnapInfoYaml, nil, "polkit")
+	s.plug, s.plugInfo = MockConnectedPlug(c, mockPlugSnapInfoYaml, nil, "polkit")
+
+	c.Assert(os.WriteFile(s.daemonPath1, nil, 0o600), IsNil)
+	c.Assert(os.WriteFile(s.daemonPath2, nil, 0o600), IsNil)
+	c.Assert(os.MkdirAll(dirs.SnapPolkitPolicyDir, 0o700), IsNil)
 }
 
 func (s *polkitInterfaceSuite) TestName(c *C) {
@@ -88,7 +103,7 @@ func (s *polkitInterfaceSuite) TestName(c *C) {
 }
 
 func (s *polkitInterfaceSuite) TestConnectedPlugAppArmor(c *C) {
-	apparmorSpec := &apparmor.Specification{}
+	apparmorSpec := apparmor.NewSpecification(s.plug.AppSet())
 	err := apparmorSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
 	c.Assert(err, IsNil)
 	c.Assert(apparmorSpec.SecurityTags(), DeepEquals, []string{"snap.other.app"})
@@ -112,9 +127,9 @@ func (s *polkitInterfaceSuite) TestConnectedPlugPolkit(c *C) {
 
 	c.Assert(os.MkdirAll(filepath.Join(s.plugInfo.Snap.MountDir(), "meta/polkit"), 0755), IsNil)
 	policyPath := filepath.Join(s.plugInfo.Snap.MountDir(), "meta/polkit/polkit.foo.policy")
-	c.Assert(ioutil.WriteFile(policyPath, []byte(samplePolicy1), 0644), IsNil)
+	c.Assert(os.WriteFile(policyPath, []byte(samplePolicy1), 0644), IsNil)
 	policyPath = filepath.Join(s.plugInfo.Snap.MountDir(), "meta/polkit/polkit.bar.policy")
-	c.Assert(ioutil.WriteFile(policyPath, []byte(samplePolicy2), 0644), IsNil)
+	c.Assert(os.WriteFile(policyPath, []byte(samplePolicy2), 0644), IsNil)
 
 	polkitSpec := &polkit.Specification{}
 	err := polkitSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
@@ -146,7 +161,7 @@ func (s *polkitInterfaceSuite) TestConnectedPlugPolkitBadXML(c *C) {
 	const samplePolicy = `<malformed`
 	c.Assert(os.MkdirAll(filepath.Join(s.plugInfo.Snap.MountDir(), "meta/polkit"), 0755), IsNil)
 	policyPath := filepath.Join(s.plugInfo.Snap.MountDir(), "meta/polkit/polkit.foo.policy")
-	c.Assert(ioutil.WriteFile(policyPath, []byte(samplePolicy), 0644), IsNil)
+	c.Assert(os.WriteFile(policyPath, []byte(samplePolicy), 0644), IsNil)
 
 	polkitSpec := &polkit.Specification{}
 	err := polkitSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
@@ -165,7 +180,7 @@ func (s *polkitInterfaceSuite) TestConnectedPlugPolkitBadAction(c *C) {
 </policyconfig>`
 	c.Assert(os.MkdirAll(filepath.Join(s.plugInfo.Snap.MountDir(), "meta/polkit"), 0755), IsNil)
 	policyPath := filepath.Join(s.plugInfo.Snap.MountDir(), "meta/polkit/polkit.foo.policy")
-	c.Assert(ioutil.WriteFile(policyPath, []byte(samplePolicy), 0644), IsNil)
+	c.Assert(os.WriteFile(policyPath, []byte(samplePolicy), 0644), IsNil)
 
 	polkitSpec := &polkit.Specification{}
 	err := polkitSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
@@ -185,7 +200,7 @@ func (s *polkitInterfaceSuite) TestConnectedPlugPolkitBadImplies(c *C) {
 </policyconfig>`
 	c.Assert(os.MkdirAll(filepath.Join(s.plugInfo.Snap.MountDir(), "meta/polkit"), 0755), IsNil)
 	policyPath := filepath.Join(s.plugInfo.Snap.MountDir(), "meta/polkit/polkit.foo.policy")
-	c.Assert(ioutil.WriteFile(policyPath, []byte(samplePolicy), 0644), IsNil)
+	c.Assert(os.WriteFile(policyPath, []byte(samplePolicy), 0644), IsNil)
 
 	polkitSpec := &polkit.Specification{}
 	err := polkitSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
@@ -247,7 +262,7 @@ plugs:
 }
 
 func (s *polkitInterfaceSuite) TestConnectedPlugPolkitInternalError(c *C) {
-	const mockPlugSnapInfo = `name: other
+	const mockPlugSnapInfoYaml = `name: other
 version: 1.0
 plugs:
  polkit:
@@ -257,28 +272,60 @@ apps:
   command: foo
   plugs: [polkit]
 `
-	s.slotInfo = &snap.SlotInfo{
-		Snap:      &snap.Info{SuggestedName: "core", SnapType: snap.TypeOS},
-		Name:      "polkit",
-		Interface: "polkit",
-	}
-	s.slot = interfaces.NewConnectedSlot(s.slotInfo, nil, nil)
-	plugSnap := snaptest.MockInfo(c, mockPlugSnapInfo, nil)
-	s.plugInfo = plugSnap.Plugs["polkit"]
-	s.plug = interfaces.NewConnectedPlug(s.plugInfo, nil, nil)
+	const mockSlotSnapInfoYaml = `name: core
+version: 1.0
+type: os
+slots:
+ polkit:
+  interface: polkit
+`
+	slot, _ := MockConnectedSlot(c, mockSlotSnapInfoYaml, nil, "polkit")
+	plug, _ := MockConnectedPlug(c, mockPlugSnapInfoYaml, nil, "polkit")
 
 	polkitSpec := &polkit.Specification{}
-	err := polkitSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
+	err := polkitSpec.AddConnectedPlug(s.iface, plug, slot)
 	c.Assert(err, ErrorMatches, `snap "other" has interface "polkit" with invalid value type bool for "action-prefix" attribute: \*string`)
 }
 
 func (s *polkitInterfaceSuite) TestStaticInfo(c *C) {
 	si := interfaces.StaticInfoOf(s.iface)
-	c.Check(si.ImplicitOnCore, Equals, osutil.IsExecutable("/usr/libexec/polkitd"))
+	// ImplicitOnCore is only tested in TestPolkitPoliciesSupported.
 	c.Check(si.ImplicitOnClassic, Equals, true)
 	c.Check(si.Summary, Equals, "allows access to polkitd to check authorisation")
 	c.Check(si.BaseDeclarationPlugs, testutil.Contains, "polkit")
 	c.Check(si.BaseDeclarationSlots, testutil.Contains, "polkit")
+}
+
+func (s *polkitInterfaceSuite) TestPolkitPoliciesSupported(c *C) {
+	// From now the actions directory is writable so daemon permissions matter.
+	c.Assert(os.Chmod(dirs.SnapPolkitPolicyDir, 0o700), IsNil)
+
+	// Neither daemon is executable so polkit policies are not supported.
+	c.Assert(os.Chmod(s.daemonPath1, 0o600), IsNil)
+	c.Assert(os.Chmod(s.daemonPath2, 0o600), IsNil)
+	c.Check(builtin.PolkitPoliciesSupported(), Equals, false)
+
+	// The 1st daemon is executable so polkit policies are supported.
+	c.Assert(os.Chmod(s.daemonPath1, 0o700), IsNil)
+	c.Assert(os.Chmod(s.daemonPath2, 0o600), IsNil)
+	c.Check(builtin.PolkitPoliciesSupported(), Equals, true)
+
+	// The 2nd daemon is executable so polkit policies are supported.
+	c.Assert(os.Chmod(s.daemonPath1, 0o600), IsNil)
+	c.Assert(os.Chmod(s.daemonPath2, 0o700), IsNil)
+	c.Check(builtin.PolkitPoliciesSupported(), Equals, true)
+
+	// From now own, both daemons are executable so mounts matter.
+	c.Assert(os.Chmod(s.daemonPath1, 0o700), IsNil)
+	c.Assert(os.Chmod(s.daemonPath2, 0o700), IsNil)
+
+	// Actions directory is not writable so polkit policies are not supported.
+	c.Assert(os.Chmod(dirs.SnapPolkitPolicyDir, 0o500), IsNil)
+	c.Check(builtin.PolkitPoliciesSupported(), Equals, false)
+
+	// Actions directory is writable so polkit policies are not supported.
+	c.Assert(os.Chmod(dirs.SnapPolkitPolicyDir, 0o700), IsNil)
+	c.Check(builtin.PolkitPoliciesSupported(), Equals, true)
 }
 
 func (s *polkitInterfaceSuite) TestInterfaces(c *C) {

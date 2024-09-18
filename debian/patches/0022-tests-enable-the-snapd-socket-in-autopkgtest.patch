@@ -1,0 +1,27 @@
+From: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+Date: Wed, 5 Jun 2024 10:13:14 +0200
+Subject: tests: enable the snapd socket in autopkgtest
+
+For reasons I don't quite understand, and cannot reproduce when running
+autopkgtest locally, when the system is tested on the Debian infrastructure
+snapd ends up installed but not enabled.
+
+Enable the socket to at least have a chance to run something.
+
+Signed-off-by: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+---
+ tests/lib/prepare-restore.sh | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/tests/lib/prepare-restore.sh b/tests/lib/prepare-restore.sh
+index 5015ed7..34fdeaa 100755
+--- a/tests/lib/prepare-restore.sh
++++ b/tests/lib/prepare-restore.sh
+@@ -270,6 +270,7 @@ prepare_project() {
+     # we want to run as pristine as possible
+     if [ "$SPREAD_BACKEND" = autopkgtest ]; then
+         create_test_user
++        systemctl enable --now snapd.socket
+         exit 0
+     fi
+ 

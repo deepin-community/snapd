@@ -21,11 +21,13 @@
 #include <unistd.h>
 
 #include "../libsnap-confine-private/cleanup-funcs.h"
+#include "../libsnap-confine-private/snap-dir.h"
 #include "../libsnap-confine-private/snap.h"
 #include "../libsnap-confine-private/string-utils.h"
 #include "../libsnap-confine-private/utils.h"
 
-void sc_init_invocation(sc_invocation *inv, const struct sc_args *args, const char *snap_instance) {
+void sc_init_invocation(sc_invocation *inv, const struct sc_args *args, const char *snap_instance,
+                        const char *snap_component) {
     /* Snap instance name is conveyed via untrusted environment. It may be
      * unset (typically when experimenting with snap-confine by hand). It
      * must also be a valid snap instance name. */
@@ -34,11 +36,22 @@ void sc_init_invocation(sc_invocation *inv, const struct sc_args *args, const ch
     }
     sc_instance_name_validate(snap_instance, NULL);
 
+    // snap_component may be NULL if what we're confining isn't from a component
+    char *component_name = NULL;
+    char component_name_buffer[SNAP_NAME_LEN + 1] = {0};
+    if (snap_component != NULL) {
+        sc_snap_component_validate(snap_component, snap_instance, NULL);
+
+        sc_snap_split_snap_component(snap_component, NULL, 0, component_name_buffer, sizeof component_name_buffer);
+
+        component_name = component_name_buffer;
+    }
+
     /* The security tag is conveyed via untrusted command line. It must be
      * in agreement with snap instance name and must be a valid security
      * tag. */
     const char *security_tag = sc_args_security_tag(args);
-    if (!sc_security_tag_validate(security_tag, snap_instance)) {
+    if (!sc_security_tag_validate(security_tag, snap_instance, component_name)) {
         die("security tag %s not allowed", security_tag);
     }
 
@@ -72,12 +85,13 @@ void sc_init_invocation(sc_invocation *inv, const struct sc_args *args, const ch
     inv->executable = sc_strdup(executable);
     inv->security_tag = sc_strdup(security_tag);
     inv->snap_instance = sc_strdup(snap_instance);
+    inv->snap_component = snap_component != NULL ? sc_strdup(snap_component) : NULL;
     inv->snap_name = sc_strdup(snap_name);
     inv->classic_confinement = sc_args_is_classic_confinement(args);
 
     // construct rootfs_dir based on base_snap_name
     char mount_point[PATH_MAX] = {0};
-    sc_must_snprintf(mount_point, sizeof mount_point, "%s/%s/current", SNAP_MOUNT_DIR, inv->base_snap_name);
+    sc_must_snprintf(mount_point, sizeof mount_point, "%s/%s/current", sc_snap_mount_dir(NULL), inv->base_snap_name);
     inv->rootfs_dir = sc_strdup(mount_point);
 
     debug("security tag: %s", inv->security_tag);
@@ -95,6 +109,7 @@ void sc_cleanup_invocation(sc_invocation *inv) {
         sc_cleanup_string(&inv->security_tag);
         sc_cleanup_string(&inv->executable);
         sc_cleanup_string(&inv->rootfs_dir);
+        sc_cleanup_string(&inv->snap_component);
         sc_cleanup_deep_strv(&inv->homedirs);
     }
 }
@@ -114,7 +129,7 @@ void sc_check_rootfs_dir(sc_invocation *inv) {
         /* For "core" we can still use the ubuntu-core snap. This is helpful in
          * the migration path when new snap-confine runs before snapd has
          * finished obtaining the core snap. */
-        sc_must_snprintf(mount_point, sizeof mount_point, "%s/%s/current", SNAP_MOUNT_DIR, "ubuntu-core");
+        sc_must_snprintf(mount_point, sizeof mount_point, "%s/%s/current", sc_snap_mount_dir(NULL), "ubuntu-core");
         if (access(mount_point, F_OK) == 0) {
             sc_cleanup_string(&inv->base_snap_name);
             inv->base_snap_name = sc_strdup("ubuntu-core");
@@ -132,7 +147,7 @@ void sc_check_rootfs_dir(sc_invocation *inv) {
          * to help people transition to core16 bases without requiring
          * twice the disk space.
          */
-        sc_must_snprintf(mount_point, sizeof mount_point, "%s/%s/current", SNAP_MOUNT_DIR, "core");
+        sc_must_snprintf(mount_point, sizeof mount_point, "%s/%s/current", sc_snap_mount_dir(NULL), "core");
         if (access(mount_point, F_OK) == 0) {
             sc_cleanup_string(&inv->base_snap_name);
             inv->base_snap_name = sc_strdup("core");
@@ -146,8 +161,7 @@ void sc_check_rootfs_dir(sc_invocation *inv) {
     die("cannot locate base snap %s", inv->base_snap_name);
 }
 
-static char* read_homedirs_from_system_params(void)
-{
+static char *read_homedirs_from_system_params(void) {
     FILE *f SC_CLEANUP(sc_cleanup_file) = NULL;
     f = fopen("/var/lib/snapd/system-params", "r");
     if (f == NULL) {
@@ -164,8 +178,7 @@ static char* read_homedirs_from_system_params(void)
     return NULL;
 }
 
-void sc_invocation_init_homedirs(sc_invocation *inv)
-{
+void sc_invocation_init_homedirs(sc_invocation *inv) {
     char *config_line SC_CLEANUP(sc_cleanup_string) = read_homedirs_from_system_params();
     if (config_line == NULL) {
         return;

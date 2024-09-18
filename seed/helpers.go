@@ -21,7 +21,6 @@ package seed
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -61,7 +60,7 @@ func newMemAssertionsDB(commitObserve func(verified asserts.Assertion)) (db *ass
 
 func loadAssertions(assertsDir string, loadedFunc func(*asserts.Ref) error) (*asserts.Batch, error) {
 	logger.Debugf("loading assertions from %s", assertsDir)
-	dc, err := ioutil.ReadDir(assertsDir)
+	dc, err := os.ReadDir(assertsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrNoAssertions
@@ -156,11 +155,11 @@ func findBrand(seed Seed, db asserts.RODatabase) (*asserts.Account, error) {
 
 type defaultSnapHandler struct{}
 
-func (h defaultSnapHandler) HandleUnassertedSnap(name, path string, _ timings.Measurer) (string, error) {
+func (h defaultSnapHandler) HandleUnassertedContainer(_ snap.ContainerPlaceInfo, path string, _ timings.Measurer) (string, error) {
 	return path, nil
 }
 
-func (h defaultSnapHandler) HandleAndDigestAssertedSnap(name, path string, essType snap.Type, _ *asserts.SnapRevision, _ func(string, uint64) (snap.Revision, error), _ timings.Measurer) (string, string, uint64, error) {
+func (h defaultSnapHandler) HandleAndDigestAssertedContainer(_ snap.ContainerPlaceInfo, path string, _ timings.Measurer) (string, string, uint64, error) {
 	sha3_384, size, err := asserts.SnapFileSHA3_384(path)
 	if err != nil {
 		return "", "", 0, err

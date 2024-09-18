@@ -37,8 +37,11 @@ prepare: |
   mount /dev/nbd0p1 "$IMAGE_MOUNTPOINT"
 
   # add snapd from this branch into the seed
-  "$TESTSTOOLS"/snaps-state repack_snapd_deb_into_snap snapd
-  mv snapd-from-deb.snap snapd.snap
+
+  # shellcheck source=tests/lib/prepare.sh
+  . "$TESTSLIB"/prepare.sh
+  build_snapd_snap_with_run_mode_firstboot_tweaks "$PWD"
+  mv snapd_*.snap snapd.snap
   inject_snap_into_seed "$IMAGE_MOUNTPOINT" snapd
 
   if [ ! -x /usr/bin/lxc ]; then
@@ -60,7 +63,7 @@ restore: |
     apt autoremove --purge -y
   fi
 
-    umount "$IMAGE_MOUNTPOINT"
+  umount "$IMAGE_MOUNTPOINT"
   rmdir "$IMAGE_MOUNTPOINT"
 
   # qemu-nbd -d may sporadically fail when removing the device,
@@ -68,6 +71,11 @@ restore: |
   retry -n 30 --wait 1 qemu-nbd -d /dev/nbd0
 
   "$TESTSTOOLS"/lxd-state undo-mount-changes
+
+  # the test started a privileged LXD container which most likely replaced the
+  # AppArmor profile for /usr/lib/snapd/snap-confine with its own version,
+  # restart apparmor.service so we get back the right profiles
+  systemctl restart apparmor.service
 
 execute: |
   echo "Create a trivial container using the lxd snap"

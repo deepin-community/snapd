@@ -59,7 +59,7 @@ func (s *downloadSnapSuite) SetUpTest(c *C) {
 	s.AddCleanup(snapstatetest.UseFallbackDeviceModel())
 
 	restore := snapstate.MockEnforcedValidationSets(func(st *state.State, extraVss ...*asserts.ValidationSet) (*snapasserts.ValidationSets, error) {
-		return nil, nil
+		return snapasserts.NewValidationSets(), nil
 	})
 	s.AddCleanup(restore)
 }
@@ -296,8 +296,8 @@ func (s *downloadSnapSuite) TestDoDownloadRateLimitedIntegration(c *C) {
 			name:   "foo",
 			target: filepath.Join(dirs.SnapBlobDir, "foo_11.snap"),
 			opts: &store.DownloadOptions{
-				RateLimit:     1234,
-				IsAutoRefresh: true,
+				RateLimit: 1234,
+				Scheduled: true,
 			},
 		},
 	})

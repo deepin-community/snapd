@@ -21,7 +21,7 @@ package client_test
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"io"
 
 	"gopkg.in/check.v1"
 
@@ -140,7 +140,7 @@ func (cs *clientSuite) TestRequestSystemActionHappy(c *check.C) {
 	c.Check(cs.req.Method, check.Equals, "POST")
 	c.Check(cs.req.URL.Path, check.Equals, "/v2/systems/1234")
 
-	body, err := ioutil.ReadAll(cs.req.Body)
+	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
 	var req map[string]interface{}
 	err = json.Unmarshal(body, &req)
@@ -182,7 +182,7 @@ func (cs *clientSuite) TestRequestSystemRebootHappy(c *check.C) {
 	c.Check(cs.req.Method, check.Equals, "POST")
 	c.Check(cs.req.URL.Path, check.Equals, "/v2/systems/20201212")
 
-	body, err := ioutil.ReadAll(cs.req.Body)
+	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
 	var req map[string]interface{}
 	err = json.Unmarshal(body, &req)
@@ -272,6 +272,15 @@ func (cs *clientSuite) TestSystemDetailsHappy(c *check.C) {
 	c.Assert(err, check.IsNil)
 	c.Check(cs.req.Method, check.Equals, "GET")
 	c.Check(cs.req.URL.Path, check.Equals, "/v2/systems/20190102")
+	vols := map[string]*gadget.Volume{
+		"pc": {
+			Schema:     "gpt",
+			Bootloader: "grub",
+			Structure: []gadget.VolumeStructure{
+				{Name: "mbr", Type: "mbr", Size: 440},
+			},
+		}}
+	gadget.SetEnclosingVolumeInStructs(vols)
 	c.Check(sys, check.DeepEquals, &client.SystemDetails{
 		Current: true,
 		Label:   "20200101",
@@ -295,15 +304,7 @@ func (cs *clientSuite) TestSystemDetailsHappy(c *check.C) {
 			StorageSafety: "prefer-encrypted",
 			Type:          "cryptsetup",
 		},
-		Volumes: map[string]*gadget.Volume{
-			"pc": {
-				Schema:     "gpt",
-				Bootloader: "grub",
-				Structure: []gadget.VolumeStructure{
-					{Name: "mbr", Type: "mbr", Size: 440},
-				},
-			},
-		},
+		Volumes: vols,
 	})
 }
 
@@ -376,7 +377,7 @@ func (cs *clientSuite) TestRequestSystemInstallHappy(c *check.C) {
 	c.Check(cs.req.Method, check.Equals, "POST")
 	c.Check(cs.req.URL.Path, check.Equals, "/v2/systems/1234")
 
-	body, err := ioutil.ReadAll(cs.req.Body)
+	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
 	var req map[string]interface{}
 	err = json.Unmarshal(body, &req)

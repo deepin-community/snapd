@@ -83,6 +83,16 @@ func checkOnClassic(c *asserts.OnClassicConstraint) error {
 	return nil
 }
 
+func checkOnCoreDesktop(c *asserts.OnCoreDesktopConstraint) error {
+	if c == nil {
+		return nil
+	}
+	if c.CoreDesktop != release.OnCoreDesktop {
+		return fmt.Errorf("on-core-desktop mismatch")
+	}
+	return nil
+}
+
 func checkDeviceScope(c *asserts.DeviceScopeConstraint, model *asserts.Model, store *asserts.Store) error {
 	if c == nil {
 		return nil
@@ -123,13 +133,16 @@ func checkPlugConnectionConstraints1(connc *ConnectCandidate, constraints *asser
 	if err := checkID("snap id", connc.slotSnapID(), constraints.SlotSnapIDs, nil); err != nil {
 		return err
 	}
-	err := checkID("publisher id", connc.slotPublisherID(), constraints.SlotPublisherIDs, map[string]string{
-		"$PLUG_PUBLISHER_ID": connc.plugPublisherID(),
+	err := checkID("publisher id", connc.SlotPublisherID(), constraints.SlotPublisherIDs, map[string]string{
+		"$PLUG_PUBLISHER_ID": connc.PlugPublisherID(),
 	})
 	if err != nil {
 		return err
 	}
 	if err := checkOnClassic(constraints.OnClassic); err != nil {
+		return err
+	}
+	if err := checkOnCoreDesktop(constraints.OnCoreDesktop); err != nil {
 		return err
 	}
 	if err := checkDeviceScope(constraints.DeviceScope, connc.Model, connc.Store); err != nil {
@@ -167,19 +180,25 @@ func checkSlotConnectionConstraints1(connc *ConnectCandidate, constraints *asser
 	if err := constraints.SlotAttributes.Check(connc.Slot, connc); err != nil {
 		return err
 	}
+	if err := checkSnapType(connc.Slot.Snap(), constraints.SlotSnapTypes); err != nil {
+		return err
+	}
 	if err := checkSnapType(connc.Plug.Snap(), constraints.PlugSnapTypes); err != nil {
 		return err
 	}
 	if err := checkID("snap id", connc.plugSnapID(), constraints.PlugSnapIDs, nil); err != nil {
 		return err
 	}
-	err := checkID("publisher id", connc.plugPublisherID(), constraints.PlugPublisherIDs, map[string]string{
-		"$SLOT_PUBLISHER_ID": connc.slotPublisherID(),
+	err := checkID("publisher id", connc.PlugPublisherID(), constraints.PlugPublisherIDs, map[string]string{
+		"$SLOT_PUBLISHER_ID": connc.SlotPublisherID(),
 	})
 	if err != nil {
 		return err
 	}
 	if err := checkOnClassic(constraints.OnClassic); err != nil {
+		return err
+	}
+	if err := checkOnCoreDesktop(constraints.OnCoreDesktop); err != nil {
 		return err
 	}
 	if err := checkDeviceScope(constraints.DeviceScope, connc.Model, connc.Store); err != nil {
@@ -210,6 +229,9 @@ func checkSnapTypeSlotInstallationConstraints1(slot *snap.SlotInfo, constraints 
 	if err := checkOnClassic(constraints.OnClassic); err != nil {
 		return err
 	}
+	if err := checkOnCoreDesktop(constraints.OnCoreDesktop); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -218,7 +240,7 @@ func checkMinimalSlotInstallationAltConstraints(slot *snap.SlotInfo, altConstrai
 	var hasSnapTypeConstraints bool
 	// OR of constraints
 	for _, constraints := range altConstraints {
-		if constraints.OnClassic == nil && len(constraints.SlotSnapTypes) == 0 {
+		if constraints.OnClassic == nil && constraints.OnCoreDesktop == nil && len(constraints.SlotSnapTypes) == 0 {
 			continue
 		}
 		hasSnapTypeConstraints = true
@@ -249,6 +271,9 @@ func checkSlotInstallationConstraints1(ic *InstallCandidate, slot *snap.SlotInfo
 		return err
 	}
 	if err := checkOnClassic(constraints.OnClassic); err != nil {
+		return err
+	}
+	if err := checkOnCoreDesktop(constraints.OnCoreDesktop); err != nil {
 		return err
 	}
 	if err := checkDeviceScope(constraints.DeviceScope, ic.Model, ic.Store); err != nil {
@@ -288,6 +313,9 @@ func checkPlugInstallationConstraints1(ic *InstallCandidate, plug *snap.PlugInfo
 		return err
 	}
 	if err := checkOnClassic(constraints.OnClassic); err != nil {
+		return err
+	}
+	if err := checkOnCoreDesktop(constraints.OnCoreDesktop); err != nil {
 		return err
 	}
 	if err := checkDeviceScope(constraints.DeviceScope, ic.Model, ic.Store); err != nil {

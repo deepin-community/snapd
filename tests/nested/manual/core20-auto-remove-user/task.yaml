@@ -1,6 +1,10 @@
 summary: Verify that snapd correctly removes expired users created with assertions.
 
-systems: [ubuntu-20.04-64, ubuntu-22.04-64]
+details: |
+  Check snapd removes expired users created with assertions, and also is able to
+  reimports the user with a new expiration date.
+
+systems: [ubuntu-2*]
 
 environment:
   # use snapd from the spread run so that we have testkeys trusted in the
@@ -135,7 +139,7 @@ execute: |
     local ASSERT="$1"
     if ! remote.exec "test -e /dev/ram0"; then
       remote.exec "sudo mknod -m 660 /dev/ram0 b 1 0"
-      remote.exec "sudo chown root.disk /dev/ram0"
+      remote.exec "sudo chown root:disk /dev/ram0"
     fi
     remote.exec "sudo mkfs.ext3 /dev/ram0"
     remote.exec "sudo mount /dev/ram0 /mnt"
@@ -178,7 +182,7 @@ execute: |
   teardown_ramdisk
 
   # lets put the system time ahead by 1h
-  remote.exec "sudo timedatectl set-ntp false"
+  retry -n 3 --wait 5 remote.exec "sudo timedatectl set-ntp false"
   remote.exec "sudo date -s 'next hour'"
 
   # run ensure state to have the user removed

@@ -1,7 +1,6 @@
-From cc4da7a206ef99064056f29d4882c73684b4af25 Mon Sep 17 00:00:00 2001
 From: Zygmunt Krynicki <me@zygoon.pl>
 Date: Thu, 17 Jan 2019 17:38:41 +0200
-Subject: [PATCH 4/9] cmd/snap: skip tests depending on text wrapping
+Subject: cmd/snap: skip tests depending on text wrapping
 
 Upstream snapd contains tests that check the output of various commands
 along with the --help command-line argument. The output is wrapped to
@@ -23,10 +22,10 @@ Signed-off-by: Zygmunt Krynicki <me@zygoon.pl>
  cmd/snap/cmd_unalias_test.go    | 1 +
  8 files changed, 9 insertions(+)
 
-Index: snapd/cmd/snap/cmd_alias_test.go
-===================================================================
---- snapd.orig/cmd/snap/cmd_alias_test.go
-+++ snapd/cmd/snap/cmd_alias_test.go
+diff --git a/cmd/snap/cmd_alias_test.go b/cmd/snap/cmd_alias_test.go
+index 97e4926..ab3a87c 100644
+--- a/cmd/snap/cmd_alias_test.go
++++ b/cmd/snap/cmd_alias_test.go
 @@ -29,6 +29,7 @@ import (
  )
  
@@ -35,10 +34,10 @@ Index: snapd/cmd/snap/cmd_alias_test.go
  	msg := `Usage:
    snap.test alias [alias-OPTIONS] <snap.app> <alias>
  
-Index: snapd/cmd/snap/cmd_connect_test.go
-===================================================================
---- snapd.orig/cmd/snap/cmd_connect_test.go
-+++ snapd/cmd/snap/cmd_connect_test.go
+diff --git a/cmd/snap/cmd_connect_test.go b/cmd/snap/cmd_connect_test.go
+index 9e0c04b..a4912a9 100644
+--- a/cmd/snap/cmd_connect_test.go
++++ b/cmd/snap/cmd_connect_test.go
 @@ -32,6 +32,7 @@ import (
  )
  
@@ -47,10 +46,10 @@ Index: snapd/cmd/snap/cmd_connect_test.go
  	msg := `Usage:
    snap.test connect [connect-OPTIONS] <snap>:<plug> [<snap>:<slot>]
  
-Index: snapd/cmd/snap/cmd_disconnect_test.go
-===================================================================
---- snapd.orig/cmd/snap/cmd_disconnect_test.go
-+++ snapd/cmd/snap/cmd_disconnect_test.go
+diff --git a/cmd/snap/cmd_disconnect_test.go b/cmd/snap/cmd_disconnect_test.go
+index 695110d..0aa2ba1 100644
+--- a/cmd/snap/cmd_disconnect_test.go
++++ b/cmd/snap/cmd_disconnect_test.go
 @@ -31,6 +31,7 @@ import (
  )
  
@@ -59,11 +58,11 @@ Index: snapd/cmd/snap/cmd_disconnect_test.go
  	msg := `Usage:
    snap.test disconnect [disconnect-OPTIONS] <snap>:<plug> [<snap>:<slot>]
  
-Index: snapd/cmd/snap/cmd_info_test.go
-===================================================================
---- snapd.orig/cmd/snap/cmd_info_test.go
-+++ snapd/cmd/snap/cmd_info_test.go
-@@ -763,6 +763,7 @@ func (s *infoSuite) TestInfoNotFound(c *
+diff --git a/cmd/snap/cmd_info_test.go b/cmd/snap/cmd_info_test.go
+index a21b507..851c239 100644
+--- a/cmd/snap/cmd_info_test.go
++++ b/cmd/snap/cmd_info_test.go
+@@ -858,6 +858,7 @@ func (s *infoSuite) TestInfoNotFound(c *check.C) {
  }
  
  func (s *infoSuite) TestInfoWithLocalNoLicense(c *check.C) {
@@ -71,7 +70,7 @@ Index: snapd/cmd/snap/cmd_info_test.go
  	n := 0
  	s.RedirectClientToTestServer(func(w http.ResponseWriter, r *http.Request) {
  		switch n {
-@@ -799,6 +800,7 @@ installed:    2.10 (100) 1kB disabled
+@@ -894,6 +895,7 @@ installed:    2.10 (100) 1kB disabled
  }
  
  func (s *infoSuite) TestInfoWithChannelsAndLocal(c *check.C) {
@@ -79,10 +78,10 @@ Index: snapd/cmd/snap/cmd_info_test.go
  	n := 0
  	s.RedirectClientToTestServer(func(w http.ResponseWriter, r *http.Request) {
  		switch n {
-Index: snapd/cmd/snap/cmd_interface_test.go
-===================================================================
---- snapd.orig/cmd/snap/cmd_interface_test.go
-+++ snapd/cmd/snap/cmd_interface_test.go
+diff --git a/cmd/snap/cmd_interface_test.go b/cmd/snap/cmd_interface_test.go
+index a4b0ce4..efb8868 100644
+--- a/cmd/snap/cmd_interface_test.go
++++ b/cmd/snap/cmd_interface_test.go
 @@ -32,6 +32,7 @@ import (
  )
  
@@ -91,10 +90,10 @@ Index: snapd/cmd/snap/cmd_interface_test.go
  	msg := `Usage:
    snap.test interface [interface-OPTIONS] [<interface>]
  
-Index: snapd/cmd/snap/cmd_list_test.go
-===================================================================
---- snapd.orig/cmd/snap/cmd_list_test.go
-+++ snapd/cmd/snap/cmd_list_test.go
+diff --git a/cmd/snap/cmd_list_test.go b/cmd/snap/cmd_list_test.go
+index b711e37..3f248ab 100644
+--- a/cmd/snap/cmd_list_test.go
++++ b/cmd/snap/cmd_list_test.go
 @@ -29,6 +29,7 @@ import (
  )
  
@@ -103,10 +102,10 @@ Index: snapd/cmd/snap/cmd_list_test.go
  	msg := `Usage:
    snap.test list [list-OPTIONS] [<snap>...]
  
-Index: snapd/cmd/snap/cmd_prefer_test.go
-===================================================================
---- snapd.orig/cmd/snap/cmd_prefer_test.go
-+++ snapd/cmd/snap/cmd_prefer_test.go
+diff --git a/cmd/snap/cmd_prefer_test.go b/cmd/snap/cmd_prefer_test.go
+index 5091609..e11b832 100644
+--- a/cmd/snap/cmd_prefer_test.go
++++ b/cmd/snap/cmd_prefer_test.go
 @@ -29,6 +29,7 @@ import (
  )
  
@@ -115,10 +114,10 @@ Index: snapd/cmd/snap/cmd_prefer_test.go
  	msg := `Usage:
    snap.test prefer [prefer-OPTIONS] <snap>
  
-Index: snapd/cmd/snap/cmd_unalias_test.go
-===================================================================
---- snapd.orig/cmd/snap/cmd_unalias_test.go
-+++ snapd/cmd/snap/cmd_unalias_test.go
+diff --git a/cmd/snap/cmd_unalias_test.go b/cmd/snap/cmd_unalias_test.go
+index 72e45fd..613d5e0 100644
+--- a/cmd/snap/cmd_unalias_test.go
++++ b/cmd/snap/cmd_unalias_test.go
 @@ -29,6 +29,7 @@ import (
  )
  

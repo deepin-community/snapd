@@ -19,9 +19,13 @@
 
 package snapdtool
 
+import (
+	"github.com/snapcore/snapd/testutil"
+)
+
 var (
-	DistroSupportsReExec     = distroSupportsReExec
 	SystemSnapSupportsReExec = systemSnapSupportsReExec
+	ExeAndRoot               = exeAndRoot
 )
 
 func MockCoreSnapdPaths(newCoreSnap, newSnapdSnap string) func() {
@@ -49,4 +53,8 @@ func MockSyscallExec(f func(argv0 string, argv []string, envv []string) (err err
 	return func() {
 		syscallExec = oldSyscallExec
 	}
+}
+
+func MockElfInterp(f func(string) (string, error)) (restore func()) {
+	return testutil.Mock(&elfInterp, f)
 }
