@@ -21,7 +21,9 @@ package ctlcmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -34,9 +36,16 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 )
 
 var finalTasks map[string]bool
+
+var (
+	servicestateControl        = servicestate.Control
+	snapstateInstallComponents = snapstate.InstallComponents
+	snapstateRemoveComponents  = snapstate.RemoveComponents
+)
 
 func init() {
 	finalTasks = make(map[string]bool, len(snapstate.FinalTasks))
@@ -45,19 +54,24 @@ func init() {
 	}
 }
 
-func getServiceInfos(st *state.State, snapName string, serviceNames []string) ([]*snap.AppInfo, error) {
-	st.Lock()
-	defer st.Unlock()
-
+func currentSnapInfo(st *state.State, snapName string) (*snap.Info, error) {
 	var snapst snapstate.SnapState
 	if err := snapstate.Get(st, snapName, &snapst); err != nil {
 		return nil, err
 	}
 
-	info, err := snapst.CurrentInfo()
+	return snapst.CurrentInfo()
+}
+
+func getServiceInfos(st *state.State, snapName string, serviceNames []string) ([]*snap.AppInfo, error) {
+	st.Lock()
+	defer st.Unlock()
+
+	info, err := currentSnapInfo(st, snapName)
 	if err != nil {
 		return nil, err
 	}
+
 	if len(serviceNames) == 0 {
 		// all services
 		return info.Services(), nil
@@ -83,21 +97,15 @@ func getServiceInfos(st *state.State, snapName string, serviceNames []string) ([
 	return svcs, nil
 }
 
-var servicestateControl = servicestate.Control
-
-func queueCommand(context *hookstate.Context, tts []*state.TaskSet) error {
+func prepareQueueCommand(context *hookstate.Context, tts []*state.TaskSet) (change *state.Change, tasks []*state.Task, err error) {
 	hookTask, ok := context.Task()
 	if !ok {
-		return fmt.Errorf("attempted to queue command with ephemeral context")
+		return nil, nil, fmt.Errorf("attempted to queue command with ephemeral context")
 	}
 
-	st := context.State()
-	st.Lock()
-	defer st.Unlock()
-
-	change := hookTask.Change()
+	change = hookTask.Change()
 	hookTaskLanes := hookTask.Lanes()
-	tasks := change.LaneTasks(hookTaskLanes...)
+	tasks = change.LaneTasks(hookTaskLanes...)
 
 	// When installing or updating multiple snaps, there is one lane per snap.
 	// We want service command to join respective lane (it's the lane the hook belongs to).
@@ -111,9 +119,27 @@ func queueCommand(context *hookstate.Context, tts []*state.TaskSet) error {
 		}
 	}
 
+	return change, tasks, err
+}
+
+// queueCommand queues service command after all tasks, except for final tasks which must come after service commands.
+func queueCommand(context *hookstate.Context, tts []*state.TaskSet) error {
+	st := context.State()
+	st.Lock()
+	defer st.Unlock()
+
+	change, tasks, err := prepareQueueCommand(context, tts)
+	if err != nil {
+		return err
+	}
+
+	// Note: Multiple snaps could be installed in single transaction mode
+	// where all snap tasksets are in a single lane.
+	// This is non-issue for configure hook since the command tasks are
+	// queued at the very end of the change unlike the default-configure
+	// hook.
 	for _, ts := range tts {
 		for _, t := range tasks {
-			// queue service command after all tasks, except for final tasks which must come after service commands
 			if finalTasks[t.Kind()] {
 				t.WaitAll(ts)
 			} else {
@@ -122,6 +148,48 @@ func queueCommand(context *hookstate.Context, tts []*state.TaskSet) error {
 		}
 		change.AddAll(ts)
 	}
+
+	// As this can be run from what was originally the last task of a change,
+	// make sure the tasks added to the change are considered immediately.
+	st.EnsureBefore(0)
+
+	return nil
+}
+
+// queueDefaultConfigureHookCommand queues service command exactly after start-snap-services.
+//
+// This is possible because the default-configure hook is run on first-install only and right
+// after start-snap-services is the nearest we can queue the service commands safely to make
+// sure all the needed state is setup properly.
+func queueDefaultConfigureHookCommand(context *hookstate.Context, tts []*state.TaskSet) error {
+	st := context.State()
+	st.Lock()
+	defer st.Unlock()
+
+	_, tasks, err := prepareQueueCommand(context, tts)
+	if err != nil {
+		return err
+	}
+
+	for _, t := range tasks {
+		if t.Kind() == "start-snap-services" {
+			snapsup, err := snapstate.TaskSnapSetup(t)
+			if err != nil {
+				return err
+			}
+			// Multiple snaps could be installed in single transaction mode
+			// where all snap tasksets are in a single lane.
+			// Check that the task belongs to the relevant snap.
+			if snapsup.InstanceName() != context.InstanceName() {
+				continue
+			}
+			for _, ts := range tts {
+				snapstate.InjectTasks(t, ts)
+			}
+			break
+		}
+	}
+
 	// As this can be run from what was originally the last task of a change,
 	// make sure the tasks added to the change are considered immediately.
 	st.EnsureBefore(0)
@@ -143,14 +211,20 @@ func runServiceCommand(context *hookstate.Context, inst *servicestate.Instructio
 	flags := &servicestate.Flags{CreateExecCommandTasks: true}
 	// passing context so we can ignore self-conflicts with the current change
 	st.Lock()
-	tts, err := servicestateControl(st, appInfos, inst, flags, context)
+	tts, err := servicestateControl(st, appInfos, inst, nil, flags, context)
 	st.Unlock()
 	if err != nil {
 		return err
 	}
 
-	if !context.IsEphemeral() && context.HookName() == "configure" {
-		return queueCommand(context, tts)
+	if !context.IsEphemeral() {
+		// queue service command for default-configure and configure hooks.
+		switch context.HookName() {
+		case "configure":
+			return queueCommand(context, tts)
+		case "default-configure":
+			return queueDefaultConfigureHookCommand(context, tts)
+		}
 	}
 
 	st.Lock()
@@ -168,6 +242,114 @@ func runServiceCommand(context *hookstate.Context, inst *servicestate.Instructio
 		return chg.Err()
 	case <-time.After(configstate.ConfigureHookTimeout() / 2):
 		return fmt.Errorf("%s command is taking too long", inst.Action)
+	}
+}
+
+func validateSnapAndCompsNames(names []string, ctxSnap string) ([]string, error) {
+	var allComps []string
+	for _, name := range names {
+		snap, comps := snap.SplitSnapInstanceAndComponents(name)
+		// if snap is present it must be the context snap for the moment
+		if snap != "" && snap != ctxSnap {
+			return nil, errors.New("cannot install snaps using snapctl")
+		}
+		for _, comp := range comps {
+			if err := naming.ValidateSnap(comp); err != nil {
+				return nil, err
+			}
+		}
+		allComps = append(allComps, comps...)
+	}
+	return allComps, nil
+}
+
+type managementCommandOp int
+
+const (
+	installManagementCommand managementCommandOp = iota
+	removeManagementCommand
+)
+
+type managementCommand struct {
+	operation  managementCommandOp
+	components []string
+}
+
+func changeIDIfNotEphemeral(hctx *hookstate.Context) string {
+	if !hctx.IsEphemeral() {
+		return hctx.ChangeID()
+	}
+	return ""
+}
+
+func createSnapctlInstallTasks(hctx *hookstate.Context, cmd managementCommand) (tss []*state.TaskSet, err error) {
+	st := hctx.State()
+	st.Lock()
+	defer st.Unlock()
+
+	info, err := currentSnapInfo(st, hctx.InstanceName())
+	if err != nil {
+		return nil, err
+	}
+	return snapstateInstallComponents(context.TODO(), st, cmd.components, info,
+		snapstate.Options{ExpectOneSnap: true, FromChange: changeIDIfNotEphemeral(hctx)})
+}
+
+func createSnapctlRemoveTasks(hctx *hookstate.Context, cmd managementCommand) (tss []*state.TaskSet, err error) {
+	st := hctx.State()
+	st.Lock()
+	defer st.Unlock()
+
+	return snapstateRemoveComponents(st, hctx.InstanceName(), cmd.components,
+		snapstate.RemoveComponentsOpts{RefreshProfile: true,
+			FromChange: changeIDIfNotEphemeral(hctx)})
+}
+
+func runSnapManagementCommand(hctx *hookstate.Context, cmd managementCommand) error {
+	st := hctx.State()
+	var tss []*state.TaskSet
+	var err error
+	var cmdStr, cmdVerb string
+
+	switch cmd.operation {
+	case installManagementCommand:
+		tss, err = createSnapctlInstallTasks(hctx, cmd)
+		cmdStr = "install"
+		cmdVerb = "Installing"
+	case removeManagementCommand:
+		tss, err = createSnapctlRemoveTasks(hctx, cmd)
+		cmdStr = "remove"
+		cmdVerb = "Removing"
+	default:
+		err = fmt.Errorf("internal error: %q is not a valid snap management command", cmd.operation)
+	}
+	if err != nil {
+		return err
+	}
+
+	if !hctx.IsEphemeral() {
+		// Differently to service control commands, we always queue the
+		// management tasks if run from a hook.
+		return queueCommand(hctx, tss)
+	}
+
+	st.Lock()
+	chg := st.NewChange("snapctl-"+cmdStr,
+		fmt.Sprintf("%s components %v for snap %s",
+			cmdVerb, cmd.components, hctx.InstanceName()))
+	for _, ts := range tss {
+		chg.AddAll(ts)
+	}
+	st.EnsureBefore(0)
+	st.Unlock()
+
+	select {
+	case <-chg.Ready():
+		st.Lock()
+		defer st.Unlock()
+		return chg.Err()
+	case <-time.After(10 * time.Minute):
+		return fmt.Errorf("snapctl %s command is taking too long", cmdStr)
 	}
 }
 

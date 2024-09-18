@@ -1,0 +1,22 @@
+From: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+Date: Mon, 3 Jun 2024 11:41:32 +0200
+Subject: packaging: set LANG=C.utf-8 during tests
+
+Signed-off-by: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+---
+ packaging/debian-sid/rules | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/packaging/debian-sid/rules b/packaging/debian-sid/rules
+index 1a0139a..02de8f4 100755
+--- a/packaging/debian-sid/rules
++++ b/packaging/debian-sid/rules
+@@ -189,7 +189,7 @@ endif
+ 	$(MAKE) -C data all
+ 
+ override_dh_auto_test:
+-	GO111MODULE=off dh_auto_test -- $(BUILDFLAGS) -tags "$(TAGS)" $(GCCGOFLAGS) $(DH_GOPKG)/...
++	LANG=C.utf-8 GO111MODULE=off dh_auto_test -- $(BUILDFLAGS) -tags "$(TAGS)" $(GCCGOFLAGS) $(DH_GOPKG)/...
+ # a tested default (production) build should have no test keys
+ ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+ 	# check that only the main trusted account-keys are included

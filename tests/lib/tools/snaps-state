@@ -5,6 +5,7 @@ show_help() {
     echo "       install-local <snap-name> [OPTIONS]"
     echo "       install-local-as <snap-name> <dest-name> [OPTIONS]"
     echo "       show-name <snap>"
+    echo "       show-revision <snap>"
     echo "       is-confinement-supported <classic|devmode|strict>"
     echo "       repack-snapd-deb-into-snap <snapd|core>"
     echo "       repack-core-snap-into-snapd-snap"
@@ -99,6 +100,15 @@ show_name() {
     esac
 }
 
+show_revision() {
+    local snap="$1"
+    if not snap list "$snap" &>/dev/null; then
+        echo "snaps-state: the snap $snap is not installed" >&2
+        exit 1
+    fi
+    snap info "$snap" | awk "/installed: / {print(\$3)}" | sed -e 's/(\(.*\))/\1/'
+}
+
 is_confinement_supported() {
     local confinement="$1"
     if [ -z "$confinement" ]; then
@@ -109,7 +119,7 @@ is_confinement_supported() {
     snap debug sandbox-features --required=confinement-options:"$confinement"
 }
 
-# The function will re-pack either core or snpad snap using the assets
+# The function will re-pack either core or snapd snap using the assets
 # from the snapd deb installed on the system
 repack_snapd_deb_into_snap() {
     local snap_name="$1"
@@ -135,22 +145,6 @@ repack_snapd_deb_into_snap() {
 
             # cleanup
             rm -rf core-unpacked
-            ;;
-        snapd)
-            # use snapd from edge as a recent snap that should be close to what we will
-            # have in the snapd deb
-            snap download snapd --basename=snapd --edge
-            unsquashfs -d ./snapd-unpacked snapd.snap
-            rm snapd.snap
-
-            # extract all the files from the snapd deb
-            dpkg-deb -x "$deb_file" ./snapd-unpacked
-
-            # repack into the target dir specified
-            snap pack --filename=snapd-from-deb.snap  snapd-unpacked "$target_dir"
-
-            # cleanup
-            rm -rf snapd-unpacked
             ;;
         *)
             echo "snaps-state: use either core or snapd snaps for repack, snapd $snap_name not supported"

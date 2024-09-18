@@ -1,6 +1,5 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 //go:build !nomanagers
-// +build !nomanagers
 
 /*
  * Copyright (C) 2017-2022 Canonical Ltd
@@ -23,7 +22,6 @@ package configcore_test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
@@ -75,7 +73,7 @@ func (s *proxySuite) SetUpTest(c *C) {
 }
 
 func (s *proxySuite) makeMockEtcEnvironment(c *C) {
-	err := ioutil.WriteFile(s.mockEtcEnvironment, []byte(`
+	err := os.WriteFile(s.mockEtcEnvironment, []byte(`
 PATH="/usr/bin"
 `), 0644)
 	c.Assert(err, IsNil)
@@ -83,6 +81,8 @@ PATH="/usr/bin"
 
 func (s *proxySuite) TestConfigureProxyUnhappy(c *C) {
 	dirs.SetRootDir(c.MkDir())
+	r := configcore.MockEnvPath("/otherrootfs/etc/environment")
+	defer r()
 	err := configcore.Run(coreDev, &mockConf{
 		state: s.state,
 		conf: map[string]interface{}{
@@ -107,7 +107,8 @@ func (s *proxySuite) TestConfigureProxy(c *C) {
 
 		c.Check(s.mockEtcEnvironment, testutil.FileEquals, fmt.Sprintf(`
 PATH="/usr/bin"
-%[1]s_proxy=%[1]s://example.com`, proto))
+%[1]s_proxy=%[1]s://example.com
+`, proto))
 	}
 }
 
@@ -124,7 +125,8 @@ func (s *proxySuite) TestConfigureNoProxy(c *C) {
 
 	c.Check(s.mockEtcEnvironment, testutil.FileEquals, `
 PATH="/usr/bin"
-no_proxy=example.com,bar.com`)
+no_proxy=example.com,bar.com
+`)
 }
 
 func (s *proxySuite) TestConfigureProxyStore(c *C) {

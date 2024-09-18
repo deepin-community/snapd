@@ -1,0 +1,37 @@
+From: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+Date: Fri, 26 Jan 2024 01:11:46 +0100
+Subject: packaging,spread.yaml: use needs-sudo to setup sudo
+
+Sudo access is managed by the "needs-sudo" flag. We can drop our custom logic
+and associated manipulation. This also ensures the testbed is correctly
+selected, and incompatible systems are rejected.
+
+Signed-off-by: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+---
+ packaging/debian-sid/tests/control | 2 +-
+ spread.yaml                        | 1 -
+ 2 files changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/packaging/debian-sid/tests/control b/packaging/debian-sid/tests/control
+index 9b2b367..724473d 100644
+--- a/packaging/debian-sid/tests/control
++++ b/packaging/debian-sid/tests/control
+@@ -1,5 +1,5 @@
+ Tests: integrationtests
+-Restrictions: allow-stderr, rw-build-tree, needs-root, breaks-testbed, isolation-machine
++Restrictions: allow-stderr, rw-build-tree, needs-root, breaks-testbed, isolation-machine, needs-sudo
+ Depends: bzr,
+          ca-certificates,
+          git,
+diff --git a/spread.yaml b/spread.yaml
+index 2206e10..3b4bf56 100644
+--- a/spread.yaml
++++ b/spread.yaml
+@@ -442,7 +442,6 @@ backends:
+                 FATAL "adhoc only works inside autopkgtest"
+                 exit 1
+             fi
+-            echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/99-spread-users
+             ADDRESS localhost:22
+         discard: |
+             echo "Discarding ad-hoc $SPREAD_SYSTEM"

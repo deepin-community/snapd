@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -163,8 +162,13 @@ func Prepare(opts *Options) error {
 		if model.Classic() {
 			return fmt.Errorf("cannot preseed the image for a classic model")
 		}
-		if model.Base() != "core20" {
-			return fmt.Errorf("cannot preseed the image for a model other than core20")
+
+		coreVersion, err := naming.CoreVersion(model.Base())
+		if err != nil {
+			return fmt.Errorf("cannot preseed the image for %s: %v", model.Base(), err)
+		}
+		if coreVersion < 20 {
+			return fmt.Errorf("cannot preseed the image for older base than core20")
 		}
 		coreOpts := &preseed.CoreOptions{
 			PrepareImageDir:           opts.PrepareDir,
@@ -185,7 +189,7 @@ var reserved = []string{"core", "os", "class", "allowed-modes"}
 func decodeModelAssertion(opts *Options) (*asserts.Model, error) {
 	fn := opts.ModelFile
 
-	rawAssert, err := ioutil.ReadFile(fn)
+	rawAssert, err := os.ReadFile(fn)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read model assertion: %s", err)
 	}
@@ -239,7 +243,7 @@ func customizeImage(rootDir, defaultsDir string, custo *Customizations) error {
 		if err := os.MkdirAll(varCloudDir, 0755); err != nil {
 			return err
 		}
-		if err := ioutil.WriteFile(filepath.Join(varCloudDir, "meta-data"), []byte("instance-id: nocloud-static\n"), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(varCloudDir, "meta-data"), []byte("instance-id: nocloud-static\n"), 0644); err != nil {
 			return err
 		}
 		dst := filepath.Join(varCloudDir, "user-data")
@@ -254,7 +258,7 @@ func customizeImage(rootDir, defaultsDir string, custo *Customizations) error {
 		if err := os.MkdirAll(filepath.Dir(consoleConfDisabled), 0755); err != nil {
 			return err
 		}
-		if err := ioutil.WriteFile(consoleConfDisabled, []byte("console-conf has been disabled by image customization\n"), 0644); err != nil {
+		if err := os.WriteFile(consoleConfDisabled, []byte("console-conf has been disabled by image customization\n"), 0644); err != nil {
 			return err
 		}
 	}
@@ -447,17 +451,30 @@ func (s *imageSeeder) validateSnapArchs(snaps []*seedwriter.SeedSnap) error {
 
 type localSnapRefs map[*seedwriter.SeedSnap][]*asserts.Ref
 
-func (s *imageSeeder) deriveInfoForLocalSnaps(f seedwriter.SeedAssertionFetcher, db *asserts.Database) (localSnapRefs, error) {
+func (s *imageSeeder) deriveInfoForLocalSnaps(localCompsPaths []string, f seedwriter.SeedAssertionFetcher, db *asserts.Database) (localSnapRefs, error) {
 	localSnaps, err := s.w.LocalSnaps()
 	if err != nil {
 		return nil, err
 	}
 
-	snaps := make(map[*seedwriter.SeedSnap][]*asserts.Ref)
-	for _, sn := range localSnaps {
-		si, aRefs, err := seedwriter.DeriveSideInfo(sn.Path, s.model, f, db)
-		if err != nil && !errors.Is(err, &asserts.NotFoundError{}) {
+	cinfos := make(map[string]*snap.ComponentInfo, len(localCompsPaths))
+	for _, path := range localCompsPaths {
+		ci, err := readComponentInfoFromCont(path)
+		if err != nil {
 			return nil, err
+		}
+		cinfos[path] = ci
+	}
+
+	snaps := make(localSnapRefs)
+	for _, sn := range localSnaps {
+		assertedSnap := true
+		si, aRefs, err := seedwriter.DeriveSideInfo(sn.Path, s.model, f, db)
+		if err != nil {
+			if !errors.Is(err, &asserts.NotFoundError{}) {
+				return nil, err
+			}
+			assertedSnap = false
 		}
 
 		snapFile, err := snapfile.Open(sn.Path)
@@ -469,10 +486,51 @@ func (s *imageSeeder) deriveInfoForLocalSnaps(f seedwriter.SeedAssertionFetcher,
 			return nil, err
 		}
 
-		if err := s.w.SetInfo(sn, info); err != nil {
+		// Assign components now that we know the snap name
+		seedComps := map[string]*seedwriter.SeedComponent{}
+		for path, ci := range cinfos {
+			if ci.Component.SnapName != info.SnapName() {
+				continue
+			}
+
+			if assertedSnap {
+				// Components for an asserted snap should have
+				// assertions too, error out otherwise
+				csi, crefs, err := seedwriter.DeriveComponentSideInfo(
+					path, ci, info, s.model, f, db)
+				if err != nil {
+					return nil, err
+				}
+				ci.ComponentSideInfo = *csi
+				aRefs = append(aRefs, crefs...)
+			}
+			seedComps[ci.Component.ComponentName] = &seedwriter.SeedComponent{
+				ComponentRef: naming.NewComponentRef(info.SnapName(),
+					ci.Component.ComponentName),
+				Path: path,
+				Info: ci,
+			}
+			delete(cinfos, path)
+		}
+
+		// For local snaps, the component information is set inside
+		// w.SetInfo by looking at the local components information set
+		// in the call to w.SetOptionsSnaps.
+		if err := s.w.SetInfo(sn, info, seedComps); err != nil {
 			return nil, err
 		}
+
 		snaps[sn] = aRefs
+	}
+
+	// Check if there are local components that did not belong to one
+	// of the local snaps
+	errMsg := ""
+	for path := range cinfos {
+		errMsg += fmt.Sprintf("\n%q local component does not have a matching local snap", path)
+	}
+	if errMsg != "" {
+		return nil, fmt.Errorf("missing local snaps:%s", errMsg)
 	}
 
 	// derive info first before verifying the arch
@@ -518,7 +576,7 @@ func (s *imageSeeder) validationSetKeysAndRevisionForSnap(snapName string) ([]sn
 func (s *imageSeeder) downloadSnaps(snapsToDownload []*seedwriter.SeedSnap, curSnaps []*tooling.CurrentSnap) (downloadedSnaps map[string]*tooling.DownloadedSnap, err error) {
 	byName := make(map[string]*seedwriter.SeedSnap, len(snapsToDownload))
 	revisions := make(map[string]snap.Revision)
-	beforeDownload := func(info *snap.Info) (string, error) {
+	beforeDownload := func(info *snap.Info, cinfos map[string]*snap.ComponentInfo) (string, error) {
 		sn := byName[info.SnapName()]
 		if sn == nil {
 			return "", fmt.Errorf("internal error: downloading unexpected snap %q", info.SnapName())
@@ -527,8 +585,17 @@ func (s *imageSeeder) downloadSnaps(snapsToDownload []*seedwriter.SeedSnap, curS
 		if rev.Unset() {
 			rev = info.Revision
 		}
+		seedComps := make(map[string]*seedwriter.SeedComponent, len(cinfos))
+		for _, ci := range cinfos {
+			// No path as these are downloaded components
+			seedComps[ci.Component.ComponentName] = &seedwriter.SeedComponent{
+				ComponentRef: ci.Component,
+				Path:         "",
+				Info:         ci,
+			}
+		}
 		fmt.Fprintf(Stdout, "Fetching %s (%s)\n", sn.SnapName(), rev)
-		if err := s.w.SetInfo(sn, info); err != nil {
+		if err := s.w.SetInfo(sn, info, seedComps); err != nil {
 			return "", err
 		}
 		if err := s.validateSnapArchs([]*seedwriter.SeedSnap{sn}); err != nil {
@@ -543,13 +610,36 @@ func (s *imageSeeder) downloadSnaps(snapsToDownload []*seedwriter.SeedSnap, curS
 			return nil, err
 		}
 
+		var channel string
+		switch {
+		case !rev.Unset():
+			// if we're setting a revision from a validation set, we don't want
+			// to send a channel, since we don't know if that revision is in
+			// that channel
+			channel = ""
+		case sn.Channel == "":
+			// otherwise, we want to make sure to set a default channel if
+			// possible. this case shouldn't ever really happen, since SeedSnaps
+			// should have a channel set
+			channel = "stable"
+		default:
+			channel = sn.Channel
+		}
+
 		byName[sn.SnapName()] = sn
 		revisions[sn.SnapName()] = rev
 		snapToDownloadOptions[i].Snap = sn
-		snapToDownloadOptions[i].Channel = sn.Channel
+		snapToDownloadOptions[i].Channel = channel
 		snapToDownloadOptions[i].Revision = rev
 		snapToDownloadOptions[i].CohortKey = s.wideCohortKey
 		snapToDownloadOptions[i].ValidationSets = vss
+
+		// Components
+		compsToDownload := make([]string, len(sn.Components))
+		for i, comp := range sn.Components {
+			compsToDownload[i] = comp.ComponentRef.ComponentName
+		}
+		snapToDownloadOptions[i].CompsToDownload = compsToDownload
 	}
 
 	// sort the curSnaps slice for test consistency
@@ -563,6 +653,7 @@ func (s *imageSeeder) downloadSnaps(snapsToDownload []*seedwriter.SeedSnap, curS
 	if err != nil {
 		return nil, err
 	}
+
 	return downloadedSnaps, nil
 }
 
@@ -782,8 +873,20 @@ func (s *imageSeeder) finish() error {
 	return s.finishSeedCore()
 }
 
-func optionSnaps(opts *Options) []*seedwriter.OptionsSnap {
+func readComponentInfoFromCont(path string) (*snap.ComponentInfo, error) {
+	compf, err := snapfile.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open container: %w", err)
+	}
+
+	return snap.ReadComponentInfoFromContainer(compf, nil, nil)
+}
+
+func optionSnaps(opts *Options) ([]*seedwriter.OptionsSnap, []string, error) {
 	optSnaps := make([]*seedwriter.OptionsSnap, 0, len(opts.Snaps))
+	pathToLocalComp := map[string]*snap.ComponentInfo{}
+	localCompsPaths := []string{}
+
 	for _, snapName := range opts.Snaps {
 		var optSnap seedwriter.OptionsSnap
 		if strings.HasSuffix(snapName, ".snap") {
@@ -795,7 +898,43 @@ func optionSnaps(opts *Options) []*seedwriter.OptionsSnap {
 		optSnap.Channel = opts.SnapChannels[snapName]
 		optSnaps = append(optSnaps, &optSnap)
 	}
-	return optSnaps
+	for _, compOpt := range opts.Components {
+		if strings.HasSuffix(compOpt, ".comp") {
+			// We need to look inside to know the owner snap, wait until
+			// that can be done for all local snaps/comps
+			cinfo, err := readComponentInfoFromCont(compOpt)
+			if err != nil {
+				return nil, nil, err
+			}
+			// Being a map, we ensure we do not get duplicates
+			pathToLocalComp[compOpt] = cinfo
+			localCompsPaths = append(localCompsPaths, compOpt)
+		} else {
+			snapName, compName, err := naming.SplitFullComponentName(compOpt)
+			if err != nil {
+				return nil, nil, err
+			}
+			optComp := seedwriter.OptionsComponent{Name: compName}
+			// Add the component to the matching snap, or create
+			// new otherwise (that is, assume that
+			// --comp <snap>+<comp> implicitly pulls also the snap)
+			snapFound := false
+			for _, optSn := range optSnaps {
+				if optSn.Name == snapName {
+					optSn.Components = append(optSn.Components, optComp)
+					snapFound = true
+					break
+				}
+			}
+			if !snapFound {
+				optSnaps = append(optSnaps, &seedwriter.OptionsSnap{
+					Name:       snapName,
+					Components: []seedwriter.OptionsComponent{optComp},
+				})
+			}
+		}
+	}
+	return optSnaps, localCompsPaths, nil
 }
 
 func selectAssertionMaxFormats(tsto *tooling.ToolingStore, model *asserts.Model, sysSn, kernSn *seedwriter.SeedSnap) error {
@@ -842,7 +981,11 @@ var setupSeed = func(tsto *tooling.ToolingStore, model *asserts.Model, opts *Opt
 		return err
 	}
 
-	if err := s.start(optionSnaps(opts)); err != nil {
+	snapOpts, localCompsPaths, err := optionSnaps(opts)
+	if err != nil {
+		return err
+	}
+	if err := s.start(snapOpts); err != nil {
 		return err
 	}
 
@@ -856,7 +999,7 @@ var setupSeed = func(tsto *tooling.ToolingStore, model *asserts.Model, opts *Opt
 		return tsto.AssertionFetcher(tmpDb, save)
 	})
 
-	localSnaps, err := s.deriveInfoForLocalSnaps(tmpFetcher, tmpDb)
+	localSnaps, err := s.deriveInfoForLocalSnaps(localCompsPaths, tmpFetcher, tmpDb)
 	if err != nil {
 		return err
 	}
@@ -910,8 +1053,15 @@ var setupSeed = func(tsto *tooling.ToolingStore, model *asserts.Model, opts *Opt
 				return nil, err
 			}
 		} else {
-			// fetch snap assertions
-			if _, err = FetchAndCheckSnapAssertions(sn.Path, sn.Info, model, s.f, s.db); err != nil {
+			// fetch snap and components assertions
+			compPaths := make([]CompInfoPath, len(sn.Components))
+			for i, comp := range sn.Components {
+				compPaths[i] = CompInfoPath{
+					Info: comp.Info,
+					Path: comp.Path,
+				}
+			}
+			if _, err = FetchAndCheckSnapAssertions(sn.Path, sn.Info, compPaths, model, s.f, s.db); err != nil {
 				return nil, err
 			}
 		}

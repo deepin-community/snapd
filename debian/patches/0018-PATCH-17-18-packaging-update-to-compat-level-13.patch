@@ -1,0 +1,58 @@
+From: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+Date: Mon, 3 Jun 2024 14:33:44 +0200
+Subject: packaging: update to compat level 13
+
+Update for compatibility level 9 to 13 [1].
+
+- remove --fail-missing from dh
+- remove --with=systemd from dh
+- drop autoreconf dependencies (obsolete since level 10)
+
+[1] https://manpages.debian.org/testing/debhelper/debhelper-compat-upgrade-checklist.7.en.html#v13
+
+Signed-off-by: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+---
+ packaging/debian-sid/compat  | 2 +-
+ packaging/debian-sid/control | 4 +---
+ packaging/debian-sid/rules   | 2 +-
+ 3 files changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/packaging/debian-sid/compat b/packaging/debian-sid/compat
+index ec63514..b1bd38b 100644
+--- a/packaging/debian-sid/compat
++++ b/packaging/debian-sid/compat
+@@ -1 +1 @@
+-9
++13
+diff --git a/packaging/debian-sid/control b/packaging/debian-sid/control
+index aae3d42..cbffe50 100644
+--- a/packaging/debian-sid/control
++++ b/packaging/debian-sid/control
+@@ -9,13 +9,11 @@ Uploaders: Steve Langasek <vorlon@debian.org>,
+ Build-Depends: autoconf,
+                autoconf-archive,
+                automake,
+-               autotools-dev,
+                bash-completion,
+                ca-certificates,
+                dbus,
+-               debhelper (>= 9.20160709),
++               debhelper (>= 13),
+                dh-apparmor,
+-               dh-autoreconf,
+                dh-golang (>=1.7),
+                fakeroot,
+                gcc-multilib [amd64],
+diff --git a/packaging/debian-sid/rules b/packaging/debian-sid/rules
+index 02de8f4..12b8f87 100755
+--- a/packaging/debian-sid/rules
++++ b/packaging/debian-sid/rules
+@@ -106,7 +106,7 @@ endif
+ BUILT_USING=$(shell dpkg-query -f '$${source:Package} (= $${source:Version}), ' -W $(BUILT_USING_PACKAGES))
+ 
+ %:
+-	dh $@ --buildsystem=golang --with=golang --fail-missing --with systemd --builddirectory=_build
++	dh $@ --buildsystem=golang --with=golang --builddirectory=_build
+ 
+ override_dh_fixperms:
+ 	dh_fixperms -Xusr/lib/snapd/snap-confine

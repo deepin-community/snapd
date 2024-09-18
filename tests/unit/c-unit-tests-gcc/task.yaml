@@ -1,5 +1,9 @@
 summary: Build the test suite for C code using gcc and run it
 
+details: |
+    Parts of snapd are implemented in C. We want to make sure that
+    snapd can be built with CC=gcc, and that all the C-based unit tests pass.
+
 prepare: |
     # Precondition check, the core snap is installed
     snap info core | MATCH "installed:"
@@ -28,5 +32,5 @@ execute: |
     cd "$build_dir"
     # Build and run unit tests as root and as a user
     make check
-    chown -R test.test "$build_dir"
+    chown -R test:test "$build_dir"
     su test -c 'make check'

@@ -1,6 +1,10 @@
 summary: verify a simple UC2* scenario with 4k sector size
 
-systems: [ubuntu-20.04-64, ubuntu-22.04-64]
+details: |
+    Check the basic snap commands when the Ubuntu Core image has been
+    created with 4k sector size
+
+systems: [ubuntu-2*]
 
 environment:
   NESTED_ENABLE_TPM: true
@@ -46,7 +50,7 @@ execute: |
     remote.exec "test -e /sys/kernel/security/tpm0/binary_bios_measurements"
 
     echo "and secure boot is enabled on the nested vm"
-    remote.exec "xxd /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c" | MATCH "00000000: 0600 0000 01\s+....."
+    remote.exec "od -t x1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c" | MATCH "^0000000 06 00 00 00 01$"
 
     echo "Ensure 'snap recovery show-keys' works as root"
     remote.exec "sudo snap recovery --show-keys" | MATCH 'recovery:\s+[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}'

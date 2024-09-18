@@ -1,6 +1,7 @@
 # With Fedora, nothing is bundled. For everything else, bundling is used.
+# Amazon-linux 2023 is based on fedora but it is bundled
 # To use bundled stuff, use "--with vendorized" on rpmbuild
-%if 0%{?fedora}
+%if 0%{?fedora} && ! 0%{?amzn2023}
 %bcond_with vendorized
 %else
 %bcond_without vendorized
@@ -69,22 +70,22 @@
 
 # Until we have a way to add more extldflags to gobuild macro...
 # Always use external linking when building static binaries.
-%if 0%{?fedora} || 0%{?rhel} >= 8
-%define gobuild_static(o:) go build -buildmode pie -compiler gc -tags="rpm_crashtraceback ${BUILDTAGS:-}" -ldflags "-B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n') -linkmode external -extldflags '%__global_ldflags -static'" -a -v -x %{?**};
+%if 0%{?fedora} || 0%{?rhel} >= 8 || 0%{?amzn2023}
+%define gobuild_static(o:) go build -buildmode pie -compiler gc -tags="rpm_crashtraceback ${BUILDTAGS:-}" -ldflags "-B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n') -linkmode external -extldflags '%__global_ldflags -static'" -a -v %{?**};
 %endif
 %if 0%{?rhel} == 7
 # no pass PIE flags due to https://bugzilla.redhat.com/show_bug.cgi?id=1634486
-%define gobuild_static(o:) go build -compiler gc -tags="rpm_crashtraceback ${BUILDTAGS:-}" -ldflags "-B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n') -linkmode external -extldflags '%__global_ldflags -static'" -a -v -x %{?**};
+%define gobuild_static(o:) go build -compiler gc -tags="rpm_crashtraceback ${BUILDTAGS:-}" -ldflags "-B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n') -linkmode external -extldflags '%__global_ldflags -static'" -a -v %{?**};
 %endif
 
 # These macros are missing BUILDTAGS in RHEL 8/9, see RHBZ#1825138
-%if 0%{?rhel} >= 8
-%define gobuild(o:) go build -buildmode pie -compiler gc -tags="rpm_crashtraceback ${BUILDTAGS:-}" -ldflags "-B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n') -linkmode external -extldflags '%__global_ldflags'" -a -v -x %{?**};
+%if 0%{?rhel} >= 8 || 0%{?amzn2023}
+%define gobuild(o:) go build -buildmode pie -compiler gc -tags="rpm_crashtraceback ${BUILDTAGS:-}" -ldflags "-B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n') -linkmode external -extldflags '%__global_ldflags'" -a -v %{?**};
 %endif
 
 # These macros are not defined in RHEL 7
 %if 0%{?rhel} == 7
-%define gobuild(o:) go build -compiler gc -tags="rpm_crashtraceback ${BUILDTAGS:-}" -ldflags "-B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n') -linkmode external -extldflags '%__global_ldflags'" -a -v -x %{?**};
+%define gobuild(o:) go build -compiler gc -tags="rpm_crashtraceback ${BUILDTAGS:-}" -ldflags "-B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n') -linkmode external -extldflags '%__global_ldflags'" -a -v %{?**};
 %define gotest() go test -compiler gc %{?**};
 %endif
 
@@ -92,6 +93,7 @@
 %{!?_environmentdir: %global _environmentdir %{_prefix}/lib/environment.d}
 %{!?_systemdgeneratordir: %global _systemdgeneratordir %{_prefix}/lib/systemd/system-generators}
 %{!?_systemd_system_env_generator_dir: %global _systemd_system_env_generator_dir %{_prefix}/lib/systemd/system-environment-generators}
+%{!?_tmpfilesdir: %global _tmpfilesdir %{_prefix}/lib/tmpfiles.d}
 
 # Fedora selinux-policy includes 'map' permission on a 'file' class. However,
 # Amazon Linux 2 does not have the updated policy containing the fix for
@@ -102,7 +104,7 @@
 %endif
 
 Name:           snapd
-Version:        2.60.2
+Version:        2.65.1
 Release:        0%{?dist}
 Summary:        A transactional software package manager
 License:        GPLv3
@@ -122,6 +124,10 @@ ExclusiveArch:  %{ix86} x86_64 %{arm} aarch64 ppc64le s390x
 BuildRequires: make
 BuildRequires:  %{?go_compiler:compiler(go-compiler)}%{!?go_compiler:golang >= 1.9}
 BuildRequires:  systemd
+%if ! 0%{?amzn2}
+BuildRequires:  fakeroot
+%endif
+BuildRequires:  squashfs-tools
 %{?systemd_requires}
 
 Requires:       snap-confine%{?_isa} = %{version}-%{release}
@@ -138,6 +144,13 @@ Requires:       fuse
 %else
 # snapd will use squashfuse in the event that squashfs.ko isn't available (cloud instances, containers, etc.)
 Requires:       ((squashfuse and fuse) or kmod(squashfs.ko))
+%endif
+
+# Require xdelta for delta updates of snap packages.
+%if 0%{?fedora} || ( 0%{?rhel} && 0%{?rhel} > 8 )
+%if ! 0%{?amzn2023}
+Requires:       xdelta
+%endif
 %endif
 
 # bash-completion owns /usr/share/bash-completion/completions
@@ -157,7 +170,8 @@ Provides:       %{name}-login-service%{?_isa} = 1.33
 %endif
 
 %if ! 0%{?with_bundled}
-BuildRequires: golang(github.com/boltdb/bolt)
+BuildRequires: golang(go.etcd.io/bbolt)
+BuildRequires: golang(github.com/bmatcuk/doublestar/v4)
 BuildRequires: golang(github.com/coreos/go-systemd/activation)
 BuildRequires: golang(github.com/godbus/dbus)
 BuildRequires: golang(github.com/godbus/dbus/introspect)
@@ -192,7 +206,9 @@ designed for working with self-contained, immutable packages.
 Summary:        Confinement system for snap applications
 License:        GPLv3
 BuildRequires:  autoconf
+BuildRequires:  autoconf-archive
 BuildRequires:  automake
+BuildRequires:  make
 BuildRequires:  libtool
 BuildRequires:  gcc
 BuildRequires:  gettext
@@ -215,7 +231,8 @@ BuildRequires:  libseccomp-static
 BuildRequires:  valgrind
 %endif
 BuildRequires:  %{_bindir}/rst2man
-%if 0%{?fedora}
+%if 0%{?fedora} && ! 0%{?amzn2023}
+# AL2023 does not have shellcheck
 # ShellCheck in EPEL is too old...
 BuildRequires:  %{_bindir}/shellcheck
 %endif
@@ -251,7 +268,8 @@ BuildArch:     noarch
 %endif
 
 %if ! 0%{?with_bundled}
-Requires:      golang(github.com/boltdb/bolt)
+Requires:      golang(go.etcd.io/bbolt)
+Requires:      golang(github.com/bmatcuk/doublestar/v4)
 Requires:      golang(github.com/coreos/go-systemd/activation)
 Requires:      golang(github.com/godbus/dbus)
 Requires:      golang(github.com/godbus/dbus/introspect)
@@ -280,7 +298,8 @@ Requires:      golang(gopkg.in/yaml.v3)
 # These Provides are unversioned because the sources in
 # the bundled tarball are unversioned (they go by git commit)
 # *sigh*... I hate golang...
-Provides:      bundled(golang(github.com/snapcore/bolt))
+Provides:      bundled(golang(go.etcd.io/bbolt))
+Provides:      bundled(golang(github.com/bmatcuk/doublestar/v4))
 Provides:      bundled(golang(github.com/coreos/go-systemd/activation))
 Provides:      bundled(golang(github.com/godbus/dbus))
 Provides:      bundled(golang(github.com/godbus/dbus/introspect))
@@ -352,7 +371,6 @@ Provides:      golang(%{import_path}/desktop/notification) = %{version}-%{releas
 Provides:      golang(%{import_path}/desktop/notification/notificationtest) = %{version}-%{release}
 Provides:      golang(%{import_path}/dirs) = %{version}-%{release}
 Provides:      golang(%{import_path}/docs) = %{version}-%{release}
-Provides:      golang(%{import_path}/errtracker) = %{version}-%{release}
 Provides:      golang(%{import_path}/features) = %{version}-%{release}
 Provides:      golang(%{import_path}/gadget) = %{version}-%{release}
 Provides:      golang(%{import_path}/gadget/edition) = %{version}-%{release}
@@ -537,7 +555,7 @@ BUILDTAGS="nosecboot"
 
 %if ! 0%{?with_bundled}
 # We don't need the snapcore fork for bolt - it is just a fix on ppc
-sed -e "s:github.com/snapcore/bolt:github.com/boltdb/bolt:g" -i advisor/*.go errtracker/*.go
+sed -e "s:github.com/snapcore/bolt:github.com/boltdb/bolt:g" -i advisor/*.go
 %endif
 
 # We have to build snapd first to prevent the build from
@@ -563,10 +581,6 @@ BUILDTAGS="${BUILDTAGS} nomanagers"
     %gobuild_static -o bin/snapctl $GOFLAGS %{import_path}/cmd/snapctl
 )
 
-%if 0%{?rhel}
-# There's no static link library for libseccomp in RHEL/CentOS...
-sed -e "s/-Bstatic -lseccomp/-Bstatic/g" -i cmd/snap-seccomp/*.go
-%endif
 %gobuild -o bin/snap-seccomp $GOFLAGS %{import_path}/cmd/snap-seccomp
 
 %if 0%{?with_selinux}
@@ -575,7 +589,7 @@ sed -e "s/-Bstatic -lseccomp/-Bstatic/g" -i cmd/snap-seccomp/*.go
     M4PARAM='-D distro_rhel7'
 %endif
 %if 0%{?rhel} == 7 || 0%{?rhel} == 8
-    # RHEL7 and RHEL8 are missing the BPF interfaces from their reference policy
+    # RHEL7, RHEL8 are missing the BPF interfaces from their reference policy
     M4PARAM="$M4PARAM -D no_bpf"
 %endif
     # Build SELinux module
@@ -630,10 +644,12 @@ install -d -p %{buildroot}%{_sysconfdir}/profile.d
 install -d -p %{buildroot}%{_sysconfdir}/sysconfig
 install -d -p %{buildroot}%{_sharedstatedir}/snapd/assertions
 install -d -p %{buildroot}%{_sharedstatedir}/snapd/cookie
+install -d -p %{buildroot}%{_sharedstatedir}/snapd/cgroup
 install -d -p %{buildroot}%{_sharedstatedir}/snapd/dbus-1/services
 install -d -p %{buildroot}%{_sharedstatedir}/snapd/dbus-1/system-services
 install -d -p %{buildroot}%{_sharedstatedir}/snapd/desktop/applications
 install -d -p %{buildroot}%{_sharedstatedir}/snapd/device
+install -d -p %{buildroot}%{_sharedstatedir}/snapd/environment
 install -d -p %{buildroot}%{_sharedstatedir}/snapd/hostfs
 install -d -p %{buildroot}%{_sharedstatedir}/snapd/inhibit
 install -d -p %{buildroot}%{_sharedstatedir}/snapd/lib/gl
@@ -690,8 +706,6 @@ pushd ./cmd
 chmod 0755 %{buildroot}%{_sharedstatedir}/snapd/void
 # We don't use AppArmor
 rm -rfv %{buildroot}%{_sysconfdir}/apparmor.d
-# ubuntu-core-launcher is dead
-rm -fv %{buildroot}%{_bindir}/ubuntu-core-launcher
 popd
 
 # Install all systemd and dbus units, and env files
@@ -722,14 +736,6 @@ rm %{buildroot}%{_libexecdir}/snapd/system-shutdown
 # Remove snapd apparmor service
 rm -f %{buildroot}%{_unitdir}/snapd.apparmor.service
 rm -f %{buildroot}%{_libexecdir}/snapd/snapd-apparmor
-
-# Remove prompt services
-rm %{buildroot}%{_unitdir}/snapd.aa-prompt-listener.service
-rm %{buildroot}%{_userunitdir}/snapd.aa-prompt-ui.service
-rm %{buildroot}%{_datadir}/dbus-1/services/io.snapcraft.Prompt.service
-
-# Install Polkit configuration
-install -m 644 -D data/polkit/io.snapcraft.snapd.policy %{buildroot}%{_datadir}/polkit-1/actions
 
 # Disable re-exec by default
 echo 'SNAP_REEXEC=0' > %{buildroot}%{_sysconfdir}/sysconfig/snapd
@@ -854,6 +860,7 @@ popd
 %dir %{_sharedstatedir}/snapd
 %dir %{_sharedstatedir}/snapd/assertions
 %dir %{_sharedstatedir}/snapd/cookie
+%dir %{_sharedstatedir}/snapd/cgroup
 %dir %{_sharedstatedir}/snapd/dbus-1
 %dir %{_sharedstatedir}/snapd/dbus-1/services
 %dir %{_sharedstatedir}/snapd/dbus-1/system-services
@@ -996,6 +1003,640 @@ fi
 
 
 %changelog
+* Sat Aug 24 2024 Ernest Lotter <ernest.lotter@canonical.com>
+- New upstream release 2.65.1
+ - Support building snapd using base Core22 (Snapcraft 8.x)
+ - FIPS: support building FIPS complaint snapd variant that switches
+   to FIPS mode when the system boots with FIPS enabled
+ - AppArmor: update to latest 4.0.2 release
+ - AppArmor: enable using ABI 4.0 from host parser
+ - AppArmor: fix parser lookup
+ - AppArmor: support AppArmor snippet priorities
+ - AppArmor: allow reading cgroup memory.max file
+ - AppArmor: allow using snap-exec coming from the snapd snap when
+   starting a confined process with jailmode
+ - AppArmor prompting (experimental): add checks for prompting
+   support, include prompting status in system key, and restart snapd
+   if prompting flag changes
+ - AppArmor prompting (experimental): include prompt prefix in
+   AppArmor rules if prompting is supported and enabled
+ - AppArmor prompting (experimental): add common types, constraints,
+   and mappings from AppArmor permissions to abstract permissions
+ - AppArmor prompting (experimental): add path pattern parsing and
+   matching
+ - AppArmor prompting (experimental): add path pattern precedence
+   based on specificity
+ - AppArmor prompting (experimental): add packages to manage
+   outstanding request prompts and rules
+ - AppArmor prompting (experimental): add prompting API and notice
+   types, which require snap-interfaces-requests-control interface
+ - AppArmor prompting (experimental): feature flag can only be
+   enabled if prompting is supported, handler service connected, and
+   the service can be started
+ - Registry views (experimental): rename from aspects to registries
+ - Registry views (experimental): support reading registry views and
+   setting/unsetting registry data using snapctl
+ - Registry views (experimental): fetch and refresh registry
+   assertions as needed
+ - Registry views (experimental): restrict view paths from using a
+   number as first character and view names to storage path style
+   patterns
+ - Snap components: support installing snaps and components from
+   files at the same time (no REST API/CLI)
+ - Snap components: support downloading components related assertions
+   from the store
+ - Snap components: support installing components from the store
+ - Snap components: support removing components individually and
+   during snap removal
+ - Snap components: support kernel modules as components
+ - Snap components: support for component install, pre-refresh and
+   post-refresh hooks
+ - Snap components: initial support for building systems that contain
+   components
+ - Refresh app awareness (experimental): add data field for
+   /v2/changes REST API to allow associating each task with affected
+   snaps
+ - Refresh app awareness (experimental): use the app name from
+   .desktop file in notifications
+ - Refresh app awareness (experimental): give snap-refresh-observe
+   interface access to /v2/snaps/{name} endpoint
+ - Improve snap-confine compatibility with nvidia drivers
+ - Allow re-exec when SNAP_REEXEC is set for unlisted distros to
+   simplify testing
+ - Allow mixing revision and channel on snap install
+ - Generate GNU build ID for Go binaries
+ - Add missing etelpmoc.sh for shell completion
+ - Do not attempt to run snapd on classic when re-exec is disabled
+ - Packaging/build maintenance for Debian sid, Fedora, Arch, openSuse
+ - Add snap debug API command to enable running raw queries
+ - Enable snap-confine snap mount directory detection
+ - Replace global seccomp filter with deny rules in standard seccomp
+   template
+ - Remove support for Ubuntu Core Launcher (superseded by snap-
+   confine)
+ - Support creating pending serial bound users after serial assertion
+   becomes available
+ - Support disabling cloud-init using kernel command-line
+ - In hybrid systems, apps can refresh without waiting for restarts
+   required by essential snaps
+ - Ship snap-debug-info.sh script used for system diagnostics
+ - Improve error messages when attempting to run non-existent snap
+ - Switch to -u UID:GID for strace-static
+ - Support enabling snapd logging with snap set system
+   debug.snapd.{log,log-level}
+ - Add options system.coredump.enable and system.coredump.maxuse to
+   support using systemd-coredump on Ubuntu Core
+ - Provide documentation URL for 'snap interface '
+ - Fix snapd riscv64 build
+ - Fix restarting activated services instead of their activator units
+   (i.e. sockets, timers)
+ - Fix potential unexpected auto-refresh of snap on managed schedule
+ - Fix potential segfault by guarding against kernel command-line
+   changes on classic system
+ - Fix proxy entries in /etc/environment with missing newline that
+   caused later manual entries to not be usable
+ - Fix offline remodelling by ignoring prerequisites that will
+   otherwise be downloaded from store
+ - Fix devmode seccomp deny regression that caused spamming the log
+   instead of actual denies
+ - Fix snap lock leak during refresh
+ - Fix not re-pinning validation sets that were already pinned when
+   enforcing new validation sets
+ - Fix handling of unexpected snapd runtime failure
+ - Fix /v2/notices REST API skipping notices with duplicate
+   timestamps
+ - Fix comparing systemd versions that may contain pre-release
+   suffixes
+ - Fix udev potentially starting before snap-device-helper is made
+   available
+ - Fix race in snap seed metadata loading
+ - Fix treating cloud-init exit status 2 as error
+ - Fix to prevent sending refresh complete notification if snap snap-
+   refresh-observe interface is connected
+ - Fix to queue snapctl service commands if run from the default-
+   configure hook to ensure they get up-to-date config values
+ - Fix stop service failure when the service is not actually running
+   anymore
+ - Fix parsing /proc/PID/mounts with spaces
+ - Add registry interface that provides snaps access to a particular
+   registry view
+ - Add snap-interfaces-requests-control interface to enable prompting
+   client snaps
+ - steam-support interface: remove all AppArmor and seccomp
+   restrictions to improve user experience
+ - opengl interface: improve compatibility with nvidia drivers
+ - home interface: autoconnect home on Ubuntu Core Desktop
+ - serial-port interface: support RPMsg tty
+ - display-control interface: allow changing LVDS backlight power and
+   brightness
+ - power-control interface: support for battery charging thesholds,
+   type/status and AC type/status
+ - cpu-control interface: allow CPU C-state control
+ - raw-usb interface: support RPi5 and Thinkpad x13s
+ - custom-device interface: allow device file locking
+ - lxd-support interface: allow LXD to self-manage its own cgroup
+ - network-manager interface: support MPTCP sockets
+ - network-control interface: allow plug/slot access to gnutls config
+   and systemd resolved cache flushing via D-Bus
+ - network-control interface: allow wpa_supplicant dbus api
+ - gpio-control interface: support gpiochip* devices
+ - polkit interface: fix "rw" mount option check
+ - u2f-devices interface: enable additional security keys
+ - desktop interface: enable kde theming support
+
+* Fri Aug 23 2024 Ernest Lotter <ernest.lotter@canonical.com>
+- New upstream release 2.65
+ - Support building snapd using base Core22 (Snapcraft 8.x)
+ - FIPS: support building FIPS complaint snapd variant that switches
+   to FIPS mode when the system boots with FIPS enabled
+ - AppArmor: update to latest 4.0.2 release
+ - AppArmor: enable using ABI 4.0 from host parser
+ - AppArmor: fix parser lookup
+ - AppArmor: support AppArmor snippet priorities
+ - AppArmor: allow reading cgroup memory.max file
+ - AppArmor: allow using snap-exec coming from the snapd snap when
+   starting a confined process with jailmode
+ - AppArmor prompting (experimental): add checks for prompting
+   support, include prompting status in system key, and restart snapd
+   if prompting flag changes
+ - AppArmor prompting (experimental): include prompt prefix in
+   AppArmor rules if prompting is supported and enabled
+ - AppArmor prompting (experimental): add common types, constraints,
+   and mappings from AppArmor permissions to abstract permissions
+ - AppArmor prompting (experimental): add path pattern parsing and
+   matching
+ - AppArmor prompting (experimental): add path pattern precedence
+   based on specificity
+ - AppArmor prompting (experimental): add packages to manage
+   outstanding request prompts and rules
+ - AppArmor prompting (experimental): add prompting API and notice
+   types, which require snap-interfaces-requests-control interface
+ - AppArmor prompting (experimental): feature flag can only be
+   enabled if prompting is supported, handler service connected, and
+   the service can be started
+ - Registry views (experimental): rename from aspects to registries
+ - Registry views (experimental): support reading registry views and
+   setting/unsetting registry data using snapctl
+ - Registry views (experimental): fetch and refresh registry
+   assertions as needed
+ - Registry views (experimental): restrict view paths from using a
+   number as first character and view names to storage path style
+   patterns
+ - Snap components: support installing snaps and components from
+   files at the same time (no REST API/CLI)
+ - Snap components: support downloading components related assertions
+   from the store
+ - Snap components: support installing components from the store
+ - Snap components: support removing components individually and
+   during snap removal
+ - Snap components: support kernel modules as components
+ - Snap components: support for component install, pre-refresh and
+   post-refresh hooks
+ - Snap components: initial support for building systems that contain
+   components
+ - Refresh app awareness (experimental): add data field for
+   /v2/changes REST API to allow associating each task with affected
+   snaps
+ - Refresh app awareness (experimental): use the app name from
+   .desktop file in notifications
+ - Refresh app awareness (experimental): give snap-refresh-observe
+   interface access to /v2/snaps/{name} endpoint
+ - Improve snap-confine compatibility with nvidia drivers
+ - Allow re-exec when SNAP_REEXEC is set for unlisted distros to
+   simplify testing
+ - Allow mixing revision and channel on snap install
+ - Generate GNU build ID for Go binaries
+ - Add missing etelpmoc.sh for shell completion
+ - Do not attempt to run snapd on classic when re-exec is disabled
+ - Packaging/build maintenance for Debian sid, Fedora, Arch, openSuse
+ - Add snap debug API command to enable running raw queries
+ - Enable snap-confine snap mount directory detection
+ - Replace global seccomp filter with deny rules in standard seccomp
+   template
+ - Remove support for Ubuntu Core Launcher (superseded by snap-
+   confine)
+ - Support creating pending serial bound users after serial assertion
+   becomes available
+ - Support disabling cloud-init using kernel command-line
+ - In hybrid systems, apps can refresh without waiting for restarts
+   required by essential snaps
+ - Ship snap-debug-info.sh script used for system diagnostics
+ - Improve error messages when attempting to run non-existent snap
+ - Switch to -u UID:GID for strace-static
+ - Support enabling snapd logging with snap set system
+   debug.snapd.{log,log-level}
+ - Add options system.coredump.enable and system.coredump.maxuse to
+   support using systemd-coredump on Ubuntu Core
+ - Provide documentation URL for 'snap interface '
+ - Fix restarting activated services instead of their activator units
+   (i.e. sockets, timers)
+ - Fix potential unexpected auto-refresh of snap on managed schedule
+ - Fix potential segfault by guarding against kernel command-line
+   changes on classic system
+ - Fix proxy entries in /etc/environment with missing newline that
+   caused later manual entries to not be usable
+ - Fix offline remodelling by ignoring prerequisites that will
+   otherwise be downloaded from store
+ - Fix devmode seccomp deny regression that caused spamming the log
+   instead of actual denies
+ - Fix snap lock leak during refresh
+ - Fix not re-pinning validation sets that were already pinned when
+   enforcing new validation sets
+ - Fix handling of unexpected snapd runtime failure
+ - Fix /v2/notices REST API skipping notices with duplicate
+   timestamps
+ - Fix comparing systemd versions that may contain pre-release
+   suffixes
+ - Fix udev potentially starting before snap-device-helper is made
+   available
+ - Fix race in snap seed metadata loading
+ - Fix treating cloud-init exit status 2 as error
+ - Fix to prevent sending refresh complete notification if snap snap-
+   refresh-observe interface is connected
+ - Fix to queue snapctl service commands if run from the default-
+   configure hook to ensure they get up-to-date config values
+ - Fix stop service failure when the service is not actually running
+   anymore
+ - Fix parsing /proc/PID/mounts with spaces
+ - Add registry interface that provides snaps access to a particular
+   registry view
+ - Add snap-interfaces-requests-control interface to enable prompting
+   client snaps
+ - steam-support interface: remove all AppArmor and seccomp
+   restrictions to improve user experience
+ - opengl interface: improve compatibility with nvidia drivers
+ - home interface: autoconnect home on Ubuntu Core Desktop
+ - serial-port interface: support RPMsg tty
+ - display-control interface: allow changing LVDS backlight power and
+   brightness
+ - power-control interface: support for battery charging thesholds,
+   type/status and AC type/status
+ - cpu-control interface: allow CPU C-state control
+ - raw-usb interface: support RPi5 and Thinkpad x13s
+ - custom-device interface: allow device file locking
+ - lxd-support interface: allow LXD to self-manage its own cgroup
+ - network-manager interface: support MPTCP sockets
+ - network-control interface: allow plug/slot access to gnutls config
+   and systemd resolved cache flushing via D-Bus
+ - network-control interface: allow wpa_supplicant dbus api
+ - gpio-control interface: support gpiochip* devices
+ - polkit interface: fix "rw" mount option check
+ - u2f-devices interface: enable additional security keys
+ - desktop interface: enable kde theming support
+
+* Wed Jul 24 2024 Ernest Lotter <ernest.lotter@canonical.com>
+- New upstream release 2.64
+ - Support building snapd using base Core22 (Snapcraft 8.x)
+ - FIPS: support building FIPS complaint snapd variant that switches
+   to FIPS mode when the system boots with FIPS enabled
+ - AppArmor: update to AppArmor 4.0.1
+ - AppArmor: support AppArmor snippet priorities
+ - AppArmor prompting: add checks for prompting support, include
+   prompting status in system key, and restart snapd if prompting
+   flag changes
+ - AppArmor prompting: include prompt prefix in AppArmor rules if
+   prompting is supported and enabled
+ - AppArmor prompting: add common types, constraints, and mappings
+   from AppArmor permissions to abstract permissions
+ - AppArmor prompting: add path pattern parsing and matching
+ - Registry views (experimental): rename from aspects to registries
+ - Registry views (experimental): support reading registry views
+   using snapctl
+ - Registry views (experimental): restrict view paths from using a
+   number as first character and view names to storage path style
+   patterns
+ - Snap components: support installing snaps and components from
+   files at the same time (no REST API/CLI)
+ - Snap components: support downloading components related assertions
+   from the store
+ - Snap components: support installing components from the store (no
+   REST API/CLI)
+ - Snap components: support removing components (REST API, no CLI)
+ - Snap components: started support for component hooks
+ - Snap components: support kernel modules as components
+ - Refresh app awareness (experimental): add data field for
+   /v2/changes REST API to allow associating each task with affected
+   snaps
+ - Refresh app awareness (experimental): use the app name from
+   .desktop file in notifications
+ - Refresh app awareness (experimental): give snap-refresh-observe
+   interface access to /v2/snaps/{name} endpoint
+ - Allow re-exec when SNAP_REEXEC is set for unlisted distros to
+   simplify testing
+ - Generate GNU build ID for Go binaries
+ - Add missing etelpmoc.sh for shell completion
+ - Do not attempt to run snapd on classic when re-exec is disabled
+ - Packaging/build maintenance for Debian sid, Fedora, Arch, openSuse
+ - Add snap debug api command to enable running raw queries
+ - Enable snap-confine snap mount directory detection
+ - Replace global seccomp filter with deny rules in standard seccomp
+   template
+ - Remove support for Ubuntu Core Launcher (superseded by snap-
+   confine)
+ - Support creating pending serial bound users after serial assertion
+   becomes available
+ - Support disabling cloud-init using kernel command-line
+ - In hybrid systems, apps can refresh without waiting for restarts
+   required by essential snaps
+ - Ship snap-debug-info.sh script used for system diagnostics
+ - Improve error messages when attempting to run non-existent snap
+ - Switch to -u UID:GID for strace-static
+ - Support enabling snapd logging with snap set system
+   debug.snapd.{log,log-level}
+ - Fix restarting activated services instead of their activator units
+   (i.e. sockets, timers)
+ - Fix potential unexpected auto-refresh of snap on managed schedule
+ - Fix potential segfault by guarding against kernel command-line
+   changes on classic system
+ - Fix proxy entries in /etc/environment with missing newline that
+   caused later manual entries to not be usable
+ - Fix offline remodelling by ignoring prerequisites that will
+   otherwise be downloaded from store
+ - Fix devmode seccomp deny regression that caused spamming the log
+   instead of actual denies
+ - Fix snap lock leak during refresh
+ - Fix not re-pinning validation sets that were already pinned when
+   enforcing new validation sets
+ - Fix handling of unexpected snapd runtime failure
+ - Fix /v2/notices REST API skipping notices with duplicate
+   timestamps
+ - Fix comparing systemd versions that may contain pre-release
+   suffixes
+ - Fix udev potentially starting before snap-device-helper is made
+   available
+ - Fix race in snap seed metadata loading
+ - Fix treating cloud-init exit status 2 as error
+ - Fix to prevent sending refresh complete notification if snap snap-
+   refresh-observe interface is connected
+ - Fix to queue snapctl service commands if run from the default-
+   configure hook to ensure they get up-to-date config values
+ - Fix stop service failure when the service is not actually running
+   anymore
+ - Add registry interface that provides snaps access to a particular
+   registry view
+ - steam-support interface: relaxed AppArmor and seccomp restrictions
+   to improve user experience
+ - home interface: autoconnect home on Ubuntu Core Desktop
+ - serial-port interface: support RPMsg tty
+ - display-control interface: allow changing LVDS backlight power and
+   brightness
+ - power-control interface: support for battery charging thesholds,
+   type/status and AC type/status
+ - cpu-control interface: allow CPU C-state control
+ - raw-usb interface: support RPi5 and Thinkpad x13s
+ - custom-device interface: allow device file locking
+ - lxd-support interface: allow LXD to self-manage its own cgroup
+ - network-manager interface: support MPTCP sockets
+ - network-control interface: allow plug/slot access to gnutls config
+   and systemd resolved cache flushing via D-Bus
+
+* Wed Apr 24 2024 Ernest Lotter <ernest.lotter@canonical.com>
+- New upstream release 2.63
+ - Support for snap services to show the current status of user
+   services (experimental)
+ - Refresh app awareness: record snap-run-inhibit notice when
+   starting app from snap that is busy with refresh (experimental)
+ - Refresh app awareness: use warnings as fallback for desktop
+   notifications (experimental)
+ - Aspect based configuration: make request fields in the aspect-
+   bundle's rules optional (experimental)
+ - Aspect based configuration: make map keys conform to the same
+   format as path sub-keys (experimental)
+ - Aspect based configuration: make unset and set behaviour similar
+   to configuration options (experimental)
+ - Aspect based configuration: limit nesting level for setting value
+   (experimental)
+ - Components: use symlinks to point active snap component revisions
+ - Components: add model assertion support for components
+ - Components: fix to ensure local component installation always gets
+   a new revision number
+ - Add basic support for a CIFS remote filesystem-based home
+   directory
+ - Add support for AppArmor profile kill mode to avoid snap-confine
+   error
+ - Allow more than one interface to grant access to the same API
+   endpoint or notice type
+ - Allow all snapd service's control group processes to send systemd
+   notifications to prevent warnings flooding the log
+ - Enable not preseeded single boot install
+ - Update secboot to handle new sbatlevel
+ - Fix to not use cgroup for non-strict confined snaps (devmode,
+   classic)
+ - Fix two race conditions relating to freedesktop notifications
+ - Fix missing tunables in snap-update-ns AppArmor template
+ - Fix rejection of snapd snap udev command line by older host snap-
+   device-helper
+ - Rework seccomp allow/deny list
+ - Clean up files removed by gadgets
+ - Remove non-viable boot chains to avoid secboot failure
+ - posix_mq interface: add support for missing time64 mqueue syscalls
+   mq_timedreceive_time64 and mq_timedsend_time64
+ - password-manager-service interface: allow kwalletd version 6
+ - kubernetes-support interface: allow SOCK_SEQPACKET sockets
+ - system-observe interface: allow listing systemd units and their
+   properties
+ - opengl interface: enable use of nvidia container toolkit CDI
+   config generation
+
+* Thu Mar 21 2024 Ernest Lotter <ernest.lotter@canonical.com>
+- New upstream release 2.62
+ - Aspects based configuration schema support (experimental)
+ - Refresh app awareness support for UI (experimental)
+ - Support for user daemons by introducing new control switches
+   --user/--system/--users for service start/stop/restart
+   (experimental)
+ - Add AppArmor prompting experimental flag (feature currently
+   unsupported)
+ - Installation of local snap components of type test
+ - Packaging of components with snap pack
+ - Expose experimental features supported/enabled in snapd REST API
+   endpoint /v2/system-info
+ - Support creating and removing recovery systems for use by factory
+   reset
+ - Enable API route for creating and removing recovery systems using
+   /v2/systems with action create and /v2/systems/{label} with action
+   remove
+ - Lift requirements for fde-setup hook for single boot install
+ - Enable single reboot gadget update for UC20+
+ - Allow core to be removed on classic systems
+ - Support for remodeling on hybrid systems
+ - Install desktop files on Ubuntu Core and update after snapd
+   upgrade
+ - Upgrade sandbox features to account for cgroup v2 device filtering
+ - Support snaps to manage their own cgroups
+ - Add support for AppArmor 4.0 unconfined profile mode
+ - Add AppArmor based read access to /etc/default/keyboard
+ - Upgrade to squashfuse 0.5.0
+ - Support useradd utility to enable removing Perl dependency for
+   UC24+
+ - Support for recovery-chooser to use console-conf snap
+ - Add support for --uid/--gid using strace-static
+ - Add support for notices (from pebble) and expose via the snapd
+   REST API endpoints /v2/notices and /v2/notice
+ - Add polkit authentication for snapd REST API endpoints
+   /v2/snaps/{snap}/conf and /v2/apps
+ - Add refresh-inhibit field to snapd REST API endpoint /v2/snaps
+ - Add refresh-inhibited select query to REST API endpoint /v2/snaps
+ - Take into account validation sets during remodeling
+ - Improve offline remodeling to use installed revisions of snaps to
+   fulfill the remodel revision requirement
+ - Add rpi configuration option sdtv_mode
+ - When snapd snap is not installed, pin policy ABI to 4.0 or 3.0 if
+   present on host
+ - Fix gadget zero-sized disk mapping caused by not ignoring zero
+   sized storage traits
+ - Fix gadget install case where size of existing partition was not
+   correctly taken into account
+ - Fix trying to unmount early kernel mount if it does not exist
+ - Fix restarting mount units on snapd start
+ - Fix call to udev in preseed mode
+ - Fix to ensure always setting up the device cgroup for base bare
+   and core24+
+ - Fix not copying data from newly set homedirs on revision change
+ - Fix leaving behind empty snap home directories after snap is
+   removed (resulting in broken symlink)
+ - Fix to avoid using libzstd from host by adding to snapd snap
+ - Fix autorefresh to correctly handle forever refresh hold
+ - Fix username regex allowed for system-user assertion to not allow
+   '+'
+ - Fix incorrect application icon for notification after autorefresh
+   completion
+ - Fix to restart mount units when changed
+ - Fix to support AppArmor running under incus
+ - Fix case of snap-update-ns dropping synthetic mounts due to
+   failure to match  desired mount dependencies
+ - Fix parsing of base snap version to enable pre-seeding of Ubuntu
+   Core Desktop
+ - Fix packaging and tests for various distributions
+ - Add remoteproc interface to allow developers to interact with
+   Remote Processor Framework which enables snaps to load firmware to
+   ARM Cortex microcontrollers
+ - Add kernel-control interface to enable controlling the kernel
+   firmware search path
+ - Add nfs-mount interface to allow mounting of NFS shares
+ - Add ros-opt-data interface to allow snaps to access the host
+   /opt/ros/ paths
+ - Add snap-refresh-observe interface that provides refresh-app-
+   awareness clients access to relevant snapd API endpoints
+ - steam-support interface: generalize Pressure Vessel root paths and
+   allow access to driver information, features and container
+   versions
+ - steam-support interface: make implicit on Ubuntu Core Desktop
+ - desktop interface: improved support for Ubuntu Core Desktop and
+   limit autoconnection to implicit slots
+ - cups-control interface: make autoconnect depend on presence of
+   cupsd on host to ensure it works on classic systems
+ - opengl interface: allow read access to /usr/share/nvidia
+ - personal-files interface: extend to support automatic creation of
+   missing parent directories in write paths
+ - network-control interface: allow creating /run/resolveconf
+ - network-setup-control and network-setup-observe interfaces: allow
+   busctl bind as required for systemd 254+
+ - libvirt interface: allow r/w access to /run/libvirt/libvirt-sock-
+   ro and read access to /var/lib/libvirt/dnsmasq/**
+ - fwupd interface: allow access to IMPI devices (including locking
+   of device nodes), sysfs attributes needed by amdgpu and the COD
+   capsule update directory
+ - uio interface: allow configuring UIO drivers from userspace
+   libraries
+ - serial-port interface: add support for NXP Layerscape SoC
+ - lxd-support interface: add attribute enable-unconfined-mode to
+   require LXD to opt-in to run unconfined
+ - block-devices interface: add support for ZFS volumes
+ - system-packages-doc interface: add support for reading jquery and
+   sphinx documentation
+ - system-packages-doc interface: workaround to prevent autoconnect
+   failure for snaps using base bare
+ - microceph-support interface: allow more types of block devices to
+   be added as an OSD
+ - mount-observe interface: allow read access to
+   /proc/{pid}/task/{tid}/mounts and proc/{pid}/task/{tid}/mountinfo
+ - polkit interface: changed to not be implicit on core because
+   installing policy files is not possible
+ - upower-observe interface: allow stats refresh
+ - gpg-public-keys interface: allow creating lock file for certain
+   gpg operations
+ - shutdown interface: allow access to SetRebootParameter method
+ - media-control interface: allow device file locking
+ - u2f-devices interface: support for Trustkey G310H, JaCarta U2F,
+   Kensington VeriMark Guard, RSA DS100, Google Titan v2
+
+* Wed Mar 06 2024 Ernest Lotter <ernest.lotter@canonical.com>
+- New upstream release 2.61.3
+ - Install systemd files in correct location for 24.04
+
+* Fri Feb 16 2024 Ernest Lotter <ernest.lotter@canonical.com>
+- New upstream release 2.61.2
+ - Fix to enable plug/slot sanitization for prepare-image
+ - Fix panic when device-service.access=offline
+ - Support offline remodeling
+ - Allow offline update only remodels without serial
+ - Fail early when remodeling to old model revision
+ - Fix to enable plug/slot sanitization for validate-seed
+ - Allow removal of core snap on classic systems
+ - Fix network-control interface denial for file lock on /run/netns
+ - Add well-known core24 snap-id
+ - Fix remodel snap installation order
+ - Prevent remodeling from UC18+ to UC16
+ - Fix cups auto-connect on classic with cups snap installed
+ - u2f-devices interface support for GoTrust Idem Key with USB-C
+ - Fix to restore services after unlink failure
+ - Add libcudnn.so to Nvidia libraries
+ - Fix skipping base snap download due to false snapd downgrade
+   conflict
+
+* Fri Nov 24 2023 Ernest Lotter <ernest.lotter@canonical.com>
+- New upstream release 2.61.1
+ - Stop requiring default provider snaps on image building and first
+   boot if alternative providers are included and available
+ - Fix auth.json access for login as non-root group ID
+ - Fix incorrect remodelling conflict when changing track to older
+   snapd version
+ - Improved check-rerefresh message
+ - Fix UC16/18 kernel/gadget update failure due volume mismatch with
+   installed disk
+ - Stop auto-import of assertions during install modes
+ - Desktop interface exposes GetIdletime
+ - Polkit interface support for new polkit versions
+ - Fix not applying snapd snap changes in tracked channel when remodelling
+
+* Fri Oct 13 2023 Philip Meulengracht <philip.meulengracht@canonical.com>
+- New upstream release 2.61
+ - Fix control of activated services in 'snap start' and 'snap stop'
+ - Correctly reflect activated services in 'snap services'
+ - Disabled services are no longer enabled again when snap is
+   refreshed
+ - interfaces/builtin: added support for Token2 U2F keys
+ - interfaces/u2f-devices: add Swissbit iShield Key
+ - interfaces/builtin: update gpio apparmor to match pattern that
+   contains multiple subdirectories under /sys/devices/platform
+ - interfaces: add a polkit-agent interface
+ - interfaces: add pcscd interface
+ - Kernel command-line can now be edited in the gadget.yaml
+ - Only track validation-sets in run-mode, fixes validation-set
+   issues on first boot.
+ - Added support for using store.access to disable access to snap
+   store
+ - Support for fat16 partition in gadget
+ - Pre-seed authority delegation is now possible
+ - Support new system-user name  daemon
+ - Several bug fixes and improvements around remodelling
+ - Offline remodelling support
+
+* Fri Sep 15 2023 Michael Vogt <michael.vogt@ubuntu.com>
+- New upstream release 2.60.4
+ - i/b/qualcomm_ipc_router.go: switch to plug/slot and add socket
+   permission
+ - interfaces/builtin: fix custom-device udev KERNEL values
+ - overlord: allow the firmware-updater snap to install user daemons
+ - interfaces: allow loopback as a block-device
+
+* Fri Aug 25 2023 Michael Vogt <michael.vogt@ubuntu.com>
+- New upstream release 2.60.3
+ - i/b/shared-memory: handle "private" plug attribute in shared-
+   memory interface correctly
+ - i/apparmor: support for home.d tunables from /etc/
+
 * Fri Aug 04 2023 Michael Vogt <michael.vogt@ubuntu.com>
 - New upstream release 2.60.2
  - i/builtin: allow directories in private /dev/shm

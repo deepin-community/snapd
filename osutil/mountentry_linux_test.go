@@ -57,6 +57,50 @@ func (s *entrySuite) TestString(c *C) {
 		Options: []string{"rw,noatime"},
 	}
 	c.Assert(ent3.String(), Equals, `/dev/sda5 /media/My\040Files ext4 rw,noatime 0 0`)
+	ent4 := osutil.MountEntry{
+		Dir:     "/usr/lib/lib4d.so.1.1.0",
+		Options: []string{"x-snapd.kind=symlink", "x-snapd.symlink=/snap/snapname/165/graphics/usr/lib/lib4d.so.1.1.0", "x-snapd.origin=layout"},
+	}
+	c.Assert(ent4.String(), Equals, "none /usr/lib/lib4d.so.1.1.0 none x-snapd.kind=symlink,x-snapd.symlink=/snap/snapname/165/graphics/usr/lib/lib4d.so.1.1.0,x-snapd.origin=layout 0 0")
+	ent5 := osutil.MountEntry{
+		Dir:     "$HOME/.local/share",
+		Options: []string{"x-snapd.kind=ensure-dir", "x-snapd.must-exist-dir=$HOME"},
+	}
+	c.Assert(ent5.String(), Equals, "none $HOME/.local/share none x-snapd.kind=ensure-dir,x-snapd.must-exist-dir=$HOME 0 0")
+}
+
+func (s *entrySuite) TestReplaceOption(c *C) {
+	ent1 := osutil.MountEntry{
+		Dir:     "$HOME/.local/share",
+		Options: []string{"x-snapd.kind=ensure-dir", "x-snapd.must-exist-dir=$HOME"},
+	}
+	osutil.ReplaceMountEntryOption(&ent1, osutil.XSnapdMustExistDir("/home/username"))
+	c.Assert(ent1.String(), Equals, "none $HOME/.local/share none x-snapd.kind=ensure-dir,x-snapd.must-exist-dir=/home/username 0 0")
+
+	ent2 := osutil.MountEntry{
+		Dir:     "/usr/lib/lib4d.so.1.1.0",
+		Options: []string{"x-snapd.kind=symlink", "x-snapd.symlink=/snap/snapname/165/graphics/usr/lib/lib4d.so.1.1.0", "x-snapd.origin=layout"},
+	}
+	osutil.ReplaceMountEntryOption(&ent2, osutil.XSnapdSymlink("/snap/snapname/200/graphics/usr/lib/lib4d.so.1.1.0"))
+	osutil.ReplaceMountEntryOption(&ent2, osutil.XSnapdKindEnsureDir())
+	c.Assert(ent2.String(), Equals, "none /usr/lib/lib4d.so.1.1.0 none x-snapd.kind=ensure-dir,x-snapd.symlink=/snap/snapname/200/graphics/usr/lib/lib4d.so.1.1.0,x-snapd.origin=layout 0 0")
+
+	ent3 := osutil.MountEntry{
+		Dir:     "/usr/lib/lib4d.so.1.1.0",
+		Options: []string{"x-snapd.kind=symlink", "x-snapd.symlink=/snap/snapname/165/graphics/usr/lib/lib4d.so.1.1.0", "x-snapd.origin=layout"},
+	}
+	osutil.ReplaceMountEntryOption(&ent3, "x-snapd.kind=")
+	c.Assert(ent3.String(), Equals, "none /usr/lib/lib4d.so.1.1.0 none x-snapd.kind=symlink,x-snapd.symlink=/snap/snapname/165/graphics/usr/lib/lib4d.so.1.1.0,x-snapd.origin=layout 0 0")
+
+	ent4 := osutil.MountEntry{
+		Dir:     "/usr/lib/lib4d.so.1.1.0",
+		Options: []string{"x-snapd.kind=symlink", "x-snapd.symlink=/snap/snapname/165/graphics/usr/lib/lib4d.so.1.1.0", "x-snapd.origin=layout"},
+	}
+	osutil.ReplaceMountEntryOption(&ent4, "x-snapd.kind")
+	c.Assert(ent4.String(), Equals, "none /usr/lib/lib4d.so.1.1.0 none x-snapd.kind=symlink,x-snapd.symlink=/snap/snapname/165/graphics/usr/lib/lib4d.so.1.1.0,x-snapd.origin=layout 0 0")
+
+	var ent5 *osutil.MountEntry
+	osutil.ReplaceMountEntryOption(ent5, osutil.XSnapdMustExistDir("doNotPanic"))
 }
 
 func (s *entrySuite) TestEqual(c *C) {
@@ -140,11 +184,9 @@ func (s *entrySuite) TestParseMountEntry3(c *C) {
 
 // Test that number of fields is checked
 func (s *entrySuite) TestParseMountEntry4(c *C) {
-	for _, s := range []string{
-		"", "1", "1 2" /* skip 3, 4, 5 and 6 fields (valid case) */, "1 2 3 4 5 6 7",
-	} {
+	for _, s := range []string{"", "1", "1 2"} {
 		_, err := osutil.ParseMountEntry(s)
-		c.Assert(err, ErrorMatches, "expected between 3 and 6 fields, found [01237]")
+		c.Assert(err, ErrorMatches, "expected at least 3 fields, found [012]")
 	}
 }
 
@@ -172,6 +214,42 @@ func (s *entrySuite) TestParseMountEntry6(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(e.DumpFrequency, Equals, 5)
 	c.Assert(e.CheckPassNumber, Equals, 7)
+}
+
+func (s *entrySuite) TestParseMountEntrySpacesInOptions(c *C) {
+	const p9DockerSpaces = `C:\134Program\040Files\134Docker\134Docker\134resources /Docker/host 9p rw,dirsync,noatime,aname=drvfs;path=C:\Program Files\Docker\Docker\resources;symlinkroot=/mnt/,mmap,access=client,msize=65536,trans=fd,rfd=4,wfd=4 0 0`
+	e, err := osutil.ParseMountEntry(p9DockerSpaces)
+	c.Assert(err, IsNil)
+
+	c.Assert(e.Name, Equals, "C:\\Program Files\\Docker\\Docker\\resources")
+	c.Assert(e.Dir, Equals, "/Docker/host")
+	c.Assert(e.Type, Equals, "9p")
+	c.Assert(e.Options, DeepEquals, []string{
+		"rw",
+		"dirsync",
+		"noatime",
+		"aname=drvfs;path=C:\\Program Files\\Docker\\Docker\\resources;symlinkroot=/mnt/",
+		"mmap",
+		"access=client",
+		"msize=65536",
+		"trans=fd",
+		"rfd=4",
+		"wfd=4",
+	})
+	c.Assert(e.DumpFrequency, Equals, 0)
+	c.Assert(e.CheckPassNumber, Equals, 0)
+}
+
+// Test that the typical ensure-dir fstab entry is parsed correctly.
+func (s *entrySuite) TestParseMountEntryEnsureDir(c *C) {
+	e, err := osutil.ParseMountEntry("none $HOME/.local/share none x-snapd.kind=ensure-dir,x-snapd.must-exist-dir=$HOME 0 0")
+	c.Assert(err, IsNil)
+	c.Assert(e.Name, Equals, "none")
+	c.Assert(e.Dir, Equals, "$HOME/.local/share")
+	c.Assert(e.Type, Equals, "none")
+	c.Assert(e.Options, DeepEquals, []string{"x-snapd.kind=ensure-dir", "x-snapd.must-exist-dir=$HOME"})
+	c.Assert(e.DumpFrequency, Equals, 0)
+	c.Assert(e.CheckPassNumber, Equals, 0)
 }
 
 // Test (string) options -> (int) flag conversion code.
@@ -243,6 +321,7 @@ func (s *entrySuite) TestOptionHelpers(c *C) {
 	c.Assert(osutil.XSnapdGroup(1000), Equals, "x-snapd.group=1000")
 	c.Assert(osutil.XSnapdMode(0755), Equals, "x-snapd.mode=0755")
 	c.Assert(osutil.XSnapdSymlink("oldname"), Equals, "x-snapd.symlink=oldname")
+	c.Assert(osutil.XSnapdMustExistDir("$HOME"), Equals, "x-snapd.must-exist-dir=$HOME")
 }
 
 func (s *entrySuite) TestXSnapdMode(c *C) {
@@ -412,6 +491,13 @@ func (s *entrySuite) TestXSnapdKind(c *C) {
 
 	// There's a helper function that returns this option string.
 	c.Assert(osutil.XSnapdKindSymlink(), Equals, "x-snapd.kind=symlink")
+
+	// A mount entry can request creation of missing directories within the mount directory.
+	e = &osutil.MountEntry{Options: []string{"x-snapd.kind=ensure-dir"}}
+	c.Assert(e.XSnapdKind(), Equals, "ensure-dir")
+
+	// There is a helper function that returns this option string.
+	c.Assert(osutil.XSnapdKindEnsureDir(), Equals, "x-snapd.kind=ensure-dir")
 }
 
 func (s *entrySuite) TestXSnapdSymlink(c *C) {
@@ -437,4 +523,14 @@ func (s *entrySuite) TestXSnapdIgnoreMissing(c *C) {
 
 	// There's a helper function that returns this option string.
 	c.Assert(osutil.XSnapdIgnoreMissing(), Equals, "x-snapd.ignore-missing")
+}
+
+func (s *entrySuite) TestXSnapdMustExistDir(c *C) {
+	// Entries without the x-snapd.must-exist-dir key return an empty string
+	e := &osutil.MountEntry{}
+	c.Assert(e.XSnapdMustExistDir(), Equals, "")
+
+	// A mount entry can list a symlink target
+	e = &osutil.MountEntry{Options: []string{osutil.XSnapdMustExistDir("$HOME")}}
+	c.Assert(e.XSnapdMustExistDir(), Equals, "$HOME")
 }

@@ -34,11 +34,10 @@ var (
 	ResolveSpecialVariable      = resolveSpecialVariable
 	ImplicitSystemPermanentSlot = implicitSystemPermanentSlot
 	ImplicitSystemConnectedSlot = implicitSystemConnectedSlot
-	LabelExpr                   = labelExpr
-	PlugAppLabelExpr            = plugAppLabelExpr
-	SlotAppLabelExpr            = slotAppLabelExpr
 	AareExclusivePatterns       = aareExclusivePatterns
 	GetDesktopFileRules         = getDesktopFileRules
+	StringListAttribute         = stringListAttribute
+	PolkitPoliciesSupported     = polkitPoliciesSupported
 )
 
 func MprisGetName(iface interfaces.Interface, attribs map[string]interface{}) (string, error) {
@@ -83,16 +82,24 @@ func MockSlot(c *C, yaml string, si *snap.SideInfo, slotName string) *snap.SlotI
 
 func MockConnectedPlug(c *C, yaml string, si *snap.SideInfo, plugName string) (*interfaces.ConnectedPlug, *snap.PlugInfo) {
 	info := snaptest.MockInfo(c, yaml, si)
+
+	set, err := interfaces.NewSnapAppSet(info, nil)
+	c.Assert(err, IsNil)
+
 	if plugInfo, ok := info.Plugs[plugName]; ok {
-		return interfaces.NewConnectedPlug(plugInfo, nil, nil), plugInfo
+		return interfaces.NewConnectedPlug(plugInfo, set, nil, nil), plugInfo
 	}
 	panic(fmt.Sprintf("cannot find plug %q in snap %q", plugName, info.InstanceName()))
 }
 
 func MockConnectedSlot(c *C, yaml string, si *snap.SideInfo, slotName string) (*interfaces.ConnectedSlot, *snap.SlotInfo) {
 	info := snaptest.MockInfo(c, yaml, si)
+
+	set, err := interfaces.NewSnapAppSet(info, nil)
+	c.Assert(err, IsNil)
+
 	if slotInfo, ok := info.Slots[slotName]; ok {
-		return interfaces.NewConnectedSlot(slotInfo, nil, nil), slotInfo
+		return interfaces.NewConnectedSlot(slotInfo, set, nil, nil), slotInfo
 	}
 	panic(fmt.Sprintf("cannot find slot %q in snap %q", slotName, info.InstanceName()))
 }
@@ -115,4 +122,27 @@ func MockProcCpuinfo(filename string) (restore func()) {
 	procCpuinfo = filename
 
 	return restore
+}
+
+func MockDirsToEnsure(fn func(paths []string) ([]*interfaces.EnsureDirSpec, error)) (restore func()) {
+	old := dirsToEnsure
+	restore = func() {
+		dirsToEnsure = old
+	}
+	dirsToEnsure = fn
+
+	return restore
+}
+
+func MockPolkitDaemonPaths(path1, path2 string) (restore func()) {
+	oldDaemonPath1 := polkitDaemonPath1
+	oldDaemonPath2 := polkitDaemonPath2
+
+	polkitDaemonPath1 = path1
+	polkitDaemonPath2 = path2
+
+	return func() {
+		polkitDaemonPath1 = oldDaemonPath1
+		polkitDaemonPath2 = oldDaemonPath2
+	}
 }

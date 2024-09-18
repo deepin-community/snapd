@@ -18,8 +18,8 @@ environment:
 prepare: |
   #shellcheck source=tests/lib/prepare.sh
   . "$TESTSLIB"/prepare.sh
-  snap download "--channel=${SNAPD_CHANNEL}" snapd
-  repack_snapd_snap_with_deb_content_and_run_mode_firstboot_tweaks /tmp
+  mkdir -p /tmp/tweaked-snapd-snap
+  build_snapd_snap_with_run_mode_firstboot_tweaks /tmp/tweaked-snapd-snap
 
   snap pack systemusers-snap
 
@@ -36,6 +36,7 @@ prepare: |
   gendeveloper1 show-key | gpg --homedir=~/.snap/gnupg --import
 
 restore: |
+  rm -rf /tmp/tweaked-snapd-snap
   rm -rf "$PREPARE_IMAGE_DIR"
   "$TESTSTOOLS"/store-state teardown-fake-store "$STORE_DIR"
 
@@ -47,10 +48,18 @@ execute: |
   export SNAPPY_FORCE_SAS_URL=http://$STORE_ADDR
 
   echo "Running pre-seeding"
-  SNAPD_SNAP=$(ls /tmp/snapd*.snap)
+  for f in /tmp/tweaked-snapd-snap/snapd*.snap; do
+    if [ "${SNAPD_SNAP:+set}" = set ]; then
+      echo "found multiple snaps in /tmp/tweaked-snapd-snap" 1>&2
+      exit 1
+    fi
+    SNAPD_SNAP="${f}"
+  done
 
   # XXX: confusingly, the name of our test key is actually " (test)".
-  snap prepare-image --preseed --preseed-sign-key=" (test)" --channel=stable --snap="$SNAPD_SNAP" --snap systemusers-snap_1.0_all.snap "$TESTSLIB"/assertions/developer1-20-dangerous.model "$PREPARE_IMAGE_DIR" > preseed.log 2>&1
+  SNAPD_DEBUG=1 snap prepare-image --preseed --preseed-sign-key=" (test)" --channel=stable \
+      --snap="$SNAPD_SNAP" --snap systemusers-snap_1.0_all.snap \
+      "$TESTSLIB"/assertions/developer1-20-dangerous.model "$PREPARE_IMAGE_DIR" > preseed.log 2>&1
 
   echo "Make sure no umount errors were reported during preseeding cleanup"
   NOMATCH "umount.*failed" < preseed.log
@@ -141,6 +150,14 @@ execute: |
   MATCH "^etc/systemd/system/getty.target.wants/getty@tty1.service" < files.log
   MATCH "^etc/systemd/system/snapd.failure.service" < files.log
 
+  # tar tf already escapes '\', so we need to double escape it here
+  # TODO add a preseed core24 test and check these mounts:
+  # MATCH '^etc/systemd/system/run-mnt-kernel\\\\x2dsnaps-pc\\\\x2dkernel.*.mount' < files.log
+  # MATCH '^etc/systemd/system/sysinit.target.wants/run-mnt-kernel\\\\x2dsnaps-pc\\\\x2dkernel.*.mount' < files.log
+  # TODO and these entries:
+  # MATCH "^var/lib/snapd/kernel/.*/lib/modules/.*" < files.log
+  # MATCH "^var/lib/snapd/kernel/.*/lib/firmware/.*" < files.log
+
   MATCH "^snap/pc-kernel/current" < files.log
   MATCH "^snap/core20/current" < files.log
   MATCH "^snap/snapd/current" < files.log
@@ -153,8 +170,11 @@ execute: |
   MATCH "^var/lib/snapd/apparmor/profiles/snap-update-ns.pc" < files.log
   MATCH "^var/lib/snapd/apparmor/profiles/snap-confine.snapd.x1" < files.log
 
+  MATCH "^var/lib/snapd/cgroup/snap.pc.device" < files.log
+  MATCH "^var/lib/snapd/cgroup/snap.pc-kernel.device" < files.log
+
   MATCH "^var/lib/snapd/seccomp/bpf/snap.pc.hook.configure.src" < files.log
-  MATCH "^var/lib/snapd/seccomp/bpf/snap.pc.hook.configure.bin" < files.log
+  MATCH "^var/lib/snapd/seccomp/bpf/snap.pc.hook.configure.bin2" < files.log
 
   MATCH "^var/lib/snapd/sequence/pc-kernel.json" < files.log
   MATCH "^var/lib/snapd/sequence/pc.json" < files.log

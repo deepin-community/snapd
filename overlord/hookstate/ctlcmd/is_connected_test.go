@@ -29,6 +29,7 @@ import (
 	"github.com/snapcore/snapd/overlord/hookstate/ctlcmd"
 	"github.com/snapcore/snapd/overlord/hookstate/hooktest"
 	"github.com/snapcore/snapd/overlord/snapstate"
+	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snaptest"
@@ -134,21 +135,22 @@ var isConnectedTests = []struct {
 	exitCode: ctlcmd.ClassicSnapCode,
 }}
 
-func mockInstalledSnap(c *C, st *state.State, snapYaml, cohortKey string) {
+func mockInstalledSnap(c *C, st *state.State, snapYaml, cohortKey string) *snap.Info {
 	info := snaptest.MockSnapCurrent(c, snapYaml, &snap.SideInfo{Revision: snap.R(1)})
 	snapstate.Set(st, info.InstanceName(), &snapstate.SnapState{
 		Active: true,
-		Sequence: []*snap.SideInfo{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
 			{
 				RealName: info.SnapName(),
 				Revision: info.Revision,
 				SnapID:   info.InstanceName() + "-id",
 			},
-		},
+		}),
 		Current:         info.Revision,
 		TrackingChannel: "stable",
 		CohortKey:       cohortKey,
 	})
+	return info
 }
 
 func (s *isConnectedSuite) testIsConnected(c *C, context *hookstate.Context) {

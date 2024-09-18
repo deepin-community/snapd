@@ -260,6 +260,10 @@ func init() {
 	maxSupportedFormat[TestOnlySeqType.Name] = 2
 }
 
+func (ak *AccountKey) CanSign(a Assertion) bool {
+	return ak.canSign(a)
+}
+
 // AccountKeyIsKeyValidAt exposes isKeyValidAt on AccountKey for tests
 func AccountKeyIsKeyValidAt(ak *AccountKey, when time.Time) bool {
 	return ak.isValidAt(when)
@@ -306,11 +310,12 @@ func (gkm *GPGKeypairManager) ParametersForGenerate(passphrase string, name stri
 
 // constraint tests
 
-func CompileAttrMatcher(constraints interface{}, allowedOperations []string) (func(attrs map[string]interface{}, helper AttrMatchContext) error, error) {
+func CompileAttrMatcher(constraints interface{}, allowedOperations, allowedRefs []string) (func(attrs map[string]interface{}, helper AttrMatchContext) error, error) {
 	// XXX adjust
 	cc := compileContext{
 		opts: &compileAttrMatcherOptions{
 			allowedOperations: allowedOperations,
+			allowedRefs:       allowedRefs,
 		},
 	}
 	matcher, err := compileAttrMatcher(cc, constraints)

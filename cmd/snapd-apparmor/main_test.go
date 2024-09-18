@@ -22,7 +22,6 @@ package main_test
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -47,6 +46,7 @@ var _ = Suite(&mainSuite{})
 
 func (s *mainSuite) SetUpTest(c *C) {
 	dirs.SetRootDir(c.MkDir())
+	s.AddCleanup(mockWSL(0))
 }
 
 func (s *mainSuite) TearDownTest(c *C) {
@@ -81,34 +81,46 @@ func (s *mainSuite) TestIsContainerWithInternalPolicy(c *C) {
 
 	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
 
-	// simulate being inside WSL
+	// Simulate being inside WSL 1 and 2.
+	//
+	// At present neither version is capable of running AppArmor correctly.
+	// AppArmor on WSL-1 is just not emulated by the Windows kernel.
+	// AppArmor on WSL-2 is neither configured in the Microsoft distribution
+	// of Linux nor properly set up to stack so that each running
+	// distribution gets an isolated playground.
 	restore := mockWSL(1)
-	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, true)
+	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
 	restore()
 
 	restore = mockWSL(2)
-	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, true)
+	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
 	restore()
 
-	// simulate being inside a container environment
-	testutil.MockCommand(c, "systemd-detect-virt", "echo lxc")
-	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
+	for _, prefix := range []string{"lxc", "lxd", "incus"} {
+		// simulate being inside a container environment
+		restore := testutil.MockCommand(c, "systemd-detect-virt", "echo "+prefix)
+		c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
 
-	err = ioutil.WriteFile(filepath.Join(appArmorSecurityFSPath, ".ns_stacked"), []byte("yes"), 0644)
-	c.Assert(err, IsNil)
-	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
+		err = os.WriteFile(filepath.Join(appArmorSecurityFSPath, ".ns_stacked"), []byte("yes"), 0644)
+		c.Assert(err, IsNil)
+		c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
 
-	err = ioutil.WriteFile(filepath.Join(appArmorSecurityFSPath, ".ns_name"), nil, 0644)
-	c.Assert(err, IsNil)
-	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
+		err = os.WriteFile(filepath.Join(appArmorSecurityFSPath, ".ns_name"), nil, 0644)
+		c.Assert(err, IsNil)
+		c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
 
-	err = ioutil.WriteFile(filepath.Join(appArmorSecurityFSPath, ".ns_name"), []byte("foo"), 0644)
-	c.Assert(err, IsNil)
-	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
-	// lxc/lxd name should result in a container with internal policy
-	err = ioutil.WriteFile(filepath.Join(appArmorSecurityFSPath, ".ns_name"), []byte("lxc-foo"), 0644)
-	c.Assert(err, IsNil)
-	c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, true)
+		err = os.WriteFile(filepath.Join(appArmorSecurityFSPath, ".ns_name"), []byte("foo"), 0644)
+		c.Assert(err, IsNil)
+		c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, false)
+		// lxc/lxd name should result in a container with internal policy
+		err = os.WriteFile(filepath.Join(appArmorSecurityFSPath, ".ns_name"), []byte(prefix+"-foo"), 0644)
+		c.Assert(err, IsNil)
+		c.Assert(snapd_apparmor.IsContainerWithInternalPolicy(), Equals, true)
+
+		os.Remove(filepath.Join(appArmorSecurityFSPath, ".ns_name"))
+		os.Remove(filepath.Join(appArmorSecurityFSPath, ".ns_stacked"))
+		restore.Restore()
+	}
 }
 
 func (s *mainSuite) TestLoadAppArmorProfiles(c *C) {
@@ -126,8 +138,12 @@ func (s *mainSuite) TestLoadAppArmorProfiles(c *C) {
 	c.Assert(err, IsNil)
 
 	profile := filepath.Join(dirs.SnapAppArmorDir, "foo")
-	err = ioutil.WriteFile(profile, nil, 0644)
+	err = os.WriteFile(profile, nil, 0644)
 	c.Assert(err, IsNil)
+
+	// pretend that the host apparmor has a 3.0 abi file.
+	c.Assert(os.MkdirAll(filepath.Join(dirs.GlobalRootDir, "/etc/apparmor.d/abi"), 0755), IsNil)
+	c.Assert(os.WriteFile(filepath.Join(dirs.GlobalRootDir, "/etc/apparmor.d/abi/3.0"), nil, 0644), IsNil)
 
 	// ensure SNAPD_DEBUG is set in the environment so then --quiet
 	// will *not* be included in the apparmor_parser arguments (since
@@ -138,9 +154,9 @@ func (s *mainSuite) TestLoadAppArmorProfiles(c *C) {
 
 	// check arguments to the parser are as expected
 	c.Assert(parserCmd.Calls(), DeepEquals, [][]string{
-		{"apparmor_parser", "--replace", "--write-cache",
-			fmt.Sprintf("--cache-loc=%s/var/cache/apparmor", dirs.GlobalRootDir),
-			profile}})
+		{"apparmor_parser", "--policy-features", filepath.Join(dirs.GlobalRootDir, "/etc/apparmor.d/abi/3.0"),
+			"--replace", "--write-cache",
+			fmt.Sprintf("--cache-loc=%s/var/cache/apparmor", dirs.GlobalRootDir), profile}})
 
 	// test error case
 	parserCmd = testutil.MockCommand(c, "apparmor_parser", "echo mocked parser failed > /dev/stderr; exit 1")
@@ -226,6 +242,7 @@ type integrationSuite struct {
 var _ = Suite(&integrationSuite{})
 
 func (s *integrationSuite) SetUpTest(c *C) {
+	s.AddCleanup(mockWSL(0))
 	dirs.SetRootDir(c.MkDir())
 	s.AddCleanup(func() { dirs.SetRootDir("/") })
 
@@ -241,7 +258,7 @@ func (s *integrationSuite) SetUpTest(c *C) {
 	err := os.MkdirAll(dirs.SnapAppArmorDir, 0755)
 	c.Assert(err, IsNil)
 	profile := filepath.Join(dirs.SnapAppArmorDir, "foo")
-	err = ioutil.WriteFile(profile, nil, 0644)
+	err = os.WriteFile(profile, nil, 0644)
 	c.Assert(err, IsNil)
 
 	os.Args = []string{"snapd-apparmor", "start"}
@@ -262,8 +279,8 @@ func (s *integrationSuite) TestRunInContainerWithInternalPolicyLoadsProfiles(c *
 	err := snapd_apparmor.Run()
 	c.Assert(err, IsNil)
 	c.Check(s.logBuf.String(), testutil.Contains, "DEBUG: inside container environment")
-	c.Check(s.logBuf.String(), Not(testutil.Contains), "Inside container environment without internal policy")
-	c.Assert(s.parserCmd.Calls(), HasLen, 1)
+	c.Check(s.logBuf.String(), testutil.Contains, "Inside container environment without internal policy")
+	c.Assert(s.parserCmd.Calls(), HasLen, 0)
 }
 
 func (s *integrationSuite) TestRunNormalLoadsProfiles(c *C) {

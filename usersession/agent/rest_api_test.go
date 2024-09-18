@@ -24,18 +24,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/godbus/dbus"
+	"github.com/mvo5/goconfigparser"
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/desktop/notification"
 	"github.com/snapcore/snapd/desktop/notification/notificationtest"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/systemd"
 	"github.com/snapcore/snapd/testutil"
 	"github.com/snapcore/snapd/usersession/agent"
@@ -178,6 +182,74 @@ func (s *restSuite) TestServiceControlStart(c *C) {
 	})
 }
 
+func (s *restSuite) TestServiceControlStartEnable(c *C) {
+	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"start", "enable":true,"services":["snap.foo.service", "snap.bar.service"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceControlCmd.POST(agent.ServiceControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 200)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeSync)
+	c.Check(rsp.Result, Equals, nil)
+
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"--user", "--no-reload", "enable", "snap.foo.service", "snap.bar.service"},
+		{"--user", "daemon-reload"},
+		{"--user", "start", "snap.foo.service"},
+		{"--user", "start", "snap.bar.service"},
+	})
+}
+
+func (s *restSuite) TestServiceControlStartEnableFailsAndDisables(c *C) {
+	var sysdLog [][]string
+	restore := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		sysdLog = append(sysdLog, cmd)
+		if cmd[1] == "start" && cmd[2] == "snap.bar.service" {
+			return []byte("ActiveState=active\n"), errors.New("mock systemctl error")
+		}
+		return []byte("ActiveState=inactive\n"), nil
+	})
+	defer restore()
+
+	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"start", "enable":true,"services":["snap.foo.service", "snap.bar.service"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceControlCmd.POST(agent.ServiceControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 500)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{
+		"kind": "service-control", "message": "some user services failed to start",
+		"value": map[string]interface{}{
+			"start-errors": map[string]interface{}{"snap.bar.service": "mock systemctl error"},
+			"stop-errors":  map[string]interface{}{},
+		},
+	})
+
+	c.Check(sysdLog, DeepEquals, [][]string{
+		// Enable them as the first step
+		{"--user", "--no-reload", "enable", "snap.foo.service", "snap.bar.service"},
+		{"--user", "daemon-reload"},
+		{"--user", "start", "snap.foo.service"},
+
+		// Game is rigged, this will fail, and we should stop the first service
+		// we managed to start
+		{"--user", "start", "snap.bar.service"},
+		{"--user", "stop", "snap.foo.service"},
+		{"--user", "show", "--property=ActiveState", "snap.foo.service"},
+
+		// And because it fails, we re-disable services.
+		{"--user", "--no-reload", "disable", "snap.foo.service", "snap.bar.service"},
+		{"--user", "daemon-reload"},
+	})
+}
+
 func (s *restSuite) TestServicesStartNonSnap(c *C) {
 	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"start","services":["snap.foo.service", "not-snap.bar.service"]}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -303,6 +375,94 @@ func (s *restSuite) TestServicesStop(c *C) {
 	})
 }
 
+func (s *restSuite) TestServicesStopDisable(c *C) {
+	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"stop", "disable":true,"services":["snap.foo.service", "snap.bar.service"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceControlCmd.POST(agent.ServiceControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 200)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeSync)
+	c.Check(rsp.Result, Equals, nil)
+
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"--user", "stop", "snap.foo.service"},
+		{"--user", "show", "--property=ActiveState", "snap.foo.service"},
+		{"--user", "stop", "snap.bar.service"},
+		{"--user", "show", "--property=ActiveState", "snap.bar.service"},
+		{"--user", "--no-reload", "disable", "snap.foo.service", "snap.bar.service"},
+		{"--user", "daemon-reload"},
+	})
+}
+
+func (s *restSuite) TestServicesStopDisableFailsOnDisable(c *C) {
+	var sysdLog [][]string
+	restore := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		sysdLog = append(sysdLog, cmd)
+		if cmd[1] == "--no-reload" && cmd[2] == "disable" {
+			return []byte("ActiveState=active\n"), errors.New("mock systemctl error")
+		}
+		return []byte("ActiveState=inactive\n"), nil
+	})
+	defer restore()
+
+	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"stop", "disable":true,"services":["snap.foo.service"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceControlCmd.POST(agent.ServiceControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 500)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{
+		"message": "cannot disable services [\"snap.foo.service\"]: mock systemctl error",
+	})
+
+	c.Check(sysdLog, DeepEquals, [][]string{
+		{"--user", "stop", "snap.foo.service"},
+		{"--user", "show", "--property=ActiveState", "snap.foo.service"},
+		{"--user", "--no-reload", "disable", "snap.foo.service"},
+	})
+}
+
+func (s *restSuite) TestServicesStopDisableFailsOnReload(c *C) {
+	var sysdLog [][]string
+	restore := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		sysdLog = append(sysdLog, cmd)
+		if cmd[1] == "daemon-reload" {
+			return []byte("ActiveState=active\n"), errors.New("mock systemctl error")
+		}
+		return []byte("ActiveState=inactive\n"), nil
+	})
+	defer restore()
+
+	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"stop", "disable":true,"services":["snap.foo.service"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceControlCmd.POST(agent.ServiceControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 500)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{
+		"message": "cannot reload systemd: mock systemctl error",
+	})
+
+	c.Check(sysdLog, DeepEquals, [][]string{
+		{"--user", "stop", "snap.foo.service"},
+		{"--user", "show", "--property=ActiveState", "snap.foo.service"},
+		{"--user", "--no-reload", "disable", "snap.foo.service"},
+		{"--user", "daemon-reload"},
+	})
+}
+
 func (s *restSuite) TestServicesStopNonSnap(c *C) {
 	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"stop","services":["snap.foo.service", "not-snap.bar.service"]}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -359,6 +519,495 @@ func (s *restSuite) TestServicesStopReportsError(c *C) {
 	c.Check(sysdLog, DeepEquals, [][]string{
 		{"--user", "stop", "snap.foo.service"},
 		{"--user", "stop", "snap.bar.service"},
+	})
+}
+
+func (s *restSuite) TestServicesRestart(c *C) {
+	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"restart","services":["snap.foo.service", "snap.bar.service"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceControlCmd.POST(agent.ServiceControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 200)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeSync)
+	c.Check(rsp.Result, Equals, nil)
+
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"--user", "stop", "snap.foo.service"},
+		{"--user", "show", "--property=ActiveState", "snap.foo.service"},
+		{"--user", "start", "snap.foo.service"},
+		{"--user", "stop", "snap.bar.service"},
+		{"--user", "show", "--property=ActiveState", "snap.bar.service"},
+		{"--user", "start", "snap.bar.service"},
+	})
+}
+
+func (s *restSuite) TestServicesRestartNonSnap(c *C) {
+	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"restart","services":["snap.foo.service", "not-snap.bar.service"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceControlCmd.POST(agent.ServiceControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 500)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{
+		"message": "cannot restart non-snap service not-snap.bar.service",
+	})
+
+	// No services were started on the error.
+	c.Check(s.sysdLog, HasLen, 0)
+}
+
+func (s *restSuite) TestServicesRestartReportsError(c *C) {
+	var sysdLog [][]string
+	restore := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		// Ignore "show" spam
+		if cmd[1] != "show" {
+			sysdLog = append(sysdLog, cmd)
+		}
+		if cmd[len(cmd)-1] == "snap.bar.service" {
+			return []byte("ActiveState=active\n"), errors.New("mock systemctl error")
+		}
+		return []byte("ActiveState=inactive\n"), nil
+	})
+	defer restore()
+
+	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"restart","services":["snap.foo.service", "snap.bar.service"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceControlCmd.POST(agent.ServiceControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 500)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{
+		"kind":    "service-control",
+		"message": "some user services failed to restart",
+		"value": map[string]interface{}{
+			"restart-errors": map[string]interface{}{
+				"snap.bar.service": "mock systemctl error",
+			},
+		},
+	})
+
+	c.Check(sysdLog, DeepEquals, [][]string{
+		{"--user", "stop", "snap.foo.service"},
+		{"--user", "start", "snap.foo.service"},
+		{"--user", "stop", "snap.bar.service"},
+	})
+}
+
+func (s *restSuite) TestServicesRestartOrReload(c *C) {
+	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"restart", "reload":true,"services":["snap.foo.service", "snap.bar.service"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceControlCmd.POST(agent.ServiceControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 200)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeSync)
+	c.Check(rsp.Result, Equals, nil)
+
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"--user", "reload-or-restart", "snap.foo.service"},
+		{"--user", "reload-or-restart", "snap.bar.service"},
+	})
+}
+
+func (s *restSuite) TestServicesRestartOrReloadNonSnap(c *C) {
+	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"restart", "reload":true,"services":["snap.foo.service", "not-snap.bar.service"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceControlCmd.POST(agent.ServiceControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 500)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{
+		"message": "cannot restart non-snap service not-snap.bar.service",
+	})
+
+	// No services were started on the error.
+	c.Check(s.sysdLog, HasLen, 0)
+}
+
+func (s *restSuite) TestServicesRestartOrReloadReportsError(c *C) {
+	var sysdLog [][]string
+	restore := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		// Ignore "show" spam
+		if cmd[1] != "show" {
+			sysdLog = append(sysdLog, cmd)
+		}
+		if cmd[len(cmd)-1] == "snap.bar.service" {
+			return []byte("ActiveState=active\n"), errors.New("mock systemctl error")
+		}
+		return []byte("ActiveState=inactive\n"), nil
+	})
+	defer restore()
+
+	req := httptest.NewRequest("POST", "/v1/service-control", bytes.NewBufferString(`{"action":"restart", "reload":true,"services":["snap.foo.service", "snap.bar.service"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceControlCmd.POST(agent.ServiceControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 500)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{
+		"kind":    "service-control",
+		"message": "some user services failed to restart",
+		"value": map[string]interface{}{
+			"restart-errors": map[string]interface{}{
+				"snap.bar.service": "mock systemctl error",
+			},
+		},
+	})
+
+	c.Check(sysdLog, DeepEquals, [][]string{
+		{"--user", "reload-or-restart", "snap.foo.service"},
+		{"--user", "reload-or-restart", "snap.bar.service"},
+	})
+}
+
+func (s *restSuite) TestServicesStatus(c *C) {
+	var sysdLog [][]string
+	restore := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		sysdLog = append(sysdLog, cmd)
+		svc := cmd[len(cmd)-1]
+		return []byte(fmt.Sprintf(`Type=notify
+Id=%[1]s
+Names=%[1]s
+ActiveState=inactive
+UnitFileState=enabled
+NeedDaemonReload=no
+`, svc)), nil
+	})
+	defer restore()
+
+	req := httptest.NewRequest("GET", "/v1/service-status?services=snap.foo.service,snap.bar.service", nil)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceStatusCmd.GET(agent.ServiceStatusCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 200)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeSync)
+	c.Check(rsp.Result, DeepEquals, []interface{}{
+		map[string]interface{}{
+			"active":    false,
+			"daemon":    "notify",
+			"enabled":   true,
+			"id":        "snap.foo.service",
+			"installed": true,
+			"name":      "snap.foo.service",
+			"names": []interface{}{
+				"snap.foo.service",
+			},
+			"needs-reload": false,
+		},
+		map[string]interface{}{
+			"active":    false,
+			"daemon":    "notify",
+			"enabled":   true,
+			"id":        "snap.bar.service",
+			"installed": true,
+			"name":      "snap.bar.service",
+			"names": []interface{}{
+				"snap.bar.service",
+			},
+			"needs-reload": false,
+		},
+	})
+
+	c.Check(sysdLog, DeepEquals, [][]string{
+		{"--user", "show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", "snap.foo.service"},
+		{"--user", "show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", "snap.bar.service"},
+	})
+}
+
+func (s *restSuite) TestServiceStatusNonSnap(c *C) {
+	req := httptest.NewRequest("GET", "/v1/service-status?services=not-snap.bar.service", nil)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceStatusCmd.GET(agent.ServiceStatusCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 500)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{
+		"message": "cannot query non-snap service not-snap.bar.service",
+	})
+
+	// No services were started on the error.
+	c.Check(s.sysdLog, HasLen, 0)
+}
+
+func (s *restSuite) TestServicesStatusReportsError(c *C) {
+	var sysdLog [][]string
+	restore := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		sysdLog = append(sysdLog, cmd)
+		return []byte("ActiveState=active\n"), errors.New("mock systemctl error")
+	})
+	defer restore()
+
+	req := httptest.NewRequest("GET", "/v1/service-status?services=snap.foo.service,snap.bar.service", nil)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.ServiceStatusCmd.GET(agent.ServiceStatusCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 500)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{
+		"kind":    "service-status",
+		"message": "some user services failed to respond to status query",
+		"value": map[string]interface{}{
+			"status-errors": map[string]interface{}{
+				"snap.foo.service": "mock systemctl error",
+				"snap.bar.service": "mock systemctl error",
+			},
+		},
+	})
+
+	c.Check(sysdLog, DeepEquals, [][]string{
+		{"--user", "show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", "snap.foo.service"},
+		{"--user", "show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", "snap.bar.service"},
+	})
+}
+
+func (s *restSuite) TestAppControl(c *C) {
+	// the agent.Apps end point only supports POST requests
+	c.Assert(agent.AppControlCmd.GET, IsNil)
+	c.Check(agent.AppControlCmd.PUT, IsNil)
+	c.Check(agent.AppControlCmd.POST, NotNil)
+	c.Check(agent.AppControlCmd.DELETE, IsNil)
+
+	c.Check(agent.AppControlCmd.Path, Equals, "/v1/app-control")
+}
+
+func (s *restSuite) testAppControlBadRequest(c *C, inst string, contentType string, expectedErr string) {
+	req := httptest.NewRequest("POST", "/v1/app-control", bytes.NewBufferString(inst))
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	agent.AppControlCmd.POST(agent.AppControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 400)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{"message": expectedErr})
+}
+
+func (s *restSuite) TestAppControlBadContentType(c *C) {
+	const inst = `{"action":"kill","snaps":["foo"],"signal":9}`
+	const contentType = "text/html"
+	const expectedErr = "unknown content type: text/html"
+	s.testAppControlBadRequest(c, inst, contentType, expectedErr)
+}
+
+func (s *restSuite) TestAppControlBadAction(c *C) {
+	const inst = `{"action":"bad-action","snaps":["foo"],"signal":9}`
+	const contentType = "application/json"
+	const expectedErr = "unknown action bad-action"
+	s.testAppControlBadRequest(c, inst, contentType, expectedErr)
+}
+
+func (s *restSuite) TestAppControlBadJsonFormat(c *C) {
+	const inst = `{"action":}`
+	const contentType = "application/json"
+	const expectedErr = "cannot decode request body into service instruction: invalid character '}' looking for beginning of value"
+	s.testAppControlBadRequest(c, inst, contentType, expectedErr)
+}
+
+func mockSystemctlUnitJsonOutput(units []string, c *C) []byte {
+	type rawUnit struct {
+		UnitName string `json:"unit"`
+	}
+	var fakeUnits = make([]rawUnit, len(units))
+	for i, unit := range units {
+		fakeUnits[i].UnitName = unit
+	}
+	systemctlOutput, err := json.Marshal(fakeUnits)
+	c.Assert(err, IsNil)
+	return systemctlOutput
+}
+
+func (s *restSuite) TestAppControlKill(c *C) {
+	var sysdLog [][]string
+	unitsForPattern := map[string][]string{
+		"snap.foo.*.scope": {
+			"snap.foo.some-app-7414e1a3-6d08-43ff-a81c-6547242a78b0.scope",
+			"snap.foo.some-app-ff81c9d9-cabb-494b-84b5-494ba945a458.scope",
+		},
+		"snap.bar.*.scope": {
+			"snap.bar.some-app-f3a1d6fa-c660-4b7d-a450-aaa8849614c7.scope",
+		},
+		// no running apps for foobar
+		"snap.foobar.*.scope": nil,
+	}
+	restore := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		sysdLog = append(sysdLog, cmd)
+		switch cmd[1] {
+		case "list-units":
+			units, exists := unitsForPattern[cmd[len(cmd)-1]]
+			c.Assert(exists, Equals, true)
+			return mockSystemctlUnitJsonOutput(units, c), nil
+		case "kill":
+			return []byte{}, nil
+		default:
+			return nil, fmt.Errorf("unexpected systemctl cmd %q", cmd[1])
+		}
+	})
+	defer restore()
+
+	req := httptest.NewRequest("POST", "/v1/app-control", bytes.NewBufferString(`{"action":"kill","snaps":["foo", "bar", "foobar"],"signal":9}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.AppControlCmd.POST(agent.AppControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 200)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeSync)
+	c.Check(rsp.Result, Equals, nil)
+
+	c.Check(sysdLog, DeepEquals, [][]string{
+		{"--user", "list-units", "--output=json", "snap.foo.*.scope"},
+		{"--user", "list-units", "--output=json", "snap.bar.*.scope"},
+		{"--user", "list-units", "--output=json", "snap.foobar.*.scope"},
+		{"--user", "kill", "snap.foo.some-app-7414e1a3-6d08-43ff-a81c-6547242a78b0.scope", "-s", "9", "--kill-who=all"},
+		{"--user", "kill", "snap.foo.some-app-ff81c9d9-cabb-494b-84b5-494ba945a458.scope", "-s", "9", "--kill-who=all"},
+		{"--user", "kill", "snap.bar.some-app-f3a1d6fa-c660-4b7d-a450-aaa8849614c7.scope", "-s", "9", "--kill-who=all"},
+	})
+}
+
+func (s *restSuite) TestAppControlKillBadSignal(c *C) {
+	const inst = `{"action":"kill","snaps":["foo"],"signal":15}`
+	const contentType = "application/json"
+	const expectedErr = "only signal SIGKILL is supported"
+	s.testAppControlBadRequest(c, inst, contentType, expectedErr)
+}
+
+func (s *restSuite) TestAppControlKillBadInstanceName(c *C) {
+	const inst = `{"action":"kill","snaps":["foo_bad-instance-name"],"signal":9}`
+	const contentType = "application/json"
+	const expectedErr = `invalid snap instance name "foo_bad-instance-name": invalid instance key: "bad-instance-name"`
+	s.testAppControlBadRequest(c, inst, contentType, expectedErr)
+}
+
+func (s *restSuite) TestAppControlKillBadSnapName(c *C) {
+	const inst = `{"action":"kill","snaps":["Bad"],"signal":9}`
+	const contentType = "application/json"
+	const expectedErr = `invalid snap instance name "Bad": invalid snap name: "Bad"`
+	s.testAppControlBadRequest(c, inst, contentType, expectedErr)
+}
+
+func (s *restSuite) TestAppControlKillListUnitsError(c *C) {
+	var sysdLog [][]string
+	restore := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		sysdLog = append(sysdLog, cmd)
+		switch cmd[1] {
+		case "list-units":
+			return nil, errors.New("mock systemctl error")
+		default:
+			return nil, fmt.Errorf("unexpected systemctl cmd %q", cmd[1])
+		}
+	})
+	defer restore()
+
+	req := httptest.NewRequest("POST", "/v1/app-control", bytes.NewBufferString(`{"action":"kill","snaps":["foo", "bar", "foobar"],"signal":9}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.AppControlCmd.POST(agent.AppControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 500)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{"message": `cannot collect snap app units for "foo": mock systemctl error`})
+}
+
+func (s *restSuite) TestAppControlKillReportsError(c *C) {
+	var sysdLog [][]string
+	unitsForPattern := map[string][]string{
+		"snap.foo.*.scope": {
+			"snap.foo.some-app-7414e1a3-6d08-43ff-a81c-6547242a78b0.scope",
+		},
+		"snap.bad.*.scope": {
+			"snap.bad.app-ff81c9d9-cabb-494b-84b5-494ba945a458.scope",
+		},
+		"snap.bar.*.scope": {
+			"snap.bar.some-app-f3a1d6fa-c660-4b7d-a450-aaa8849614c7.scope",
+		},
+	}
+	restore := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		sysdLog = append(sysdLog, cmd)
+		switch cmd[1] {
+		case "list-units":
+			units, exists := unitsForPattern[cmd[len(cmd)-1]]
+			c.Assert(exists, Equals, true)
+			return mockSystemctlUnitJsonOutput(units, c), nil
+		case "kill":
+			if strings.HasPrefix(cmd[2], "snap.bad.") {
+				return []byte{}, errors.New("mock systemctl error")
+			}
+			return []byte{}, nil
+		default:
+			return nil, fmt.Errorf("unexpected systemctl cmd %q", cmd[1])
+		}
+	})
+	defer restore()
+
+	req := httptest.NewRequest("POST", "/v1/app-control", bytes.NewBufferString(`{"action":"kill","snaps":["foo", "bad", "bar"],"signal":9}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	agent.AppControlCmd.POST(agent.AppControlCmd, req).ServeHTTP(rec, req)
+	c.Check(rec.Code, Equals, 500)
+	c.Check(rec.Header().Get("Content-Type"), Equals, "application/json")
+
+	var rsp resp
+	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), IsNil)
+	c.Check(rsp.Type, Equals, agent.ResponseTypeError)
+	c.Check(rsp.Result, DeepEquals, map[string]interface{}{
+		"message": "some transient units failed to be killed",
+		"kind":    "app-control",
+		"value": map[string]interface{}{
+			"kill-errors": map[string]interface{}{
+				"snap.bad.app-ff81c9d9-cabb-494b-84b5-494ba945a458.scope": "mock systemctl error",
+			},
+		},
+	})
+
+	c.Check(sysdLog, DeepEquals, [][]string{
+		{"--user", "list-units", "--output=json", "snap.foo.*.scope"},
+		{"--user", "list-units", "--output=json", "snap.bad.*.scope"},
+		{"--user", "list-units", "--output=json", "snap.bar.*.scope"},
+		{"--user", "kill", "snap.foo.some-app-7414e1a3-6d08-43ff-a81c-6547242a78b0.scope", "-s", "9", "--kill-who=all"},
+		{"--user", "kill", "snap.bad.app-ff81c9d9-cabb-494b-84b5-494ba945a458.scope", "-s", "9", "--kill-who=all"},
+		{"--user", "kill", "snap.bar.some-app-f3a1d6fa-c660-4b7d-a450-aaa8849614c7.scope", "-s", "9", "--kill-who=all"},
 	})
 }
 
@@ -461,7 +1110,7 @@ func (s *restSuite) TestPostPendingRefreshNotificationHappeningNow(c *C) {
 	n := notifications[0]
 	c.Check(n.AppName, Equals, "")
 	c.Check(n.Icon, Equals, "")
-	c.Check(n.Summary, Equals, `Snap "pkg" is refreshing now!`)
+	c.Check(n.Summary, Equals, `pkg is updating now!`)
 	c.Check(n.Body, Equals, "")
 	c.Check(n.Actions, DeepEquals, []string{})
 	c.Check(n.Hints, DeepEquals, map[string]dbus.Variant{
@@ -481,8 +1130,8 @@ func (s *restSuite) TestPostPendingRefreshNotificationFewDays(c *C) {
 	c.Assert(notifications, HasLen, 1)
 	n := notifications[0]
 	// boring stuff is checked above
-	c.Check(n.Summary, Equals, `Pending update of "pkg" snap`)
-	c.Check(n.Body, Equals, "Close the app to update now (3 days left)")
+	c.Check(n.Summary, Equals, `Update available for pkg.`)
+	c.Check(n.Body, Equals, "Close the application to update now. It will update automatically in 3 days.")
 	c.Check(n.Hints, DeepEquals, map[string]dbus.Variant{
 		"urgency":       dbus.MakeVariant(byte(notification.LowUrgency)),
 		"desktop-entry": dbus.MakeVariant("io.snapcraft.SessionAgent"),
@@ -499,8 +1148,8 @@ func (s *restSuite) TestPostPendingRefreshNotificationFewHours(c *C) {
 	c.Assert(notifications, HasLen, 1)
 	n := notifications[0]
 	// boring stuff is checked above
-	c.Check(n.Summary, Equals, `Pending update of "pkg" snap`)
-	c.Check(n.Body, Equals, "Close the app to update now (7 hours left)")
+	c.Check(n.Summary, Equals, `Update available for pkg.`)
+	c.Check(n.Body, Equals, "Close the application to update now. It will update automatically in 7 hours.")
 	c.Check(n.Hints, DeepEquals, map[string]dbus.Variant{
 		"urgency":       dbus.MakeVariant(byte(notification.NormalUrgency)),
 		"desktop-entry": dbus.MakeVariant("io.snapcraft.SessionAgent"),
@@ -517,8 +1166,8 @@ func (s *restSuite) TestPostPendingRefreshNotificationFewMinutes(c *C) {
 	c.Assert(notifications, HasLen, 1)
 	n := notifications[0]
 	// boring stuff is checked above
-	c.Check(n.Summary, Equals, `Pending update of "pkg" snap`)
-	c.Check(n.Body, Equals, "Close the app to update now (15 minutes left)")
+	c.Check(n.Summary, Equals, `Update available for pkg.`)
+	c.Check(n.Body, Equals, "Close the application to update now. It will update automatically in 15 minutes.")
 	c.Check(n.Hints, DeepEquals, map[string]dbus.Variant{
 		"urgency":       dbus.MakeVariant(byte(notification.CriticalUrgency)),
 		"desktop-entry": dbus.MakeVariant("io.snapcraft.SessionAgent"),
@@ -534,7 +1183,7 @@ func (s *restSuite) TestPostPendingRefreshNotificationBusyAppDesktopFile(c *C) {
 	err := os.MkdirAll(dirs.SnapDesktopFilesDir, 0755)
 	c.Assert(err, IsNil)
 	desktopFilePath := filepath.Join(dirs.SnapDesktopFilesDir, "pkg_app.desktop")
-	err = ioutil.WriteFile(desktopFilePath, []byte(`
+	err = os.WriteFile(desktopFilePath, []byte(`
 [Desktop Entry]
 Icon=app.png
 	`), 0644)
@@ -561,7 +1210,7 @@ func (s *restSuite) TestPostPendingRefreshNotificationBusyAppMalformedDesktopFil
 	err := os.MkdirAll(dirs.SnapDesktopFilesDir, 0755)
 	c.Assert(err, IsNil)
 	desktopFilePath := filepath.Join(dirs.SnapDesktopFilesDir, "pkg_app.desktop")
-	err = ioutil.WriteFile(desktopFilePath, []byte(`garbage!`), 0644)
+	err = os.WriteFile(desktopFilePath, []byte(`garbage!`), 0644)
 	c.Assert(err, IsNil)
 
 	s.testPostPendingRefreshNotificationBody(c, refreshInfo)
@@ -624,8 +1273,344 @@ func (s *restSuite) TestPostCloseRefreshNotification(c *C) {
 	c.Assert(notifications, HasLen, 1)
 	n := notifications[0]
 	// boring stuff is checked above
-	c.Check(n.Summary, Equals, `"some-snap" snap has been refreshed`)
-	c.Check(n.Body, Equals, "Now available to launch")
+	c.Check(n.Summary, Equals, `some-snap was updated.`)
+	c.Check(n.Body, Equals, "Ready to launch.")
+	c.Check(n.Hints, DeepEquals, map[string]dbus.Variant{
+		"urgency":       dbus.MakeVariant(byte(notification.LowUrgency)),
+		"desktop-entry": dbus.MakeVariant("io.snapcraft.SessionAgent"),
+	})
+}
+
+func createDesktopFile(c *C, desktopFilePath string, icon string, name string, localizedNames map[string]string) {
+	data := []byte("[Desktop Entry]\nName=" + name + "\n")
+	if icon != "" {
+		data = append(data, []byte("Icon="+icon+"\n")...)
+	}
+	for key, value := range localizedNames {
+		data = append(data, []byte("Name["+key+"]="+value+"\n")...)
+	}
+	c.Assert(os.MkdirAll(path.Dir(desktopFilePath), 0755), IsNil)
+	c.Assert(os.WriteFile(desktopFilePath, data, 0644), IsNil)
+}
+
+func createLocalizedDesktopFile(c *C, name string, localizedNames map[string]string) *goconfigparser.ConfigParser {
+	tmpFile := filepath.Join(c.MkDir(), "desktop.desktop")
+	createDesktopFile(c, tmpFile, "", name, localizedNames)
+	parser := goconfigparser.New()
+	c.Assert(parser.ReadFile(tmpFile), IsNil)
+	return parser
+}
+
+func createSnapInfo(snapName string) *snap.Info {
+	si := snap.Info{
+		SideInfo: snap.SideInfo{
+			RealName: snapName,
+		},
+		Apps: make(map[string]*snap.AppInfo, 5),
+	}
+	return &si
+}
+
+func addAppToSnap(c *C, snapinfo *snap.Info, app string, isService bool, icon string, name string) {
+	newInfo := snap.AppInfo{
+		Snap: snapinfo,
+		Name: app,
+	}
+	if isService {
+		newInfo.Daemon = "daemon"
+	}
+	snapinfo.Apps[app] = &newInfo
+	createDesktopFile(c, newInfo.DesktopFile(), icon, name, nil)
+}
+
+func (s *restSuite) TestGuessAppDataNoIconPrefixEqualApp(c *C) {
+	si := createSnapInfo("app1")
+	addAppToSnap(c, si, "app1", false, "", "")
+	icon, name := agent.GuessAppData(si, "", "")
+	c.Check(icon, Equals, "")
+	c.Check(name, Equals, "")
+}
+
+func (s *restSuite) TestGuessAppDataNoIconPrefixDifferentApp(c *C) {
+	si := createSnapInfo("snap1")
+	addAppToSnap(c, si, "app1", false, "", "")
+	icon, name := agent.GuessAppData(si, "", "")
+	c.Check(icon, Equals, "")
+	c.Check(name, Equals, "")
+}
+
+func (s *restSuite) TestGuessAppDataPrefixDifferentApp(c *C) {
+	si := createSnapInfo("snap1")
+	addAppToSnap(c, si, "app1", false, "iconname", "appname")
+	icon, name := agent.GuessAppData(si, "", "")
+	c.Check(icon, Equals, "iconname")
+	c.Check(name, Equals, "appname")
+}
+
+func (s *restSuite) TestGuessAppDataPrefixEqualApp(c *C) {
+	si := createSnapInfo("app1")
+	addAppToSnap(c, si, "app1", false, "iconname1", "appname1")
+	addAppToSnap(c, si, "app2", false, "iconname2", "appname2")
+	icon, name := agent.GuessAppData(si, "", "")
+	c.Check(icon, Equals, "iconname1")
+	c.Check(name, Equals, "appname1")
+}
+
+func (s *restSuite) TestGuessAppDataServicePrefixEqualApp(c *C) {
+	si := createSnapInfo("app1")
+	addAppToSnap(c, si, "app1", true, "iconname", "appname")
+	icon, name := agent.GuessAppData(si, "", "")
+	c.Check(icon, Equals, "")
+	c.Check(name, Equals, "")
+}
+
+func (s *restSuite) TestGuessAppDataServicePrefixDifferentApp(c *C) {
+	si := createSnapInfo("snap1")
+	addAppToSnap(c, si, "app1", true, "iconname", "appname")
+	icon, name := agent.GuessAppData(si, "", "")
+	c.Check(icon, Equals, "")
+	c.Check(name, Equals, "")
+}
+
+func (s *restSuite) TestGuessAppDataServiceTwoApps(c *C) {
+	si := createSnapInfo("app1")
+	addAppToSnap(c, si, "app1", true, "iconname1", "appname1")
+	addAppToSnap(c, si, "app2", false, "iconname2", "appname2")
+	icon, name := agent.GuessAppData(si, "", "")
+	c.Check(icon, Equals, "iconname2")
+	c.Check(name, Equals, "appname2")
+}
+
+func (s *restSuite) TestGuessAppDataServiceTwoAppsServices(c *C) {
+	si := createSnapInfo("app1")
+	addAppToSnap(c, si, "app1", true, "iconname1", "appname1")
+	addAppToSnap(c, si, "app2", true, "iconname2", "appname2")
+	icon, name := agent.GuessAppData(si, "", "")
+	c.Check(icon, Equals, "")
+	c.Check(name, Equals, "")
+}
+
+func (s *restSuite) TestGuessAppDataServiceTwoAppsOneServicePrefixDifferent(c *C) {
+	si := createSnapInfo("snap1")
+	addAppToSnap(c, si, "app1", true, "iconname1", "appname1")
+	addAppToSnap(c, si, "app2", false, "iconname2", "appname2")
+	icon, name := agent.GuessAppData(si, "", "")
+	c.Check(icon, Equals, "iconname2")
+	c.Check(name, Equals, "appname2")
+}
+
+func (s *restSuite) TestGuessAppDataTwoAppsPrefixDifferent(c *C) {
+	si := createSnapInfo("snap1")
+	addAppToSnap(c, si, "app1", false, "iconname1", "appname1")
+	addAppToSnap(c, si, "app2", false, "iconname2", "appname2")
+	icon, name := agent.GuessAppData(si, "", "")
+	if (icon != "iconname1") && (icon != "iconname2") {
+		c.Fail()
+	}
+	if (icon == "iconname1") && (name != "appname1") {
+		c.Fail()
+	}
+	if (icon == "iconname2") && (name != "appname2") {
+		c.Fail()
+	}
+}
+
+func (s *restSuite) TestGuessAppDataWithKey(c *C) {
+	si := createSnapInfo("snap1")
+	addAppToSnap(c, si, "app1", false, "iconname", "appname")
+	icon, name := agent.GuessAppData(si, "", "akey")
+	c.Check(icon, Equals, "iconname")
+	c.Check(name, Equals, "appname (akey)")
+}
+
+func (s *restSuite) TestPostCloseRefreshNotificationWithIconDefault(c *C) {
+	snap.MockSanitizePlugsSlots(func(snapInfo *snap.Info) {})
+	// add a notification first
+	mockYaml := `
+name: snap-name
+apps:
+  other-app:
+    command: /bin/foo
+  snap-name:
+    command: /bin/foo
+`
+	snaptest.MockSnapCurrent(c, mockYaml[1:], &snap.SideInfo{
+		Revision: snap.R("42"),
+	})
+
+	desktopEntry := `
+[Desktop Entry]
+Icon=foo.png
+`
+	os.MkdirAll(dirs.SnapDesktopFilesDir, 0755)
+	c.Assert(os.WriteFile(filepath.Join(dirs.SnapDesktopFilesDir, "snap-name_snap-name.desktop"), []byte(desktopEntry[1:]), 0644), IsNil)
+	refreshInfo := &client.FinishedSnapRefreshInfo{InstanceName: "snap-name"}
+	s.testPostFinishRefreshNotificationBody(c, refreshInfo)
+
+	notifications := s.notify.GetAll()
+	c.Assert(notifications, HasLen, 1)
+	n := notifications[0]
+	c.Check(n.Summary, Equals, `snap-name was updated.`)
+	c.Check(n.Body, Equals, "Ready to launch.")
+	c.Check(n.Hints, DeepEquals, map[string]dbus.Variant{
+		"urgency":       dbus.MakeVariant(byte(notification.LowUrgency)),
+		"desktop-entry": dbus.MakeVariant("io.snapcraft.SessionAgent"),
+	})
+	// boring stuff is checked above
+	c.Check(n.Icon, Equals, "foo.png")
+}
+
+func (s *restSuite) TestLocalizedDesktopNameNoLocale(c *C) {
+	restore := agent.MockCurrentLocale("")
+	s.AddCleanup(restore)
+	localizedNames := map[string]string{
+		"es":    "testapp_es",
+		"es_ES": "testapp_es_ES",
+		"es_AR": "testapp_es_AR",
+		"en_US": "testapp_en_US",
+		"en":    "testapp_en",
+	}
+	parser := createLocalizedDesktopFile(c, "testapp", localizedNames)
+	name := agent.GetLocalizedAppNameFromDesktopFile(parser, "defaultName")
+	c.Assert(name, Equals, "testapp")
+}
+
+func (s *restSuite) TestLocalizedDesktopNameFullLocale(c *C) {
+	restore := agent.MockCurrentLocale("es_ES")
+	s.AddCleanup(restore)
+	localizedNames := map[string]string{
+		"es":    "testapp_es",
+		"es_ES": "testapp_es_ES",
+		"es_AR": "testapp_es_AR",
+		"en_US": "testapp_en_US",
+		"en":    "testapp_en",
+	}
+	parser := createLocalizedDesktopFile(c, "testapp", localizedNames)
+	name := agent.GetLocalizedAppNameFromDesktopFile(parser, "defaultName")
+	c.Assert(name, Equals, "testapp_es_ES")
+}
+
+func (s *restSuite) TestLocalizedDesktopNamePartialLocale(c *C) {
+	restore := agent.MockCurrentLocale("es_ES")
+	s.AddCleanup(restore)
+	localizedNames := map[string]string{
+		"es":    "testapp_es",
+		"es_AR": "testapp_es_AR",
+		"en_US": "testapp_en_US",
+		"en":    "testapp_en",
+	}
+	parser := createLocalizedDesktopFile(c, "testapp", localizedNames)
+	name := agent.GetLocalizedAppNameFromDesktopFile(parser, "defaultName")
+	c.Assert(name, Equals, "testapp_es")
+}
+
+func (s *restSuite) TestLocalizedDesktopNameLocaleNotFound(c *C) {
+	restore := agent.MockCurrentLocale("es_ES")
+	s.AddCleanup(restore)
+	localizedNames := map[string]string{
+		"es_AR": "testapp_es_AR",
+		"en_US": "testapp_en_US",
+		"en":    "testapp_en",
+	}
+	parser := createLocalizedDesktopFile(c, "testapp", localizedNames)
+	name := agent.GetLocalizedAppNameFromDesktopFile(parser, "defaultName")
+	c.Assert(name, Equals, "testapp")
+}
+
+func (s *restSuite) TestPostPendingRefreshNotificationTestInstanceKeyHappeningNow(c *C) {
+	refreshInfo := &client.PendingSnapRefreshInfo{InstanceName: "pkg_devel"}
+	s.testPostPendingRefreshNotificationBody(c, refreshInfo)
+	notifications := s.notify.GetAll()
+	c.Assert(notifications, HasLen, 1)
+	n := notifications[0]
+	c.Check(n.AppName, Equals, "")
+	c.Check(n.Icon, Equals, "")
+	c.Check(n.Summary, Equals, `pkg (devel) is updating now!`)
+	c.Check(n.Body, Equals, "")
+	c.Check(n.Actions, DeepEquals, []string{})
+	c.Check(n.Hints, DeepEquals, map[string]dbus.Variant{
+		"urgency":       dbus.MakeVariant(byte(notification.CriticalUrgency)),
+		"desktop-entry": dbus.MakeVariant("io.snapcraft.SessionAgent"),
+	})
+	c.Check(n.Expires, Equals, int32(0))
+}
+
+func (s *restSuite) TestPostPendingRefreshNotificationTestInstanceKeyWithDesktopFileHappeningNow(c *C) {
+	restore := agent.MockCurrentLocale("es_ES")
+	s.AddCleanup(restore)
+	localizedNames := map[string]string{
+		"es":    "pkg_es",
+		"es_ES": "pkg_es_ES",
+		"es_AR": "pkg_es_AR",
+		"en_US": "pkg_en_US",
+		"en":    "pkg_en",
+	}
+	tmpFile := filepath.Join(dirs.SnapDesktopFilesDir, "desktop.desktop")
+	createDesktopFile(c, tmpFile, "", "pkg", localizedNames)
+
+	refreshInfo := &client.PendingSnapRefreshInfo{
+		InstanceName:        "pkg_devel",
+		BusyAppDesktopEntry: "desktop",
+	}
+	s.testPostPendingRefreshNotificationBody(c, refreshInfo)
+	notifications := s.notify.GetAll()
+	c.Assert(notifications, HasLen, 1)
+	n := notifications[0]
+	c.Check(n.AppName, Equals, "")
+	c.Check(n.Icon, Equals, "")
+	c.Check(n.Summary, Equals, `pkg_es_ES (devel) is updating now!`)
+	c.Check(n.Body, Equals, "")
+	c.Check(n.Actions, DeepEquals, []string{})
+	c.Check(n.Hints, DeepEquals, map[string]dbus.Variant{
+		"urgency":       dbus.MakeVariant(byte(notification.CriticalUrgency)),
+		"desktop-entry": dbus.MakeVariant("io.snapcraft.SessionAgent"),
+	})
+	c.Check(n.Expires, Equals, int32(0))
+}
+
+func (s *restSuite) TestPostPendingRefreshNotificationTestInstanceKeyFewDays(c *C) {
+	refreshInfo := &client.PendingSnapRefreshInfo{
+		InstanceName:  "pkg_devel",
+		TimeRemaining: time.Hour * 72,
+	}
+	s.testPostPendingRefreshNotificationBody(c, refreshInfo)
+	notifications := s.notify.GetAll()
+	c.Assert(notifications, HasLen, 1)
+	n := notifications[0]
+	// boring stuff is checked above
+	c.Check(n.Summary, Equals, `Update available for pkg (devel).`)
+	c.Check(n.Body, Equals, "Close the application to update now. It will update automatically in 3 days.")
+	c.Check(n.Hints, DeepEquals, map[string]dbus.Variant{
+		"urgency":       dbus.MakeVariant(byte(notification.LowUrgency)),
+		"desktop-entry": dbus.MakeVariant("io.snapcraft.SessionAgent"),
+	})
+}
+
+func (s *restSuite) TestPostPendingRefreshNotificationTestInstanceKeyWithDesktopFileFewDays(c *C) {
+	restore := agent.MockCurrentLocale("es_ES")
+	s.AddCleanup(restore)
+	localizedNames := map[string]string{
+		"es":    "pkg_es",
+		"es_ES": "pkg_es_ES",
+		"es_AR": "pkg_es_AR",
+		"en_US": "pkg_en_US",
+		"en":    "pkg_en",
+	}
+	tmpFile := filepath.Join(dirs.SnapDesktopFilesDir, "desktop.desktop")
+	createDesktopFile(c, tmpFile, "", "pkg", localizedNames)
+
+	refreshInfo := &client.PendingSnapRefreshInfo{
+		InstanceName:        "pkg_devel",
+		TimeRemaining:       time.Hour * 72,
+		BusyAppDesktopEntry: "desktop",
+	}
+	s.testPostPendingRefreshNotificationBody(c, refreshInfo)
+	notifications := s.notify.GetAll()
+	c.Assert(notifications, HasLen, 1)
+	n := notifications[0]
+	// boring stuff is checked above
+	c.Check(n.Summary, Equals, `Update available for pkg_es_ES (devel).`)
+	c.Check(n.Body, Equals, "Close the application to update now. It will update automatically in 3 days.")
 	c.Check(n.Hints, DeepEquals, map[string]dbus.Variant{
 		"urgency":       dbus.MakeVariant(byte(notification.LowUrgency)),
 		"desktop-entry": dbus.MakeVariant("io.snapcraft.SessionAgent"),

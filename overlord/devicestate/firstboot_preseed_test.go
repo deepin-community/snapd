@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2015-2019 Canonical Ltd
+ * Copyright (C) 2015-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -21,7 +21,6 @@ package devicestate_test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
@@ -239,8 +238,10 @@ func (s *firstbootPreseedingClassic16Suite) SetUpTest(c *C) {
 	err := os.MkdirAll(filepath.Join(dirs.SnapSeedDir, "assertions"), 0755)
 	c.Assert(err, IsNil)
 
+	extraData := interfaces.SystemKeyExtraData{}
+
 	s.AddCleanup(interfaces.MockSystemKey(`{"core": "123"}`))
-	c.Assert(interfaces.WriteSystemKey(), IsNil)
+	c.Assert(interfaces.WriteSystemKey(extraData), IsNil)
 
 	restoreRelease := release.MockOnClassic(true)
 	s.AddCleanup(restoreRelease)
@@ -289,7 +290,7 @@ snaps:
  - name: core
    file: %s
 `, fooFname, barFname, coreFname))
-	err := ioutil.WriteFile(filepath.Join(dirs.SnapSeedDir, "seed.yaml"), content, 0644)
+	err := os.WriteFile(filepath.Join(dirs.SnapSeedDir, "seed.yaml"), content, 0644)
 	c.Assert(err, IsNil)
 
 	// run the firstboot stuff
@@ -375,7 +376,7 @@ snaps:
  - name: core18
    file: %s
 `, snapdFname, fooFname, core18Fname))
-	err := ioutil.WriteFile(filepath.Join(dirs.SnapSeedDir, "seed.yaml"), content, 0644)
+	err := os.WriteFile(filepath.Join(dirs.SnapSeedDir, "seed.yaml"), content, 0644)
 	c.Assert(err, IsNil)
 
 	// run the firstboot stuff
@@ -507,7 +508,7 @@ snaps:
  - name: bar
    file: %s
 `, snapdFname, core18Fname, fooFname, barFname))
-	err := ioutil.WriteFile(filepath.Join(dirs.SnapSeedDir, "seed.yaml"), content, 0644)
+	err := os.WriteFile(filepath.Join(dirs.SnapSeedDir, "seed.yaml"), content, 0644)
 	c.Assert(err, IsNil)
 
 	// run the firstboot stuff
@@ -533,12 +534,14 @@ snaps:
 	c.Assert(err, IsNil)
 	c.Assert(chg.Err(), IsNil)
 	c.Check(chg.Status(), Equals, state.DoingStatus)
+	st.Unlock()
 
 	// we are done with this instance of the overlord, stop it here. Otherwise
 	// it will interfere with our second overlord instance
 	c.Assert(s.overlord.Stop(), IsNil)
 
 	// Verify state between the two change runs
+	st.Lock()
 	r, err := os.Open(dirs.SnapStateFile)
 	c.Assert(err, IsNil)
 	diskState, err := state.ReadState(nil, r)
@@ -588,10 +591,10 @@ snaps:
 	restart.MockPending(st, restart.RestartUnset)
 	st.Unlock()
 	err = s.overlord.Settle(settleTimeout)
-	st.Lock()
 	c.Assert(err, IsNil)
 	c.Assert(s.overlord.Stop(), IsNil)
 	c.Assert(err, IsNil)
+	st.Lock()
 
 	// Update the change pointer to the change in the new state
 	// otherwise we will be referring to the old one.
