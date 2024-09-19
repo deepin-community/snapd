@@ -1,0 +1,42 @@
+From: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+Date: Fri, 26 Jan 2024 01:11:46 +0100
+Subject: spread.yaml: add autopkgtest entries for Debian
+
+Add entries for Debian unstable "sid" to allow running the integration test
+suite while traversing migrations in the Debian archive.
+
+Signed-off-by: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+---
+ spread.yaml | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/spread.yaml b/spread.yaml
+index 3b4bf56..4f3fb0d 100644
+--- a/spread.yaml
++++ b/spread.yaml
+@@ -526,6 +526,25 @@ backends:
+             - ubuntu-22.04-arm64:
+                   username: ubuntu
+                   password: ubuntu
++            # Debian
++            - debian-sid-amd64:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++            - debian-sid-i386:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++            - debian-sid-armhf:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++            - debian-sid-ppc64el:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++            - debian-sid-s390x:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++            - debian-sid-arm64:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+ 
+     external:
+         type: adhoc

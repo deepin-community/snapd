@@ -20,7 +20,7 @@
 package main_test
 
 import (
-	"io/ioutil"
+	"io"
 	"net/http"
 
 	. "gopkg.in/check.v1"
@@ -38,10 +38,6 @@ The aliases command lists all aliases available in the system and their status.
 $ snap aliases <snap>
 
 Lists only the aliases defined by the specified snap.
-
-An alias noted as undefined means it was explicitly enabled or disabled but is
-not defined in the current revision of the snap, possibly temporarily (e.g.
-because of a revert). This can cleared with 'snap alias --reset'.
 `
 	s.testSubCommandHelp(c, "aliases", msg)
 }
@@ -50,7 +46,7 @@ func (s *SnapSuite) TestAliases(c *C) {
 	s.RedirectClientToTestServer(func(w http.ResponseWriter, r *http.Request) {
 		c.Check(r.Method, Equals, "GET")
 		c.Check(r.URL.Path, Equals, "/v2/aliases")
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		c.Check(err, IsNil)
 		c.Check(body, DeepEquals, []byte{})
 		EncodeResponseBody(c, w, map[string]interface{}{
@@ -86,7 +82,7 @@ func (s *SnapSuite) TestAliasesFilterSnap(c *C) {
 	s.RedirectClientToTestServer(func(w http.ResponseWriter, r *http.Request) {
 		c.Check(r.Method, Equals, "GET")
 		c.Check(r.URL.Path, Equals, "/v2/aliases")
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		c.Check(err, IsNil)
 		c.Check(body, DeepEquals, []byte{})
 		EncodeResponseBody(c, w, map[string]interface{}{
@@ -118,7 +114,7 @@ func (s *SnapSuite) TestAliasesNone(c *C) {
 	s.RedirectClientToTestServer(func(w http.ResponseWriter, r *http.Request) {
 		c.Check(r.Method, Equals, "GET")
 		c.Check(r.URL.Path, Equals, "/v2/aliases")
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		c.Check(err, IsNil)
 		c.Check(body, DeepEquals, []byte{})
 		EncodeResponseBody(c, w, map[string]interface{}{
@@ -136,7 +132,7 @@ func (s *SnapSuite) TestAliasesNoneFilterSnap(c *C) {
 	s.RedirectClientToTestServer(func(w http.ResponseWriter, r *http.Request) {
 		c.Check(r.Method, Equals, "GET")
 		c.Check(r.URL.Path, Equals, "/v2/aliases")
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		c.Check(err, IsNil)
 		c.Check(body, DeepEquals, []byte{})
 		EncodeResponseBody(c, w, map[string]interface{}{

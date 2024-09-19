@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2017-2018 Canonical Ltd
+ * Copyright (C) 2017-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -27,12 +27,73 @@ import (
 	"strings"
 
 	"github.com/snapcore/snapd/interfaces"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/strutil"
 )
 
+// UnconfinedMode describes the states of support for the AppArmor unconfined
+// profile mode - this is only enabled when the interface supports it as a
+// static property and it is then enabled via SetUnconfinedEnabled() method
+type UnconfinedMode int
+
+const (
+	UnconfinedIgnored UnconfinedMode = iota
+	UnconfinedSupported
+	UnconfinedEnabled
+)
+
+type prioritizedSnippets struct {
+	priority uint
+	list     []string
+}
+
+// SnippetKey is an opaque string identifying a class of snippets.
+//
+// Some APIs require the use of snippet keys to allow adding many different snippets
+// with the same key but possibly different priority.
+type SnippetKey struct {
+	key string
+}
+
+func (pk *SnippetKey) String() string {
+	return pk.key
+}
+
+func newSnippetKey(key string) SnippetKey {
+	return SnippetKey{key: key}
+}
+
+// registeredKeys is a list of allowed keys for prioritized snippets.
+// Trying to add a prioritized snippet with an unregistered key is
+// an error. Trying to register the same key twice is also an error.
+var registeredKeys map[SnippetKey]bool = make(map[SnippetKey]bool)
+
+// RegisterSnippetKey adds a key to the list of valid keys
+func RegisterSnippetKey(key string) SnippetKey {
+	snippetKey := newSnippetKey(key)
+	if _, ok := registeredKeys[snippetKey]; ok {
+		logger.Panicf("priority key %s is already registered", key)
+	}
+	registeredKeys[snippetKey] = true
+	return snippetKey
+}
+
+// GetSnippetKey retrieves all the current valid keys
+func RegisteredSnippetKeys() []string {
+	keylist := make([]string, 0, len(registeredKeys))
+	for k := range registeredKeys {
+		keylist = append(keylist, k.key)
+	}
+	return keylist
+}
+
 // Specification assists in collecting apparmor entries associated with an interface.
 type Specification struct {
+	// appSet is the set of snap applications and hooks that the specification
+	// applies to.
+	appSet *interfaces.SnapAppSet
+
 	// scope for various Add{...}Snippet functions
 	securityTags []string
 
@@ -40,6 +101,15 @@ type Specification struct {
 	// for snap application and hook processes. The security tag encodes the identity
 	// of the application or hook.
 	snippets map[string][]string
+
+	// prioritizedSnippets are just like snippets, but they have a priority value
+	// and a snippet key. An interface can add a snippet with a specific key and a priority.
+	// If there doesn't exist any snippet with that key, the passed snippet will be
+	// added as-is. But if it does exist, the new snippet will replace the old one if
+	// the new priority is bigger than the old one; will be appended if the new
+	// priority is the same as the old one, and will be discarded if the new priority
+	// is smaller than the old one.
+	prioritizedSnippets map[string]map[SnippetKey]prioritizedSnippets
 
 	// dedupSnippets are just like snippets but are added only once to the
 	// resulting policy in an effort to avoid certain expensive to de-duplicate
@@ -89,6 +159,26 @@ type Specification struct {
 	// the calling interface can be used with the home interface. Ideally,
 	// we would not need this, but we currently do (LP: #1797786)
 	suppressHomeIx bool
+
+	// Same as the above, but for the pycache deny rule which breaks docker
+	suppressPycacheDeny bool
+
+	// Include prompt prefix for relevant rules when generating security profiles.
+	usePromptPrefix bool
+
+	// Unconfined profile mode allows a profile to be applied without any
+	// real confinement
+	unconfined UnconfinedMode
+}
+
+func NewSpecification(appSet *interfaces.SnapAppSet) *Specification {
+	return &Specification{
+		appSet: appSet,
+	}
+}
+
+func (spec *Specification) SnapAppSet() *interfaces.SnapAppSet {
+	return spec.appSet
 }
 
 // setScope sets the scope of subsequent AddSnippet family functions.
@@ -112,6 +202,51 @@ func (spec *Specification) AddSnippet(snippet string) {
 		spec.snippets[tag] = append(spec.snippets[tag], snippet)
 		sort.Strings(spec.snippets[tag])
 	}
+}
+
+// AddPrioritizedSnippet adds a new apparmor snippet to all applications and hooks using the interface,
+// but identified with a key and a priority. If no other snippet exists with that key, the snippet is
+// added like with AddSnippet, but if there is already another snippet with that key, the priority of
+// both will be taken into account to decide whether the new snippet replaces the old one, is appended
+// to it, or is just ignored. The key must have been previously registered using RegisterSnippetKey().
+func (spec *Specification) AddPrioritizedSnippet(snippet string, key SnippetKey, priority uint) {
+	if _, ok := registeredKeys[key]; !ok {
+		logger.Panicf("priority key %s is not registered", key.String())
+	}
+	if len(spec.securityTags) == 0 {
+		return
+	}
+	if spec.prioritizedSnippets == nil {
+		spec.prioritizedSnippets = make(map[string]map[SnippetKey]prioritizedSnippets)
+	}
+
+	for _, tag := range spec.securityTags {
+		if _, exists := spec.prioritizedSnippets[tag]; !exists {
+			spec.prioritizedSnippets[tag] = make(map[SnippetKey]prioritizedSnippets)
+		}
+		snippets := spec.prioritizedSnippets[tag][key]
+		// If the entry doesn't exist, it will return a snippet with an empty
+		// snippet string and zero priority.
+		if snippets.priority == priority {
+			// if the priority is the same, just append the snippet to the snippets already there
+			snippets.list = append(snippets.list, snippet)
+		} else if snippets.priority < priority {
+			// if the priority is bigger, replace the snippets with the new one
+			snippets.list = append([]string(nil), snippet)
+			snippets.priority = priority
+		} // smaller priority, discard
+		spec.prioritizedSnippets[tag][key] = snippets
+	}
+}
+
+func (spec *Specification) composeSnippetsForTag(tag string) []string {
+	// Compose the normal and the prioritized snippets in a single string array
+	composedSnippets := append([]string(nil), spec.snippets[tag]...)
+	for key := range spec.prioritizedSnippets[tag] {
+		composedSnippets = append(composedSnippets, spec.prioritizedSnippets[tag][key].list...)
+	}
+	sort.Strings(composedSnippets)
+	return composedSnippets
 }
 
 // AddDeduplicatedSnippet adds a new apparmor snippet to all applications and hooks using the interface.
@@ -172,8 +307,8 @@ func (spec *Specification) AddDeduplicatedSnippet(snippet string) {
 // This function should be used whenever the apparmor template features more
 // than one use of "**" syntax (which represent arbitrary many directories or
 // files) and a variable component, like a device name or similar. Repeated
-// instances of this pattern require exponential memory when compiled with
-// apparmor_parser -O no-expr-simplify.
+// instances of this pattern slow down the apparmor parser in the default
+// "expr-simplify" mode (see PR#12943 for measurements).
 func (spec *Specification) AddParametricSnippet(templateFragment []string, value string) {
 	if len(spec.securityTags) == 0 {
 		return
@@ -290,7 +425,8 @@ func (spec *Specification) emitLayout(si *snap.Info, layout *snap.Layout) {
 //
 // Importantly, the above mount operations are happening within the per-snap
 // mount namespace.
-func (spec *Specification) AddLayout(snapInfo *snap.Info) {
+func (spec *Specification) AddLayout(appSet *interfaces.SnapAppSet) {
+	snapInfo := appSet.Info()
 	if len(snapInfo.Layout) == 0 {
 		return
 	}
@@ -302,13 +438,11 @@ func (spec *Specification) AddLayout(snapInfo *snap.Info) {
 	}
 	sort.Strings(paths)
 
-	// Get tags describing all apps and hooks.
-	tags := make([]string, 0, len(snapInfo.Apps)+len(snapInfo.Hooks))
-	for _, app := range snapInfo.Apps {
-		tags = append(tags, app.SecurityTag())
-	}
-	for _, hook := range snapInfo.Hooks {
-		tags = append(tags, hook.SecurityTag())
+	// Get tags describing all runnables (apps, hooks, component hooks)
+	runnables := appSet.Runnables()
+	tags := make([]string, 0, len(runnables))
+	for _, r := range runnables {
+		tags = append(tags, r.SecurityTag)
 	}
 
 	// Append layout snippets to all tags; the layout applies equally to the
@@ -404,7 +538,7 @@ func GenWritableMimicProfile(emit func(f string, args ...interface{}), path stri
 		// full mimic path. This is called a mimic "variant". Both of the paths
 		// must end with a slash as this is important for apparmor file vs
 		// directory path semantics.
-		mimicPath := filepath.Join(iter.CurrentBase(), iter.CurrentCleanName()) + "/"
+		mimicPath := filepath.Join(iter.CurrentBaseNoSlash(), iter.CurrentNameNoSlash()) + "/"
 		mimicAuxPath := filepath.Join("/tmp/.snap", iter.CurrentPath()) + "/"
 		emit("  # .. variant with mimic at %s\n", mimicPath)
 		emit("  # Allow reading the mimic directory, it must exist in the first place.\n")
@@ -503,6 +637,12 @@ func (spec *Specification) SecurityTags() []string {
 		tags = append(tags, t)
 		seen[t] = true
 	}
+	for t := range spec.prioritizedSnippets {
+		if !seen[t] {
+			tags = append(tags, t)
+			seen[t] = true
+		}
+	}
 	for t := range spec.dedupSnippets {
 		if !seen[t] {
 			tags = append(tags, t)
@@ -518,7 +658,7 @@ func (spec *Specification) SecurityTags() []string {
 }
 
 func (spec *Specification) snippetsForTag(tag string) []string {
-	snippets := append([]string(nil), spec.snippets[tag]...)
+	snippets := append([]string(nil), spec.composeSnippetsForTag(tag)...)
 	// First add any deduplicated snippets
 	if bag := spec.dedupSnippets[tag]; bag != nil {
 		snippets = append(snippets, bag.Items()...)
@@ -564,6 +704,64 @@ func snippetFromLayout(layout *snap.Layout) string {
 	return fmt.Sprintf("# Layout path: %s\n# (no extra permissions required for symlink)", mountPoint)
 }
 
+// emitEnsureDir creates an apparmor snippet that permits snap-update-ns to create
+// missing directories for the calling user according to the provided ensure directory spec.
+// This function is currently used as counterpart for AddUserEnsureDirs, but can also be used
+// for permitting non-user ensure directory specs.
+func emitEnsureDir(spec *Specification, ifaceName string, ensureDirSpec *interfaces.EnsureDirSpec) {
+	ensureDir := ensureDirSpec.EnsureDir
+	mustExistDir := ensureDirSpec.MustExistDir
+	if ensureDir == mustExistDir {
+		return
+	}
+
+	// Add additional expansion here as required
+	replacePrefixHome := func(path string) string {
+		if strings.HasPrefix(path, "$HOME") {
+			return strings.Replace(path, "$HOME", "@{HOME}", -1)
+		}
+		return path
+	}
+	appArmorDir := func(path string) string {
+		if path != "/" {
+			path = path + "/"
+		}
+		return path
+	}
+	emit := spec.AddUpdateNSf
+
+	// Create entry for MustExistDir
+	iter, err := strutil.NewPathIterator(ensureDir)
+	if err != nil {
+		return
+	}
+	for iter.Next() {
+		if iter.CurrentPathNoSlash() == mustExistDir {
+			emit("  # Allow the %s interface to create potentially missing directories", ifaceName)
+			emit("  owner %s rw,", appArmorDir(replacePrefixHome(mustExistDir)))
+			break
+		}
+	}
+
+	// Create entries for the remaining directories after MustExistDir up to and including EnsureDir
+	for iter.Next() {
+		emit("  owner %s/ rw,", replacePrefixHome(iter.CurrentPathNoSlash()))
+	}
+}
+
+// AddEnsureDirMounts adds snap-update-ns snippets that permit snap-update-ns to create
+// missing directories according to the provided ensure directory mount specs.
+func (spec *Specification) AddEnsureDirMounts(ifaceName string, ensureDirSpecs []*interfaces.EnsureDirSpec) {
+	// Walk the path specs in deterministic order, by EnsureDir (the mount point).
+	sort.Slice(ensureDirSpecs, func(i, j int) bool {
+		return ensureDirSpecs[i].EnsureDir < ensureDirSpecs[j].EnsureDir
+	})
+
+	for _, ensureDirSpec := range ensureDirSpecs {
+		emitEnsureDir(spec, ifaceName, ensureDirSpec)
+	}
+}
+
 // Implementation of methods required by interfaces.Specification
 
 // AddConnectedPlug records apparmor-specific side-effects of having a connected plug.
@@ -572,7 +770,12 @@ func (spec *Specification) AddConnectedPlug(iface interfaces.Interface, plug *in
 		AppArmorConnectedPlug(spec *Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error
 	}
 	if iface, ok := iface.(definer); ok {
-		restore := spec.setScope(plug.SecurityTags())
+		tags, err := spec.appSet.SecurityTagsForConnectedPlug(plug)
+		if err != nil {
+			return err
+		}
+
+		restore := spec.setScope(tags)
 		defer restore()
 		return iface.AppArmorConnectedPlug(spec, plug, slot)
 	}
@@ -585,7 +788,12 @@ func (spec *Specification) AddConnectedSlot(iface interfaces.Interface, plug *in
 		AppArmorConnectedSlot(spec *Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error
 	}
 	if iface, ok := iface.(definer); ok {
-		restore := spec.setScope(slot.SecurityTags())
+		tags, err := spec.appSet.SecurityTagsForConnectedSlot(slot)
+		if err != nil {
+			return err
+		}
+
+		restore := spec.setScope(tags)
 		defer restore()
 		return iface.AppArmorConnectedSlot(spec, plug, slot)
 	}
@@ -594,11 +802,20 @@ func (spec *Specification) AddConnectedSlot(iface interfaces.Interface, plug *in
 
 // AddPermanentPlug records apparmor-specific side-effects of having a plug.
 func (spec *Specification) AddPermanentPlug(iface interfaces.Interface, plug *snap.PlugInfo) error {
+	si := interfaces.StaticInfoOf(iface)
+	if si.AppArmorUnconfinedPlugs {
+		spec.setUnconfinedSupported()
+	}
 	type definer interface {
 		AppArmorPermanentPlug(spec *Specification, plug *snap.PlugInfo) error
 	}
 	if iface, ok := iface.(definer); ok {
-		restore := spec.setScope(plug.SecurityTags())
+		tags, err := spec.appSet.SecurityTagsForPlug(plug)
+		if err != nil {
+			return err
+		}
+
+		restore := spec.setScope(tags)
 		defer restore()
 		return iface.AppArmorPermanentPlug(spec, plug)
 	}
@@ -607,11 +824,20 @@ func (spec *Specification) AddPermanentPlug(iface interfaces.Interface, plug *sn
 
 // AddPermanentSlot records apparmor-specific side-effects of having a slot.
 func (spec *Specification) AddPermanentSlot(iface interfaces.Interface, slot *snap.SlotInfo) error {
+	si := interfaces.StaticInfoOf(iface)
+	if si.AppArmorUnconfinedSlots {
+		spec.setUnconfinedSupported()
+	}
 	type definer interface {
 		AppArmorPermanentSlot(spec *Specification, slot *snap.SlotInfo) error
 	}
 	if iface, ok := iface.(definer); ok {
-		restore := spec.setScope(slot.SecurityTags())
+		tags, err := spec.appSet.SecurityTagsForSlot(slot)
+		if err != nil {
+			return err
+		}
+
+		restore := spec.setScope(tags)
 		defer restore()
 		return iface.AppArmorPermanentSlot(spec, slot)
 	}
@@ -638,6 +864,12 @@ func (spec *Specification) SetSuppressPtraceTrace() {
 // by any of the interfaces in the spec.
 func (spec *Specification) SuppressPtraceTrace() bool {
 	return spec.suppressPtraceTrace
+}
+
+// UsePromptPrefix returns whether the prompt prefix should be included for
+// relevant rules when generating security profiles.
+func (spec *Specification) UsePromptPrefix() bool {
+	return spec.usePromptPrefix
 }
 
 // SetUsesSysModuleCapability records that some interface has granted the
@@ -674,4 +906,40 @@ func (spec *Specification) SetSuppressHomeIx() {
 // suppressed.
 func (spec *Specification) SuppressHomeIx() bool {
 	return spec.suppressHomeIx
+}
+
+// SetSuppressPycacheDeny records suppression of the ix rules for the home
+// interface.
+func (spec *Specification) SetSuppressPycacheDeny() {
+	spec.suppressPycacheDeny = true
+}
+
+// SuppressPycacheDeny returns whether the ix rules of the home interface should be
+// suppressed.
+func (spec *Specification) SuppressPycacheDeny() bool {
+	return spec.suppressPycacheDeny
+}
+
+// setUnconfinedSuported records whether a profile perhaps should be applied
+// without any real confinement - this will only occur if the spec also enables
+// this by calling SetEnableUnconfined()
+func (spec *Specification) setUnconfinedSupported() {
+	spec.unconfined = UnconfinedSupported
+}
+
+// SetUnconfinedEnabled records whether a profile should be applied without any
+// real confinement - the spec must already support unconfined profiles via a
+// previous call to setUnconfinedSupported()
+func (spec *Specification) SetUnconfinedEnabled() error {
+	if spec.unconfined != UnconfinedSupported {
+		return fmt.Errorf("unconfined profiles not supported")
+	}
+	spec.unconfined = UnconfinedEnabled
+	return nil
+}
+
+// Unconfined returns whether a profile should be applied without any real
+// confinement
+func (spec *Specification) Unconfined() UnconfinedMode {
+	return spec.unconfined
 }

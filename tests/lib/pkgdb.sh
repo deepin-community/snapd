@@ -62,7 +62,7 @@ distro_name_package() {
         ubuntu-*|debian-*)
             debian_name_package "$@"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             amazon_name_package "$@"
             ;;
         fedora-*|centos-*)
@@ -108,7 +108,7 @@ distro_install_local_package() {
             # shellcheck disable=SC2086
             apt install $flags "$@"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum -y localinstall "$@"
             ;;
         fedora-*|centos-*)
@@ -194,12 +194,12 @@ distro_install_package() {
             quiet eatmydata apt-get install $APT_FLAGS -y "${pkg_names[@]}"
             retval=$?
             ;;
-        amazon-*|centos-7-*)
+        amazon-linux-2-*)
             # shellcheck disable=SC2086
             quiet yum -y install $YUM_FLAGS "${pkg_names[@]}"
             retval=$?
             ;;
-        fedora-*|centos-*)
+        fedora-*|centos-*|amazon-linux-2023-*)
             # shellcheck disable=SC2086
             quiet dnf -y --refresh install $DNF_FLAGS "${pkg_names[@]}"
             retval=$?
@@ -254,7 +254,7 @@ distro_purge_package() {
             # behind while purging in prepare
             eatmydata apt-get remove -y --purge -y "$@"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum -y remove "$@"
             ;;
         fedora-*|centos-*)
@@ -279,7 +279,7 @@ distro_update_package_db() {
         ubuntu-*|debian-*)
             quiet eatmydata apt-get update
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum clean all
             quiet yum makecache
             ;;
@@ -305,7 +305,7 @@ distro_clean_package_cache() {
         ubuntu-*|debian-*)
             quiet eatmydata apt-get clean
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             yum clean all
             ;;
         fedora-*|centos-*)
@@ -329,7 +329,7 @@ distro_auto_remove_packages() {
         ubuntu-*|debian-*)
             quiet eatmydata apt-get -y autoremove
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum -y autoremove
             ;;
         fedora-*|centos-*)
@@ -351,7 +351,7 @@ distro_query_package_info() {
         ubuntu-*|debian-*)
             apt-cache policy "$1"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             yum info "$1"
             ;;
         fedora-*|centos-*)
@@ -376,7 +376,11 @@ distro_install_build_snapd(){
         cp /etc/apt/sources.list sources.list.back
         echo "deb http://archive.ubuntu.com/ubuntu/ $(lsb_release -c -s)-proposed restricted main multiverse universe" | tee /etc/apt/sources.list -a
         apt update
-        apt install -y --only-upgrade snapd
+        if os.query is-ubuntu-ge 24.04; then
+            apt install -y --only-upgrade -t "$(lsb_release -c -s)-proposed" snapd
+        else
+            apt install -y --only-upgrade snapd
+        fi
         mv sources.list.back /etc/apt/sources.list
         apt update
 
@@ -398,11 +402,12 @@ distro_install_build_snapd(){
         add-apt-repository -y "$PPA_VALIDATION_NAME"
         apt update
         apt install -y --only-upgrade snapd
-        add-apt-repository --remove "$PPA_VALIDATION_NAME"
-        apt update
 
         # Double check that it really comes from the PPA
         apt show snapd | MATCH "APT-Sources: http.*ppa\.launchpad(content)?\.net"
+
+        add-apt-repository --remove "$PPA_VALIDATION_NAME"
+        apt update
     else
         packages=
         case "$SPREAD_SYSTEM" in
@@ -616,7 +621,7 @@ pkg_dependencies_ubuntu_classic(){
                 shellcheck
                 "
             ;;
-        ubuntu-22.*|ubuntu-23.*)
+        ubuntu-22.*|ubuntu-23.*|ubuntu-24.*)
             # bpftool is part of linux-tools package
             echo "
                 dbus-user-session
@@ -637,6 +642,7 @@ pkg_dependencies_ubuntu_classic(){
         debian-*)
             echo "
                 autopkgtest
+                bpftool
                 cryptsetup-bin
                 debootstrap
                 eatmydata
@@ -645,20 +651,14 @@ pkg_dependencies_ubuntu_classic(){
                 gcc-multilib
                 libc6-dev-i386
                 linux-libc-dev
+                lsof
                 net-tools
                 packagekit
                 sbuild
                 schroot
+                strace
+                systemd-timesyncd
                 "
-            ;;
-    esac
-    case "$SPREAD_SYSTEM" in
-        debian-11-*|debian-sid-*)
-            echo "
-                 bpftool
-                 strace
-                 systemd-timesyncd
-                 "
             ;;
     esac
 }
@@ -730,14 +730,26 @@ pkg_dependencies_fedora(){
 }
 
 pkg_dependencies_amazon(){
+    if os.query is-amazon-linux 2 || os.query is-centos 7; then
+        echo "
+            fish
+            fwupd
+            system-lsb-core
+            upower
+            "
+    fi
+    if os.query is-amazon-linux 2023; then
+        echo "
+            bpftool
+            gpg
+            python-docutils
+            python3-gobject
+            "
+    fi
     echo "
-        python3
-        curl
         dbus-x11
         expect
-        fish
         fontconfig
-        fwupd
         git
         golang
         grub2-tools
@@ -749,12 +761,11 @@ pkg_dependencies_amazon(){
         net-tools
         nfs-utils
         PackageKit
-        system-lsb-core
+        python3
         rpm-build
         xdg-user-dirs
         xdg-utils
         udisks2
-        upower
         zsh
         "
 }
@@ -783,11 +794,12 @@ pkg_dependencies_opensuse(){
         man-pages
         nfs-kernel-server
         nss-mdns
+        osc
         PackageKit
         python3-yaml
         strace
         netcat-openbsd
-        osc
+        rpm-build
         udisks2
         upower
         uuidd
@@ -805,6 +817,7 @@ pkg_dependencies_opensuse(){
 pkg_dependencies_arch(){
     echo "
     apparmor
+    autoconf-archive
     base-devel
     bash-completion
     bpf
@@ -854,7 +867,7 @@ pkg_dependencies(){
             pkg_dependencies_ubuntu_generic
             pkg_dependencies_ubuntu_classic
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             pkg_dependencies_amazon
             ;;
         centos-*)

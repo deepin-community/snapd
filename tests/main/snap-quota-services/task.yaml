@@ -1,5 +1,11 @@
 summary: Test for per-service quota-related snap functionality.
 
+details: |
+  Check that memory, CPU and journal size quotas can be set for groups with many
+  snap services but that journal size quotas cannot be imposed on groups with a
+  single service. Check that systemd reports the services as belonging to the
+  expected slices.
+
 # memory cgroup is disabled on external devices like rpi3
 backends:
   - -external
@@ -8,9 +14,6 @@ backends:
 # requires systemd v245+
 systems:
   - -amazon-linux-2-*
-  - -centos-7-*
-  - -centos-8-*
-  - -debian-10-64
   - -ubuntu-14.04-*
   - -ubuntu-16.04-*
   - -ubuntu-18.04-*

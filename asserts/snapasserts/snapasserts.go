@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2022 Canonical Ltd
+ * Copyright (C) 2022-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -23,10 +23,12 @@ package snapasserts
 import (
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/snapfile"
 )
 
@@ -56,6 +58,25 @@ func findSnapDeclaration(snapID, name string, db Finder) (*asserts.SnapDeclarati
 	}
 
 	return snapDecl, nil
+}
+
+func findResourcePair(name, snapID string, resourceRev, snapRev int, provenance string, db Finder) (*asserts.SnapResourcePair, error) {
+	headers := map[string]string{
+		"resource-name":     name,
+		"snap-id":           snapID,
+		"resource-revision": strconv.Itoa(resourceRev),
+		"snap-revision":     strconv.Itoa(snapRev),
+	}
+	if provenance != "" {
+		headers["provenance"] = provenance
+	}
+
+	a, err := db.Find(asserts.SnapResourcePairType, headers)
+	if err != nil {
+		return nil, fmt.Errorf("cannot find snap-resource-pair for %s: %w", name, err)
+	}
+
+	return a.(*asserts.SnapResourcePair), nil
 }
 
 // CrossCheck tries to cross check the instance name, hash digest, provenance
@@ -113,6 +134,110 @@ func CrossCheck(instanceName, snapSHA3_384, provenance string, snapSize uint64, 
 	return snapRev, nil
 }
 
+// CrossCheckResource tries to cross check the name, hash digest, size,
+// provenance, and metadata of a snap resource with the relevant assertions
+// (snap-resource-revision and snap-resource-pair) in a database that should be
+// pre-populated with them.
+func CrossCheckResource(name, hash, provenance string, size uint64, csi *snap.ComponentSideInfo, si *snap.SideInfo, model *asserts.Model, db Finder) error {
+	headers := map[string]string{
+		"resource-sha3-384": hash,
+		"resource-name":     name,
+		"snap-id":           si.SnapID,
+	}
+	if provenance != "" {
+		headers["provenance"] = provenance
+	}
+
+	a, err := db.Find(asserts.SnapResourceRevisionType, headers)
+	if err != nil {
+		provInf := ""
+		if provenance != "" {
+			provInf = fmt.Sprintf(" provenance: %s", provenance)
+		}
+		return fmt.Errorf("internal error: cannot find pre-populated snap-resource-revision assertion for %q: %s%s", name, hash, provInf)
+	}
+
+	resrev := a.(*asserts.SnapResourceRevision)
+
+	if resrev.ResourceSize() != size {
+		return fmt.Errorf(
+			"resource %q file does not have expected size according to signatures (download is broken or tampered): %d != %d",
+			name, size, resrev.ResourceSize(),
+		)
+	}
+
+	if resrev.ResourceRevision() != csi.Revision.N {
+		return fmt.Errorf(
+			"resource %q does not have expected revision according to assertions (metadata is broken or tampered): %s != %d",
+			name, csi.Revision, resrev.ResourceRevision(),
+		)
+	}
+
+	// we don't actually need to use the resource pair, since all of the values
+	// that we need to validate are primary keys, but we do need to check that
+	// it exists
+	_, err = findResourcePair(name, si.SnapID, csi.Revision.N, si.Revision.N, provenance, db)
+	if err != nil {
+		return err
+	}
+
+	if provenance != "" {
+		snapDecl, err := findSnapDeclaration(si.SnapID, si.RealName, db)
+		if err != nil {
+			return err
+		}
+
+		if err := crossCheckResourceProvenance(resrev, snapDecl, model, db); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// crossCheckResourceProvenance tries to cross check the given
+// snap-resource-revision's provenance with the snap-declaration's revision
+// authority.
+func crossCheckResourceProvenance(resrev *asserts.SnapResourceRevision, snapDecl *asserts.SnapDeclaration, model *asserts.Model, db Finder) error {
+	// nothing to check when using the default provenance
+	if resrev.Provenance() == "global-upload" {
+		return nil
+	}
+
+	store, err := maybeFindStore(model, db)
+	if err != nil {
+		return err
+	}
+
+	ras := snapDecl.RevisionAuthority(resrev.Provenance())
+	for _, ra := range ras {
+		if err := ra.CheckResourceRevision(resrev, model, store); err == nil {
+			return nil
+		}
+	}
+
+	return fmt.Errorf(
+		"snap resource %q revision assertion with provenance %q is not signed by an authority authorized on this device: %s",
+		resrev.ResourceName(), resrev.Provenance(), resrev.AuthorityID(),
+	)
+}
+
+func maybeFindStore(model *asserts.Model, db Finder) (*asserts.Store, error) {
+	if model != nil && model.Store() != "" {
+		a, err := db.Find(asserts.StoreType, map[string]string{
+			"store": model.Store(),
+		})
+		if err != nil && !errors.Is(err, &asserts.NotFoundError{}) {
+			return nil, err
+		}
+		if a != nil {
+			return a.(*asserts.Store), nil
+		}
+	}
+
+	return nil, nil
+}
+
 // CrossCheckProvenance tries to cross check the given snap-revision
 // if it has a non default provenance with the revision-authority
 // constraints of the given snap-declaration including any device
@@ -125,18 +250,12 @@ func CrossCheckProvenance(instanceName string, snapRev *asserts.SnapRevision, sn
 		// nothing to check
 		return "", nil
 	}
-	var store *asserts.Store
-	if model != nil && model.Store() != "" {
-		a, err := db.Find(asserts.StoreType, map[string]string{
-			"store": model.Store(),
-		})
-		if err != nil && !errors.Is(err, &asserts.NotFoundError{}) {
-			return "", err
-		}
-		if a != nil {
-			store = a.(*asserts.Store)
-		}
+
+	store, err := maybeFindStore(model, db)
+	if err != nil {
+		return "", err
 	}
+
 	ras := snapDecl.RevisionAuthority(snapRev.Provenance())
 	matchingRevAuthority := false
 	for _, ra := range ras {
@@ -168,6 +287,27 @@ func CheckProvenanceWithVerifiedRevision(snapPath string, verifiedRev *asserts.S
 	}
 	if verifiedRev.Provenance() != info.Provenance() {
 		return fmt.Errorf("snap %q has been signed under provenance %q different from the metadata one: %q", snapPath, verifiedRev.Provenance(), info.Provenance())
+	}
+	return nil
+}
+
+// CheckComponentProvenanceWithVerifiedRevision checks that the given component
+// has the same provenance as of the provided resource-revision. It is intended
+// to be called safely on components for which a matching and authorized
+// resource-revision has been already found. Its purpose is to check that a
+// blob has not been re-signed under an inappropriate provenance.
+func CheckComponentProvenanceWithVerifiedRevision(compPath string, verifiedRev *asserts.SnapResourceRevision) error {
+
+	compf, err := snapfile.Open(compPath)
+	if err != nil {
+		return err
+	}
+	ci, err := snap.ReadComponentInfoFromContainer(compf, nil, nil)
+	if err != nil {
+		return err
+	}
+	if verifiedRev.Provenance() != ci.Provenance() {
+		return fmt.Errorf("component %q has been signed under provenance %q different from the metadata one: %q", compPath, verifiedRev.Provenance(), ci.Provenance())
 	}
 	return nil
 }
@@ -247,6 +387,58 @@ func SideInfoFromSnapAssertions(snapDecl *asserts.SnapDeclaration, snapRev *asse
 	}
 }
 
+// DeriveComponentSideInfoFromDigestAndSize tries to construct a
+// ComponentSideInfo using digest and size for a component and ID/name for the
+// snap to find the relevant assertions with the information in the given
+// database. It will fail with an asserts.NotFoundError if it cannot find them.
+func DeriveComponentSideInfoFromDigestAndSize(resName, snapName, snapID string, compPath, snapSHA3_384 string, resSize uint64, model *asserts.Model, db Finder) (*snap.ComponentSideInfo, error) {
+	// get relevant assertions and reconstruct metadata
+	headers := map[string]string{
+		"snap-id":           snapID,
+		"resource-name":     resName,
+		"resource-sha3-384": snapSHA3_384,
+	}
+	a, err := db.Find(asserts.SnapResourceRevisionType, headers)
+	if err != nil && !errors.Is(err, &asserts.NotFoundError{}) {
+		return nil, err
+	}
+	if a == nil {
+		// non-default provenance?
+		cands, err := db.FindMany(asserts.SnapResourceRevisionType, headers)
+		if err != nil {
+			return nil, err
+		}
+		if len(cands) != 1 {
+			return nil, fmt.Errorf("safely handling resources with different provenance but same hash not yet supported")
+		}
+		a = cands[0]
+	}
+
+	resRev := a.(*asserts.SnapResourceRevision)
+
+	if resRev.ResourceSize() != resSize {
+		return nil, fmt.Errorf("resource %q does not have the expected size according to signatures (broken or tampered): %d != %d", resName, resSize, resRev.ResourceSize())
+	}
+
+	snapDecl, err := findSnapDeclaration(snapID, snapName, db)
+	if err != nil {
+		return nil, err
+	}
+	err = crossCheckResourceProvenance(resRev, snapDecl, model, db)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := CheckComponentProvenanceWithVerifiedRevision(compPath, resRev); err != nil {
+		return nil, err
+	}
+
+	return &snap.ComponentSideInfo{
+		Component: naming.NewComponentRef(snapName, resName),
+		Revision:  snap.R(resRev.ResourceRevision()),
+	}, nil
+}
+
 // FetchSnapAssertions fetches the assertions matching the snap file digest and optional provenance using the given fetcher.
 func FetchSnapAssertions(f asserts.Fetcher, snapSHA3_384, provenance string) error {
 	// for now starting from the snap-revision will get us all other relevant assertions
@@ -259,6 +451,42 @@ func FetchSnapAssertions(f asserts.Fetcher, snapSHA3_384, provenance string) err
 	}
 
 	return f.Fetch(ref)
+}
+
+func FetchResourceRevisionAssertion(f asserts.Fetcher, si *snap.SideInfo, resName, hash, provenance string) error {
+	ref := &asserts.Ref{
+		Type:       asserts.SnapResourceRevisionType,
+		PrimaryKey: []string{si.SnapID, resName, hash},
+	}
+	if provenance != "" {
+		ref.PrimaryKey = append(ref.PrimaryKey, provenance)
+	}
+	return f.Fetch(ref)
+}
+
+func FetchResourcePairAssertion(f asserts.Fetcher, si *snap.SideInfo, resName string, resRev snap.Revision, provenance string) error {
+	ref := &asserts.Ref{
+		Type:       asserts.SnapResourcePairType,
+		PrimaryKey: []string{si.SnapID, resName, resRev.String(), si.Revision.String()},
+	}
+	if provenance != "" {
+		ref.PrimaryKey = append(ref.PrimaryKey, provenance)
+	}
+	return f.Fetch(ref)
+}
+
+// FetchComponentAssertions fetches the assertions matching the information
+// described in the given SideInfo and ComponentSideInfo using the given
+// fetcher.
+func FetchComponentAssertions(f asserts.Fetcher, si *snap.SideInfo, csi *snap.ComponentSideInfo, hash, provenance string) error {
+	// for now starting from the snap-resource-revision will get us all other relevant assertions
+	if err := FetchResourceRevisionAssertion(
+		f, si, csi.Component.ComponentName, hash, provenance); err != nil {
+		return err
+	}
+
+	// fetch the snap-resource-pair as well
+	return FetchResourcePairAssertion(f, si, csi.Component.ComponentName, csi.Revision, provenance)
 }
 
 // FetchSnapDeclaration fetches the snap declaration and its prerequisites for the given snap id using the given fetcher.
@@ -276,6 +504,17 @@ func FetchStore(f asserts.Fetcher, storeID string) error {
 	ref := &asserts.Ref{
 		Type:       asserts.StoreType,
 		PrimaryKey: []string{storeID},
+	}
+
+	return f.Fetch(ref)
+}
+
+// FetchRegistry fetches a registry assertion described by account and registry
+// name using the given fetcher.
+func FetchRegistry(f asserts.Fetcher, account, registryName string) error {
+	ref := &asserts.Ref{
+		Type:       asserts.RegistryType,
+		PrimaryKey: []string{account, registryName},
 	}
 
 	return f.Fetch(ref)

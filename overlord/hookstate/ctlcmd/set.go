@@ -21,18 +21,23 @@ package ctlcmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/snapcore/snapd/client/clientutil"
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/jsonutil"
 	"github.com/snapcore/snapd/overlord/configstate"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/hookstate"
+	"github.com/snapcore/snapd/overlord/registrystate"
 )
 
 type setCommand struct {
 	baseCommand
+
+	View bool `long:"view" description:"return registry values from the view declared in the plug"`
 
 	Positional struct {
 		PlugOrSlotSpec string   `positional-arg-name:":<plug|slot>"`
@@ -71,7 +76,7 @@ func init() {
 
 func (s *setCommand) Execute(args []string) error {
 	if s.Positional.PlugOrSlotSpec == "" && len(s.Positional.ConfValues) == 0 {
-		return fmt.Errorf(i18n.G("set which option?"))
+		return errors.New(i18n.G("set which option?"))
 	}
 
 	context, err := s.ensureContext()
@@ -99,6 +104,17 @@ func (s *setCommand) Execute(args []string) error {
 	if snap != "" {
 		return fmt.Errorf(`"snapctl set %s" not supported, use "snapctl set :%s" instead`, s.Positional.PlugOrSlotSpec, parts[1])
 	}
+
+	if s.View {
+		opts := &clientutil.ParseConfigOptions{String: s.String, Typed: s.Typed}
+		requests, _, err := clientutil.ParseConfigValues(s.Positional.ConfValues, opts)
+		if err != nil {
+			return fmt.Errorf(i18n.G("cannot set %s plug: %w"), s.Positional.PlugOrSlotSpec, err)
+		}
+
+		return setRegistryValues(context, name, requests)
+	}
+
 	return s.setInterfaceSetting(context, name)
 }
 
@@ -107,33 +123,14 @@ func (s *setCommand) setConfigSetting(context *hookstate.Context) error {
 	tr := configstate.ContextTransaction(context)
 	context.Unlock()
 
-	for _, patchValue := range s.Positional.ConfValues {
-		parts := strings.SplitN(patchValue, "=", 2)
-		if len(parts) == 1 && strings.HasSuffix(patchValue, "!") {
-			key := strings.TrimSuffix(patchValue, "!")
-			tr.Set(s.context().InstanceName(), key, nil)
-			continue
-		}
-		if len(parts) != 2 {
-			return fmt.Errorf(i18n.G("invalid parameter: %q (want key=value)"), patchValue)
-		}
-		key := parts[0]
+	opts := &clientutil.ParseConfigOptions{String: s.String, Typed: s.Typed}
+	confValues, confKeys, err := clientutil.ParseConfigValues(s.Positional.ConfValues, opts)
+	if err != nil {
+		return err
+	}
 
-		var value interface{}
-		if s.String {
-			value = parts[1]
-		} else {
-			if err := jsonutil.DecodeWithNumber(strings.NewReader(parts[1]), &value); err != nil {
-				if s.Typed {
-					return fmt.Errorf("failed to parse JSON: %w", err)
-				}
-
-				// Not valid JSON-- just save the string as-is.
-				value = parts[1]
-			}
-		}
-
-		tr.Set(s.context().InstanceName(), key, value)
+	for _, key := range confKeys {
+		tr.Set(s.context().InstanceName(), key, confValues[key])
 	}
 
 	return nil
@@ -175,7 +172,7 @@ func (s *setCommand) setInterfaceSetting(context *hookstate.Context, plugOrSlot 
 	// Make sure set :<plug|slot> is only supported during the execution of prepare-[plug|slot] hooks
 	hookType, _ := interfaceHookType(context.HookName())
 	if hookType != preparePlugHook && hookType != prepareSlotHook {
-		return fmt.Errorf(i18n.G("interface attributes can only be set during the execution of prepare hooks"))
+		return errors.New(i18n.G("interface attributes can only be set during the execution of prepare hooks"))
 	}
 
 	attrsTask, err := attributesTask(context)
@@ -227,4 +224,24 @@ func (s *setCommand) setInterfaceSetting(context *hookstate.Context, plugOrSlot 
 
 	attrsTask.Set(dynKey, dynamicAttrs)
 	return nil
+}
+
+func setRegistryValues(ctx *hookstate.Context, plugName string, requests map[string]interface{}) error {
+	ctx.Lock()
+	defer ctx.Unlock()
+
+	view, err := getRegistryView(ctx, plugName)
+	if err != nil {
+		return fmt.Errorf("cannot set registry: %v", err)
+	}
+
+	tx, err := registrystate.RegistryTransaction(ctx, view.Registry())
+	if err != nil {
+		return err
+	}
+
+	// TODO: once we have hooks, check that we don't set values in the wrong hooks
+	// (e.g., "registry-changed" hooks can only read data)
+
+	return registrystate.SetViaViewInTx(tx, view, requests)
 }

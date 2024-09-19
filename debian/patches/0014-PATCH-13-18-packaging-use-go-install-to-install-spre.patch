@@ -1,0 +1,25 @@
+From: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+Date: Thu, 30 May 2024 11:43:24 +0200
+Subject: packaging: use "go install" to install spread
+
+The former go get command is deprecated with current Go, and no longer works
+correctly.
+
+Signed-off-by: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+---
+ packaging/debian-sid/tests/integrationtests | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/packaging/debian-sid/tests/integrationtests b/packaging/debian-sid/tests/integrationtests
+index 7f9b272..2267e71 100644
+--- a/packaging/debian-sid/tests/integrationtests
++++ b/packaging/debian-sid/tests/integrationtests
+@@ -43,7 +43,7 @@ snap install --classic go
+ # shellcheck disable=SC1091
+ . /etc/os-release
+ export GOPATH=/tmp/go
+-/snap/bin/go get -u github.com/snapcore/spread/cmd/spread
++/snap/bin/go install github.com/snapcore/spread/cmd/spread@latest
+ /tmp/go/bin/spread -v "autopkgtest:${ID}-${VERSION_ID}-$(dpkg --print-architecture)":tests/smoke/
+ 
+ # store journal info for inspectsion

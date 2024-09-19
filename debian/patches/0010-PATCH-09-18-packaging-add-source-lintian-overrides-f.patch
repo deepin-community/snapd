@@ -1,0 +1,26 @@
+From: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+Date: Mon, 3 Jun 2024 14:35:07 +0200
+Subject: packaging: add source lintian overrides for EFI binaries
+
+Signed-off-by: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+---
+ packaging/debian-sid/source/lintian-overrides | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+ create mode 100644 packaging/debian-sid/source/lintian-overrides
+
+diff --git a/packaging/debian-sid/source/lintian-overrides b/packaging/debian-sid/source/lintian-overrides
+new file mode 100644
+index 0000000..c603c58
+--- /dev/null
++++ b/packaging/debian-sid/source/lintian-overrides
+@@ -0,0 +1,10 @@
++# binaries necessary for testing
++snapd source: source-contains-prebuilt-windows-binary [tests/lib/snaps/test-snapd-remodel-pc-18/grubx64.efi]
++snapd source: source-contains-prebuilt-windows-binary [tests/lib/snaps/test-snapd-remodel-pc-18/mmx64.efi]
++snapd source: source-contains-prebuilt-windows-binary [tests/lib/snaps/test-snapd-remodel-pc-18/shim.efi.signed]
++snapd source: source-contains-prebuilt-windows-binary [tests/lib/snaps/test-snapd-remodel-pc-20/grubx64.efi]
++snapd source: source-contains-prebuilt-windows-binary [tests/lib/snaps/test-snapd-remodel-pc-20/shim.efi.signed]
++snapd source: source-contains-prebuilt-windows-binary [tests/lib/snaps/test-snapd-remodel-pc-22/grubx64.efi]
++snapd source: source-contains-prebuilt-windows-binary [tests/lib/snaps/test-snapd-remodel-pc-22/shim.efi.signed]
++snapd source: source-contains-prebuilt-windows-binary [tests/lib/snaps/test-snapd-remodel-pc-min-size-22/grubx64.efi]
++snapd source: source-contains-prebuilt-windows-binary [tests/lib/snaps/test-snapd-remodel-pc-min-size-22/shim.efi.signed]

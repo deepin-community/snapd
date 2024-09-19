@@ -1,5 +1,10 @@
 summary: Ensure that the squashfs precondition check works
 
+details: |
+    Check that if the precondition check of a squashfs mount fails when snapd
+    is restarted, the precondition is checked and the journal log shows the message
+    "cannot mount squashfs image"
+
 prepare: |
     echo "Break mounting so that the precondition check of a squashfs mount fails"
     mount -o bind /bin/false /bin/mount
@@ -12,9 +17,7 @@ restore: |
 execute: |
     echo "Restart snapd so that the precondition check runs"
     systemctl restart snapd
-    # shellcheck source=tests/lib/systemd.sh
-    . "$TESTSLIB/systemd.sh"
-    wait_for_service snapd
+    tests.systemd wait-for-service -n 30 --state active snapd
 
     "$TESTSTOOLS"/journal-state match-log -n 120 -u snapd "system does not fully support snapd: cannot mount squashfs image"
 

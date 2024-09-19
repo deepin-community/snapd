@@ -22,12 +22,14 @@ package daemon
 import (
 	"context"
 	"net/http"
+	"os/user"
 	"time"
 
 	"github.com/gorilla/mux"
 
 	"github.com/snapcore/snapd/asserts/snapasserts"
 	"github.com/snapcore/snapd/boot"
+	"github.com/snapcore/snapd/client/clientutil"
 	"github.com/snapcore/snapd/overlord"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/restart"
@@ -37,7 +39,10 @@ import (
 	"github.com/snapcore/snapd/testutil"
 )
 
-var CreateQuotaValues = createQuotaValues
+var (
+	CreateQuotaValues = createQuotaValues
+	ParseOptionalTime = parseOptionalTime
+)
 
 func APICommands() []*Command {
 	return api
@@ -112,6 +117,14 @@ func MockUnsafeReadSnapInfo(mock func(string) (*snap.Info, error)) (restore func
 	}
 }
 
+func MockReadComponentInfoFromCont(mock func(tempPath string, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error)) (restore func()) {
+	oldUnsafeReadSnapInfo := readComponentInfoFromCont
+	readComponentInfoFromCont = mock
+	return func() {
+		readComponentInfoFromCont = oldUnsafeReadSnapInfo
+	}
+}
+
 func MockAssertstateRefreshSnapAssertions(mock func(*state.State, int, *assertstate.RefreshAssertionsOptions) error) (restore func()) {
 	oldAssertstateRefreshSnapAssertions := assertstateRefreshSnapAssertions
 	assertstateRefreshSnapAssertions = mock
@@ -126,15 +139,31 @@ func MockAssertstateTryEnforceValidationSets(f func(st *state.State, validationS
 	return r
 }
 
-func MockSnapstateInstall(mock func(context.Context, *state.State, string, *snapstate.RevisionOptions, int, snapstate.Flags) (*state.TaskSet, error)) (restore func()) {
-	oldSnapstateInstall := snapstateInstall
-	snapstateInstall = mock
+func MockSnapstateInstallWithGoal(mock func(ctx context.Context, st *state.State, goal snapstate.InstallGoal, opts snapstate.Options) ([]*snap.Info, []*state.TaskSet, error)) (restore func()) {
+	old := snapstateInstallWithGoal
+	snapstateInstallWithGoal = mock
 	return func() {
-		snapstateInstall = oldSnapstateInstall
+		snapstateInstallWithGoal = old
 	}
 }
 
-func MockSnapstateInstallPath(mock func(*state.State, *snap.SideInfo, string, string, string, snapstate.Flags) (*state.TaskSet, *snap.Info, error)) (restore func()) {
+func MockSnapstateInstallComponents(mock func(ctx context.Context, st *state.State, names []string, info *snap.Info, opts snapstate.Options) ([]*state.TaskSet, error)) (restore func()) {
+	old := snapstateInstallComponents
+	snapstateInstallComponents = mock
+	return func() {
+		snapstateInstallComponents = old
+	}
+}
+
+func MockSnapstateStoreInstallGoal(mock func(snaps ...snapstate.StoreSnap) snapstate.InstallGoal) (restore func()) {
+	old := snapstateStoreInstallGoal
+	snapstateStoreInstallGoal = mock
+	return func() {
+		snapstateStoreInstallGoal = old
+	}
+}
+
+func MockSnapstateInstallPath(mock func(*state.State, *snap.SideInfo, string, string, string, snapstate.Flags, snapstate.PrereqTracker) (*state.TaskSet, *snap.Info, error)) (restore func()) {
 	oldSnapstateInstallPath := snapstateInstallPath
 	snapstateInstallPath = mock
 	return func() {
@@ -182,19 +211,19 @@ func MockSnapstateRevertToRevision(mock func(*state.State, string, snap.Revision
 	}
 }
 
-func MockSnapstateInstallMany(mock func(*state.State, []string, []*snapstate.RevisionOptions, int, *snapstate.Flags) ([]string, []*state.TaskSet, error)) (restore func()) {
-	oldSnapstateInstallMany := snapstateInstallMany
-	snapstateInstallMany = mock
-	return func() {
-		snapstateInstallMany = oldSnapstateInstallMany
-	}
-}
-
 func MockSnapstateUpdateMany(mock func(context.Context, *state.State, []string, []*snapstate.RevisionOptions, int, *snapstate.Flags) ([]string, []*state.TaskSet, error)) (restore func()) {
 	oldSnapstateUpdateMany := snapstateUpdateMany
 	snapstateUpdateMany = mock
 	return func() {
 		snapstateUpdateMany = oldSnapstateUpdateMany
+	}
+}
+
+func MockSnapstateRemove(mock func(st *state.State, name string, revision snap.Revision, flags *snapstate.RemoveFlags) (*state.TaskSet, error)) (restore func()) {
+	oldSnapstateRemove := snapstateRemove
+	snapstateRemove = mock
+	return func() {
+		snapstateRemove = oldSnapstateRemove
 	}
 }
 
@@ -211,6 +240,14 @@ func MockSnapstateInstallPathMany(f func(context.Context, *state.State, []*snap.
 	snapstateInstallPathMany = f
 	return func() {
 		snapstateInstallPathMany = old
+	}
+}
+
+func MockSnapstateInstallComponentPath(f func(st *state.State, csi *snap.ComponentSideInfo, info *snap.Info, path string, flags snapstate.Flags) (*state.TaskSet, error)) func() {
+	old := snapstateInstallComponentPath
+	snapstateInstallComponentPath = f
+	return func() {
+		snapstateInstallComponentPath = old
 	}
 }
 
@@ -246,6 +283,14 @@ func MockSnapstateHoldRefreshesBySystem(f func(st *state.State, level snapstate.
 	}
 }
 
+func MockSnapstateRemoveComponents(mock func(st *state.State, snapName string, compName []string, opts snapstate.RemoveComponentsOpts) ([]*state.TaskSet, error)) (restore func()) {
+	oldSnapstateRemoveComponents := snapstateRemoveComponents
+	snapstateRemoveComponents = mock
+	return func() {
+		snapstateRemoveComponents = oldSnapstateRemoveComponents
+	}
+}
+
 func MockConfigstateConfigureInstalled(f func(st *state.State, name string, patchValues map[string]interface{}, flags int) (*state.TaskSet, error)) (restore func()) {
 	old := configstateConfigureInstalled
 	configstateConfigureInstalled = f
@@ -273,6 +318,27 @@ func MockLongestGatingHold(f func(st *state.State, name string) (time.Time, erro
 func MockReboot(f func(boot.RebootAction, time.Duration, *boot.RebootInfo) error) func() {
 	reboot = f
 	return func() { reboot = boot.Reboot }
+}
+
+func MockSideloadSnapsInfo(sis []*snap.SideInfo) (restore func()) {
+	r := testutil.Backup(&sideloadSnapsInfo)
+	sideloadSnapsInfo = func(st *state.State, snapFiles []*uploadedSnap,
+		flags sideloadFlags) (*sideloadedInfo, *apiError) {
+
+		names := make([]string, len(snapFiles))
+		sideInfos := make([]*snap.SideInfo, len(snapFiles))
+		origPaths := make([]string, len(snapFiles))
+		tmpPaths := make([]string, len(snapFiles))
+		for i, snapFile := range snapFiles {
+			sideInfos[i] = sis[i]
+			names[i] = sis[i].RealName
+			origPaths[i] = snapFile.filename
+			tmpPaths[i] = snapFile.tmpPath
+		}
+		return &sideloadedInfo{sideInfos: sideInfos, names: names,
+			origPaths: origPaths, tmpPaths: tmpPaths}, nil
+	}
+	return r
 }
 
 type (
@@ -313,18 +379,44 @@ var (
 	MaxReadBuflen = maxReadBuflen
 )
 
-func MockAspectstateGet(f func(st *state.State, account, bundleName, aspect, field string, value interface{}) error) (restore func()) {
-	old := aspectstateGet
-	aspectstateGet = f
+func MockRegistrystateGetViaView(f func(_ *state.State, _, _, _ string, _ []string) (interface{}, error)) (restore func()) {
+	old := registrystateGetViaView
+	registrystateGetViaView = f
 	return func() {
-		aspectstateGet = old
+		registrystateGetViaView = old
 	}
 }
 
-func MockAspectstateSet(f func(st *state.State, account, bundleName, aspect, field string, val interface{}) error) (restore func()) {
-	old := aspectstateSet
-	aspectstateSet = f
+func MockRegistrystateSetViaView(f func(_ *state.State, _, _, _ string, _ map[string]interface{}) error) (restore func()) {
+	old := registrystateSetViaView
+	registrystateSetViaView = f
 	return func() {
-		aspectstateSet = old
+		registrystateSetViaView = old
 	}
+}
+
+func MockRebootNoticeWait(d time.Duration) (restore func()) {
+	restore = testutil.Backup(&rebootNoticeWait)
+	rebootNoticeWait = d
+	return restore
+}
+
+func MockSystemUserFromRequest(f func(r *http.Request) (*user.User, error)) (restore func()) {
+	restore = testutil.Backup(&systemUserFromRequest)
+	systemUserFromRequest = f
+	return restore
+}
+
+func MockOsReadlink(f func(string) (string, error)) func() {
+	old := osReadlink
+	osReadlink = f
+	return func() {
+		osReadlink = old
+	}
+}
+
+func MockNewStatusDecorator(f func(ctx context.Context, isGlobal bool, uid string) clientutil.StatusDecorator) (restore func()) {
+	restore = testutil.Backup(&newStatusDecorator)
+	newStatusDecorator = f
+	return restore
 }

@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2022 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -81,17 +81,18 @@ func getExtraLayouts(st *state.State, snapInfo *snap.Info) ([]snap.Layout, error
 	return extraLayouts, nil
 }
 
-func buildConfinementOptions(st *state.State, snapInfo *snap.Info, flags snapstate.Flags) (interfaces.ConfinementOptions, error) {
+func (m *InterfaceManager) buildConfinementOptions(st *state.State, snapInfo *snap.Info, flags snapstate.Flags) (interfaces.ConfinementOptions, error) {
 	extraLayouts, err := getExtraLayouts(st, snapInfo)
 	if err != nil {
 		return interfaces.ConfinementOptions{}, fmt.Errorf("cannot get extra mount layouts of snap %q: %s", snapInfo.InstanceName(), err)
 	}
 
 	return interfaces.ConfinementOptions{
-		DevMode:      flags.DevMode,
-		JailMode:     flags.JailMode,
-		Classic:      flags.Classic,
-		ExtraLayouts: extraLayouts,
+		DevMode:           flags.DevMode,
+		JailMode:          flags.JailMode,
+		Classic:           flags.Classic,
+		ExtraLayouts:      extraLayouts,
+		AppArmorPrompting: m.useAppArmorPrompting,
 	}, nil
 }
 
@@ -116,11 +117,17 @@ func (m *InterfaceManager) setupAffectedSnaps(task *state.Task, affectingSnap st
 		if err := addImplicitSlots(st, affectedSnapInfo); err != nil {
 			return err
 		}
-		opts, err := buildConfinementOptions(st, affectedSnapInfo, snapst.Flags)
+
+		affectedAppSet, err := appSetForSnapRevision(st, affectedSnapInfo)
+		if err != nil {
+			return fmt.Errorf("building app set for snap %q: %v", affectingSnap, err)
+		}
+
+		opts, err := m.buildConfinementOptions(st, affectedSnapInfo, snapst.Flags)
 		if err != nil {
 			return err
 		}
-		if err := m.setupSnapSecurity(task, affectedSnapInfo, opts, tm); err != nil {
+		if err := m.setupSnapSecurity(task, affectedAppSet, opts, tm); err != nil {
 			return err
 		}
 	}
@@ -162,20 +169,33 @@ func (m *InterfaceManager) doSetupProfiles(task *state.Task, tomb *tomb.Tomb) er
 		return nil
 	}
 
-	opts, err := buildConfinementOptions(task.State(), snapInfo, snapsup.Flags)
+	opts, err := m.buildConfinementOptions(task.State(), snapInfo, snapsup.Flags)
 	if err != nil {
 		return err
 	}
-	if err := m.setupProfilesForSnap(task, tomb, snapInfo, opts, perfTimings); err != nil {
+
+	if err := addImplicitSlots(task.State(), snapInfo); err != nil {
 		return err
 	}
-	return setPendingProfilesSideInfo(task.State(), snapsup.InstanceName(), snapsup.SideInfo)
+
+	// this app set is derived from the current task, which will include any
+	// components that are already installed, with the addition of any new
+	// components that are getting setup up by this task
+	appSet, err := appSetForTask(task, snapInfo)
+	if err != nil {
+		return err
+	}
+
+	if err := m.setupProfilesForAppSet(task, appSet, opts, perfTimings); err != nil {
+		return err
+	}
+	return setPendingProfilesSideInfo(task.State(), snapsup.InstanceName(), appSet)
 }
 
 // setupPendingProfilesSideInfo helps updating information about any
 // revision for which security profiles are set up while the snap is
 // not yet active.
-func setPendingProfilesSideInfo(st *state.State, instanceName string, si *snap.SideInfo) error {
+func setPendingProfilesSideInfo(st *state.State, instanceName string, appSet *interfaces.SnapAppSet) error {
 	var snapst snapstate.SnapState
 	if err := snapstate.Get(st, instanceName, &snapst); err != nil && !errors.Is(err, state.ErrNoState) {
 		return err
@@ -188,21 +208,30 @@ func setPendingProfilesSideInfo(st *state.State, instanceName string, si *snap.S
 		// nothing is pending
 		return nil
 	}
-	snapst.PendingSecurity = &snapstate.PendingSecurityState{
-		SideInfo: si,
+
+	if appSet != nil {
+		csis := make([]*snap.ComponentSideInfo, 0, len(appSet.Components()))
+		for _, ci := range appSet.Components() {
+			csis = append(csis, &ci.ComponentSideInfo)
+		}
+
+		snapst.PendingSecurity = &snapstate.PendingSecurityState{
+			SideInfo:   &appSet.Info().SideInfo,
+			Components: csis,
+		}
+	} else {
+		snapst.PendingSecurity = &snapstate.PendingSecurityState{}
 	}
+
 	snapstate.Set(st, instanceName, &snapst)
 	return nil
 }
 
-func (m *InterfaceManager) setupProfilesForSnap(task *state.Task, _ *tomb.Tomb, snapInfo *snap.Info, opts interfaces.ConfinementOptions, tm timings.Measurer) error {
+func (m *InterfaceManager) setupProfilesForAppSet(task *state.Task, appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, tm timings.Measurer) error {
 	st := task.State()
 
-	if err := addImplicitSlots(task.State(), snapInfo); err != nil {
-		return err
-	}
-
-	snapName := snapInfo.InstanceName()
+	snapInfo := appSet.Info()
+	snapName := appSet.InstanceName()
 
 	// The snap may have been updated so perform the following operation to
 	// ensure that we are always working on the correct state:
@@ -223,7 +252,7 @@ func (m *InterfaceManager) setupProfilesForSnap(task *state.Task, _ *tomb.Tomb, 
 	if err := m.repo.RemoveSnap(snapName); err != nil {
 		return err
 	}
-	if err := m.repo.AddSnap(snapInfo); err != nil {
+	if err := m.repo.AddAppSet(appSet); err != nil {
 		return err
 	}
 	if len(snapInfo.BadInterfaces) > 0 {
@@ -260,13 +289,15 @@ func (m *InterfaceManager) setupProfilesForSnap(task *state.Task, _ *tomb.Tomb, 
 	sort.Strings(affectedNames)
 	affectedNames = append([]string{snapName}, affectedNames...)
 
-	// Obtain snap.Info for each affected snap, skipping those that cannot be
-	// found and compute the confinement options that apply to it.
-	affectedSnaps := make([]*snap.Info, 0, len(affectedSet))
+	// Obtain interfaces.SnapAppSet for each affected snap, skipping those that
+	// cannot be found and compute the confinement options that apply to it.
+	affectedSnapSets := make([]*interfaces.SnapAppSet, 0, len(affectedSet))
 	confinementOpts := make([]interfaces.ConfinementOptions, 0, len(affectedSet))
+
 	// For the snap being setup we know exactly what was requested.
-	affectedSnaps = append(affectedSnaps, snapInfo)
+	affectedSnapSets = append(affectedSnapSets, appSet)
 	confinementOpts = append(confinementOpts, opts)
+
 	// For remaining snaps we need to interrogate the state.
 	for _, name := range affectedNames[1:] {
 		var snapst snapstate.SnapState
@@ -281,16 +312,22 @@ func (m *InterfaceManager) setupProfilesForSnap(task *state.Task, _ *tomb.Tomb, 
 		if err := addImplicitSlots(st, snapInfo); err != nil {
 			return err
 		}
-		opts, err := buildConfinementOptions(st, snapInfo, snapst.Flags)
+
+		appSet, err := appSetForSnapRevision(st, snapInfo)
+		if err != nil {
+			return fmt.Errorf("building app set for snap %q: %v", name, err)
+		}
+
+		opts, err := m.buildConfinementOptions(st, snapInfo, snapst.Flags)
 		if err != nil {
 			return err
 		}
 
-		affectedSnaps = append(affectedSnaps, snapInfo)
+		affectedSnapSets = append(affectedSnapSets, appSet)
 		confinementOpts = append(confinementOpts, opts)
 	}
 
-	return m.setupSecurityByBackend(task, affectedSnaps, confinementOpts, tm)
+	return m.setupSecurityByBackend(task, affectedSnapSets, confinementOpts, tm)
 }
 
 func (m *InterfaceManager) doRemoveProfiles(task *state.Task, tomb *tomb.Tomb) error {
@@ -383,14 +420,27 @@ func (m *InterfaceManager) undoSetupProfiles(task *state.Task, tomb *tomb.Tomb) 
 		if err != nil {
 			return err
 		}
-		opts, err := buildConfinementOptions(task.State(), snapInfo, snapst.Flags)
+		opts, err := m.buildConfinementOptions(task.State(), snapInfo, snapst.Flags)
 		if err != nil {
 			return err
 		}
-		if err := m.setupProfilesForSnap(task, tomb, snapInfo, opts, perfTimings); err != nil {
+
+		if err := addImplicitSlots(st, snapInfo); err != nil {
 			return err
 		}
-		return setPendingProfilesSideInfo(task.State(), snapName, sideInfo)
+
+		// this app set is derived from the currently installed revision of the
+		// snap (not the revision that we are reverting from). it only includes
+		// components that were installed with that revision.
+		appSet, err := appSetForSnapRevision(st, snapInfo)
+		if err != nil {
+			return err
+		}
+
+		if err := m.setupProfilesForAppSet(task, appSet, opts, perfTimings); err != nil {
+			return err
+		}
+		return setPendingProfilesSideInfo(task.State(), snapName, appSet)
 	}
 }
 
@@ -412,7 +462,7 @@ func (m *InterfaceManager) doDiscardConns(task *state.Task, _ *tomb.Tomb) error 
 		return err
 	}
 
-	if err == nil && len(snapst.Sequence) != 0 {
+	if err == nil && len(snapst.Sequence.Revisions) != 0 {
 		return fmt.Errorf("cannot discard connections for snap %q while it is present", instanceName)
 	}
 	conns, err := getConns(st)
@@ -543,10 +593,20 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 		return fmt.Errorf("snap %q has no %q plug", connRef.PlugRef.Snap, connRef.PlugRef.Name)
 	}
 
+	plugAppSet, err := appSetForSnapRevision(st, plug.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", plug.Snap.InstanceName(), err)
+	}
+
 	slot := m.repo.Slot(connRef.SlotRef.Snap, connRef.SlotRef.Name)
 	if slot == nil {
 		// conflict logic should prevent this
 		return fmt.Errorf("snap %q has no %q slot", connRef.SlotRef.Snap, connRef.SlotRef.Name)
+	}
+
+	slotAppSet, err := appSetForSnapRevision(st, slot.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", slot.Snap.InstanceName(), err)
 	}
 
 	// attributes are always present, even if there are no hooks (they're initialized by Connect).
@@ -561,7 +621,7 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 	// policy "connection" rules, other auto-connections obey the
 	// "auto-connection" rules
 	if autoConnect && !byGadget {
-		autochecker, err := newAutoConnectChecker(st, task, m.repo, deviceCtx)
+		autochecker, err := newAutoConnectChecker(st, m.repo, deviceCtx)
 		if err != nil {
 			return err
 		}
@@ -595,11 +655,11 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 		if err != nil {
 			return err
 		}
-		slotOpts, err := buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
+		slotOpts, err := m.buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
 		if err != nil {
 			return err
 		}
-		if err := m.setupSnapSecurity(task, slot.Snap, slotOpts, perfTimings); err != nil {
+		if err := m.setupSnapSecurity(task, slotAppSet, slotOpts, perfTimings); err != nil {
 			return err
 		}
 
@@ -607,11 +667,11 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 		if err != nil {
 			return err
 		}
-		plugOpts, err := buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
+		plugOpts, err := m.buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
 		if err != nil {
 			return err
 		}
-		if err := m.setupSnapSecurity(task, plug.Snap, plugOpts, perfTimings); err != nil {
+		if err := m.setupSnapSecurity(task, plugAppSet, plugOpts, perfTimings); err != nil {
 			return err
 		}
 	} else {
@@ -711,11 +771,17 @@ func (m *InterfaceManager) doDisconnect(task *state.Task, _ *tomb.Tomb) error {
 		if err != nil {
 			return err
 		}
-		opts, err := buildConfinementOptions(st, snapInfo, snapst.Flags)
+
+		appSet, err := appSetForSnapRevision(st, snapInfo)
+		if err != nil {
+			return fmt.Errorf("building app set for snap %q: %v", snapInfo.InstanceName(), err)
+		}
+
+		opts, err := m.buildConfinementOptions(st, snapInfo, snapst.Flags)
 		if err != nil {
 			return err
 		}
-		if err := m.setupSnapSecurity(task, snapInfo, opts, perfTimings); err != nil {
+		if err := m.setupSnapSecurity(task, appSet, opts, perfTimings); err != nil {
 			return err
 		}
 	}
@@ -800,6 +866,7 @@ func (m *InterfaceManager) undoDisconnect(task *state.Task, _ *tomb.Tomb) error 
 
 	plug := m.repo.Plug(connRef.PlugRef.Snap, connRef.PlugRef.Name)
 	slot := m.repo.Slot(connRef.SlotRef.Snap, connRef.SlotRef.Name)
+
 	if forget && (plug == nil || slot == nil) {
 		// we were trying to forget an inactive connection that was
 		// referring to a non-existing plug or slot; just restore it
@@ -815,6 +882,16 @@ func (m *InterfaceManager) undoDisconnect(task *state.Task, _ *tomb.Tomb) error 
 		return fmt.Errorf("snap %q has no %q slot", connRef.SlotRef.Snap, connRef.SlotRef.Name)
 	}
 
+	plugAppSet, err := appSetForSnapRevision(st, plug.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", plug.Snap.InstanceName(), err)
+	}
+
+	slotAppSet, err := appSetForSnapRevision(st, slot.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", slot.Snap.InstanceName(), err)
+	}
+
 	_, err = m.repo.Connect(connRef, nil, oldconn.DynamicPlugAttrs, nil, oldconn.DynamicSlotAttrs, nil)
 	if err != nil {
 		return err
@@ -824,11 +901,11 @@ func (m *InterfaceManager) undoDisconnect(task *state.Task, _ *tomb.Tomb) error 
 	if err != nil {
 		return err
 	}
-	slotOpts, err := buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
+	slotOpts, err := m.buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
 	if err != nil {
 		return err
 	}
-	if err := m.setupSnapSecurity(task, slot.Snap, slotOpts, perfTimings); err != nil {
+	if err := m.setupSnapSecurity(task, slotAppSet, slotOpts, perfTimings); err != nil {
 		return err
 	}
 
@@ -836,11 +913,11 @@ func (m *InterfaceManager) undoDisconnect(task *state.Task, _ *tomb.Tomb) error 
 	if err != nil {
 		return err
 	}
-	plugOpts, err := buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
+	plugOpts, err := m.buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
 	if err != nil {
 		return err
 	}
-	if err := m.setupSnapSecurity(task, plug.Snap, plugOpts, perfTimings); err != nil {
+	if err := m.setupSnapSecurity(task, plugAppSet, plugOpts, perfTimings); err != nil {
 		return err
 	}
 
@@ -897,9 +974,20 @@ func (m *InterfaceManager) undoConnect(task *state.Task, _ *tomb.Tomb) error {
 	if plug == nil {
 		return fmt.Errorf("internal error: snap %q has no %q plug", connRef.PlugRef.Snap, connRef.PlugRef.Name)
 	}
+
+	plugAppSet, err := appSetForSnapRevision(st, plug.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", plug.Snap.InstanceName(), err)
+	}
+
 	slot := m.repo.Slot(connRef.SlotRef.Snap, connRef.SlotRef.Name)
 	if slot == nil {
 		return fmt.Errorf("internal error: snap %q has no %q slot", connRef.SlotRef.Snap, connRef.SlotRef.Name)
+	}
+
+	slotAppSet, err := appSetForSnapRevision(st, slot.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", slot.Snap.InstanceName(), err)
 	}
 
 	var plugSnapst snapstate.SnapState
@@ -923,11 +1011,11 @@ func (m *InterfaceManager) undoConnect(task *state.Task, _ *tomb.Tomb) error {
 	if err != nil {
 		return err
 	}
-	slotOpts, err := buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
+	slotOpts, err := m.buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
 	if err != nil {
 		return err
 	}
-	if err := m.setupSnapSecurity(task, slot.Snap, slotOpts, perfTimings); err != nil {
+	if err := m.setupSnapSecurity(task, slotAppSet, slotOpts, perfTimings); err != nil {
 		return err
 	}
 
@@ -935,11 +1023,11 @@ func (m *InterfaceManager) undoConnect(task *state.Task, _ *tomb.Tomb) error {
 	if err != nil {
 		return err
 	}
-	plugOpts, err := buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
+	plugOpts, err := m.buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
 	if err != nil {
 		return err
 	}
-	if err := m.setupSnapSecurity(task, plug.Snap, plugOpts, perfTimings); err != nil {
+	if err := m.setupSnapSecurity(task, plugAppSet, plugOpts, perfTimings); err != nil {
 		return err
 	}
 
@@ -1282,7 +1370,7 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 
 	snapName := snapsup.InstanceName()
 
-	autochecker, err := newAutoConnectChecker(st, task, m.repo, deviceCtx)
+	autochecker, err := newAutoConnectChecker(st, m.repo, deviceCtx)
 	if err != nil {
 		return err
 	}
@@ -1300,7 +1388,7 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 	// snaps with not ready link-snap|setup-profiles tasks
 	defaultProviders := snap.DefaultContentProviders(m.repo.Plugs(snapName))
 	for _, chg := range st.Changes() {
-		if chg.Status().Ready() {
+		if chg.IsReady() {
 			continue
 		}
 		for _, t := range chg.Tasks() {
@@ -1353,7 +1441,7 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 	cannotAutoConnectLog := func(plug *snap.PlugInfo, candRefs []string) string {
 		return fmt.Sprintf("cannot auto-connect plug %s, candidates found: %s", plug, strings.Join(candRefs, ", "))
 	}
-	if err := autochecker.addAutoConnections(newconns, plugs, nil, conns, cannotAutoConnectLog, conflictError); err != nil {
+	if err := autochecker.addAutoConnections(task, newconns, plugs, nil, conns, cannotAutoConnectLog, conflictError); err != nil {
 		return err
 	}
 	// Auto-connect all the slots
@@ -1366,7 +1454,7 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 		cannotAutoConnectLog := func(plug *snap.PlugInfo, candRefs []string) string {
 			return fmt.Sprintf("cannot auto-connect slot %s to plug %s, candidates found: %s", slot, plug, strings.Join(candRefs, ", "))
 		}
-		if err := autochecker.addAutoConnections(newconns, candidates, filterForSlot(slot), conns, cannotAutoConnectLog, conflictError); err != nil {
+		if err := autochecker.addAutoConnections(task, newconns, candidates, filterForSlot(slot), conns, cannotAutoConnectLog, conflictError); err != nil {
 			return err
 		}
 	}
@@ -1603,7 +1691,7 @@ func (m *InterfaceManager) doHotplugConnect(task *state.Task, _ *tomb.Tomb) erro
 		conn := conns[id]
 		// device was not unplugged, this is the case if snapd is restarted and we enumerate devices.
 		// note, the situation where device was not unplugged but has changed is handled
-		// by hotlugDeviceAdded handler - updateDevice.
+		// by hotplugDeviceAdded handler - updateDevice.
 		if !conn.HotplugGone || conn.Undesired {
 			continue
 		}
@@ -1622,7 +1710,7 @@ func (m *InterfaceManager) doHotplugConnect(task *state.Task, _ *tomb.Tomb) erro
 	}
 
 	// find new auto-connections
-	autochecker, err := newAutoConnectChecker(st, task, m.repo, deviceCtx)
+	autochecker, err := newAutoConnectChecker(st, m.repo, deviceCtx)
 	if err != nil {
 		return err
 	}
@@ -1635,7 +1723,7 @@ func (m *InterfaceManager) doHotplugConnect(task *state.Task, _ *tomb.Tomb) erro
 	cannotAutoConnectLog := func(plug *snap.PlugInfo, candRefs []string) string {
 		return fmt.Sprintf("cannot auto-connect hotplug slot %s to plug %s, candidates found: %s", slot, plug, strings.Join(candRefs, ", "))
 	}
-	if err := autochecker.addAutoConnections(newconns, candidates, filterForSlot(slot), conns, cannotAutoConnectLog, conflictError); err != nil {
+	if err := autochecker.addAutoConnections(task, newconns, candidates, filterForSlot(slot), conns, cannotAutoConnectLog, conflictError); err != nil {
 		return err
 	}
 
@@ -1912,7 +2000,7 @@ func (m *InterfaceManager) doHotplugSeqWait(task *state.Task, _ *tomb.Tomb) erro
 	}
 
 	for _, otherChg := range st.Changes() {
-		if otherChg.Status().Ready() || otherChg.ID() == chg.ID() {
+		if otherChg.IsReady() || otherChg.ID() == chg.ID() {
 			continue
 		}
 

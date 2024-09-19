@@ -1,5 +1,9 @@
 summary: Test httputil/retry.go ShouldRetryError(err)/NoNetwork(err)
 
+details: |
+    Test the httputil/retry.go helpers that determine when errors are due to
+    transient network faults such as temporary DNS failures.
+
 # ubuntu-core: no go-compiler
 # ubuntu-14.04: no nsenter
 systems: [-ubuntu-core-*, -ubuntu-14.04-*]
@@ -30,6 +34,10 @@ execute: |
 
     echo "Now without DNS resolver with ipv4"
     UBUNTU_IP="$(getent ahostsv4 www.ubuntu.com|awk '{print $1 }' | head -n1)"
+    # when ubuntu.com is configured in no_proxy, then we need to add the ip as well
+    if echo "$NO_PROXY" | MATCH 'ubuntu.com'; then
+        export NO_PROXY="$NO_PROXY","$UBUNTU_IP"
+    fi
     SNAPD_DEBUG=1 nsenter --net=/var/run/netns/testns ./detect-retry "http://$UBUNTU_IP" > output.txt 2>stderr
     # XXX: ShouldRetryError is slightly misbehaving, see comment above
     MATCH "ShouldRetryError: true" < output.txt
@@ -45,6 +53,10 @@ execute: |
 
     echo "Now without DNS resolver for ipv6"
     UBUNTU_IP="$(getent ahostsv6 www.ubuntu.com|awk '{print $1 }' | head -n1)"
+    # when ubuntu.com is configured in no_proxy, then we need to add the ip as well
+    if echo "$NO_PROXY" | MATCH 'ubuntu.com'; then
+        export NO_PROXY="$NO_PROXY","$UBUNTU_IP"
+    fi
     SNAPD_DEBUG=1 nsenter --net=/var/run/netns/testns ./detect-retry "http://[$UBUNTU_IP]" > output.txt 2>stderr
     # XXX: ShouldRetryError is slightly misbehaving, see comment above
     MATCH "ShouldRetryError: true" < output.txt

@@ -1,6 +1,18 @@
+From: Michael Hudson-Doyle <mwhudson@debian.org>
+Date: Mon, 3 Jun 2024 18:07:56 +0200
+Subject: cmd: adjust manual page sections
+
+XXX: Why?
+---
+ cmd/snap-discard-ns/snap-discard-ns.rst         | 2 +-
+ cmd/snapd-env-generator/snapd-env-generator.rst | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/cmd/snap-discard-ns/snap-discard-ns.rst b/cmd/snap-discard-ns/snap-discard-ns.rst
+index 25a74c5..dfb9a5c 100644
 --- a/cmd/snap-discard-ns/snap-discard-ns.rst
 +++ b/cmd/snap-discard-ns/snap-discard-ns.rst
-@@ -10,7 +10,7 @@
+@@ -10,7 +10,7 @@ internal tool for discarding preserved namespaces of snappy applications
  :Date:   2018-10-17
  :Copyright: Canonical Ltd.
  :Version: 2.36
@@ -9,9 +21,11 @@
  :Manual group: snappy
  
  SYNOPSIS
+diff --git a/cmd/snapd-env-generator/snapd-env-generator.rst b/cmd/snapd-env-generator/snapd-env-generator.rst
+index 8e3dab5..0799a7f 100644
 --- a/cmd/snapd-env-generator/snapd-env-generator.rst
 +++ b/cmd/snapd-env-generator/snapd-env-generator.rst
-@@ -10,7 +10,7 @@
+@@ -10,7 +10,7 @@ internal tool to set /snap/bin to PATH
  :Date:   2018-08-31
  :Copyright: Canonical Ltd.
  :Version: 2.35
