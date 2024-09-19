@@ -1,7 +1,12 @@
 summary: Check that a broken kernel snap automatically rolls itself back
 
+details: |
+  Check the trigger for a broken kernel installation (there are 7 different
+  kernel corruptions) adds an install change error and that the initial kernel revision
+  remains installed and we don't have leftover bootenv.
+
 # TODO:UC20: write equivalent test for base snap failover
-systems: [ubuntu-20.04-64, ubuntu-22.04-64]
+systems: [ubuntu-2*]
 
 environment:
   PROBLEM_TYPE/crash: crash
@@ -24,14 +29,15 @@ prepare: |
   # TODO:UC20: this doesn't work for some reason when we copy it from the 
   #            running system, we should look into that, but for now just 
   #            re-download the snap
-  version=20
-  if tests.nested is-nested uc22; then
-    version=22
-  fi
-  snap download pc-kernel --channel="$version/edge" --basename=pc-kernel
+  version="$(tests.nested show version)"
+  snap download pc-kernel --channel="$version/beta" --basename=pc-kernel
   case "$PROBLEM_TYPE" in
       crash)
-          uc20_build_initramfs_kernel_snap pc-kernel.snap "$PWD" --inject-kernel-panic-in-initramfs
+          if [ "$version" -le 22 ]; then
+            uc20_build_initramfs_kernel_snap pc-kernel.snap "$PWD" --inject-kernel-panic-in-initramfs
+          else
+            uc24_build_initramfs_kernel_snap pc-kernel.snap "$PWD" --inject-kernel-panic-in-initramfs
+          fi
           ;;
       nolink)
           # Failure will be forced by removing the try-kernel.efi link later,
@@ -68,7 +74,7 @@ execute: |
   echo "Install it and get the ID for the change"
   REMOTE_CHG_ID=$(remote.exec sudo snap install --dangerous panicking-initramfs-kernel.snap --no-wait)
   if [ "$PROBLEM_TYPE" = "nolink" ]; then
-      remote.exec "retry --wait 1 -n 50 sh -c 'sudo rm /run/mnt/ubuntu-boot/EFI/ubuntu/try-kernel.efi'"
+      remote.exec "retry --wait 1 -n 100 sh -c 'sudo rm /run/mnt/ubuntu-boot/EFI/ubuntu/try-kernel.efi'"
   fi
 
   # wait for a reboot. Note that failure is immediate for kernel.efi

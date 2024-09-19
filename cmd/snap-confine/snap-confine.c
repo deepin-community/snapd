@@ -39,8 +39,10 @@
 #include "../libsnap-confine-private/classic.h"
 #include "../libsnap-confine-private/cleanup-funcs.h"
 #include "../libsnap-confine-private/feature.h"
+#include "../libsnap-confine-private/infofile.h"
 #include "../libsnap-confine-private/locking.h"
 #include "../libsnap-confine-private/secure-getenv.h"
+#include "../libsnap-confine-private/snap-dir.h"
 #include "../libsnap-confine-private/snap.h"
 #include "../libsnap-confine-private/string-utils.h"
 #include "../libsnap-confine-private/tool.h"
@@ -133,8 +135,8 @@ typedef struct sc_preserved_process_state {
  * umask is altered. It is set to zero to make the ownership of created files
  * and directories more predictable.
 **/
-static void sc_preserve_and_sanitize_process_state(sc_preserved_process_state *
-						   proc_state)
+static void sc_preserve_and_sanitize_process_state(sc_preserved_process_state
+						   *proc_state)
 {
 	/* Reset umask to zero, storing the old value. */
 	proc_state->orig_umask = umask(0);
@@ -160,8 +162,8 @@ static void sc_preserve_and_sanitize_process_state(sc_preserved_process_state *
 /**
  *  sc_restore_process_state restores values stored earlier.
 **/
-static void sc_restore_process_state(const sc_preserved_process_state *
-				     proc_state)
+static void sc_restore_process_state(const sc_preserved_process_state
+				     *proc_state)
 {
 	/* Restore original umask */
 	umask(proc_state->orig_umask);
@@ -183,8 +185,8 @@ static void sc_restore_process_state(const sc_preserved_process_state *
 	 **/
 
 	/* Read the target of symlink at /proc/self/fd/<fd-of-orig-cwd> */
-	char fd_path[PATH_MAX] = {0};
-	char orig_cwd[PATH_MAX] = {0};
+	char fd_path[PATH_MAX] = { 0 };
+	char orig_cwd[PATH_MAX] = { 0 };
 	ssize_t nread;
 	/* If the original working directory cannot be used for whatever reason then
 	 * move the process to a special void directory. */
@@ -302,8 +304,8 @@ static void log_startup_stage(const char *stage)
 /**
  *  sc_cleanup_preserved_process_state releases system resources.
 **/
-static void sc_cleanup_preserved_process_state(sc_preserved_process_state *
-					       proc_state)
+static void sc_cleanup_preserved_process_state(sc_preserved_process_state
+					       *proc_state)
 {
 	sc_cleanup_close(&proc_state->orig_cwd_fd);
 }
@@ -319,9 +321,17 @@ static void enter_non_classic_execution_environment(sc_invocation * inv,
 
 int main(int argc, char **argv)
 {
-	log_startup_stage("snap-confine enter");
-	// Use our super-defensive parser to figure out what we've been asked to do.
 	sc_error *err = NULL;
+
+	log_startup_stage("snap-confine enter");
+
+	// Figure out what is the SNAP_MOUNT_DIR in practice.
+	sc_probe_snap_mount_dir_from_pid_1_mount_ns(AT_FDCWD, &err);
+	sc_die_on_error(err);
+
+	debug("SNAP_MOUNT_DIR (probed): %s", sc_snap_mount_dir(NULL));
+
+	// Use our super-defensive parser to figure out what we've been asked to do.
 	struct sc_args *args SC_CLEANUP(sc_cleanup_args) = NULL;
 	sc_preserved_process_state proc_state
 	    SC_CLEANUP(sc_cleanup_preserved_process_state) = {
@@ -349,7 +359,12 @@ int main(int argc, char **argv)
 	if (snap_instance_name_env == NULL) {
 		die("SNAP_INSTANCE_NAME is not set");
 	}
-	sc_init_invocation(&invocation, args, snap_instance_name_env);
+	// SNAP_COMPONENT_NAME might not be set by the environment, so callers
+	// should be prepared to handle NULL.
+	const char *snap_component_name_env = getenv("SNAP_COMPONENT_NAME");
+
+	sc_init_invocation(&invocation, args, snap_instance_name_env,
+			   snap_component_name_env);
 
 	// Who are we?
 	uid_t real_uid, effective_uid, saved_uid;
@@ -394,7 +409,7 @@ int main(int argc, char **argv)
 		// id is non-root.  This protects against, for example, unprivileged
 		// users trying to leverage the snap-confine in the core snap to
 		// escalate privileges.
-		errno = 0; // errno is insignificant here
+		errno = 0;	// errno is insignificant here
 		die("snap-confine has elevated permissions and is not confined"
 		    " but should be. Refusing to continue to avoid"
 		    " permission escalation attacks\n"
@@ -537,11 +552,7 @@ int main(int argc, char **argv)
 	}
 	// Now that we've dropped and regained SYS_ADMIN, we can load the
 	// seccomp profiles.
-	if (sc_apply_seccomp_profile_for_security_tag(invocation.security_tag)) {
-		// If the process is not explicitly unconfined then load the
-		// global profile as well.
-		sc_apply_global_seccomp_profile();
-	}
+	sc_apply_seccomp_profile_for_security_tag(invocation.security_tag);
 	// Even though we set inheritable to 0, let's clear SYS_ADMIN
 	// explicitly
 	if (keep_sys_admin) {
@@ -566,7 +577,7 @@ int main(int argc, char **argv)
 	return 1;
 }
 
-static void enter_classic_execution_environment(const sc_invocation * inv,
+static void enter_classic_execution_environment(const sc_invocation *inv,
 						gid_t real_gid, gid_t saved_gid)
 {
 	/* with parallel-instances enabled, main() reassociated with the mount ns of
@@ -623,7 +634,87 @@ static void enter_classic_execution_environment(const sc_invocation * inv,
 	}
 }
 
-static void enter_non_classic_execution_environment(sc_invocation * inv,
+/* max wait time for /var/lib/snapd/cgroup/<snap>.devices to appear */
+static const size_t DEVICES_FILE_MAX_WAIT = 120;
+
+struct sc_device_cgroup_options {
+	bool self_managed;
+	bool non_strict;
+};
+
+static void sc_get_device_cgroup_setup(const sc_invocation *inv, struct sc_device_cgroup_options
+				       *devsetup)
+{
+	if (devsetup == NULL) {
+		die("internal error: devsetup is NULL");
+	}
+
+	char info_path[PATH_MAX] = { 0 };
+	sc_must_snprintf(info_path,
+			 sizeof info_path,
+			 "/var/lib/snapd/cgroup/snap.%s.device",
+			 inv->snap_instance);
+
+	/* TODO allow overriding timeout through env? */
+	if (!sc_wait_for_file(info_path, DEVICES_FILE_MAX_WAIT)) {
+		/* don't die explicitly here, we'll die when trying to open the file
+		 * (unless it shows up) */
+		debug("timeout waiting for devices file at %s", info_path);
+	}
+
+	FILE *stream SC_CLEANUP(sc_cleanup_file) = NULL;
+	stream = fopen(info_path, "r");
+	if (stream == NULL) {
+		die("cannot open %s", info_path);
+	}
+
+	sc_error *err SC_CLEANUP(sc_cleanup_error) = NULL;
+	char *self_managed_value SC_CLEANUP(sc_cleanup_string) = NULL;
+	if (sc_infofile_get_key
+	    (stream, "self-managed", &self_managed_value, &err) < 0) {
+		sc_die_on_error(err);
+	}
+	rewind(stream);
+
+	char *non_strict_value SC_CLEANUP(sc_cleanup_string) = NULL;
+	if (sc_infofile_get_key(stream, "non-strict", &non_strict_value, &err) <
+	    0) {
+		sc_die_on_error(err);
+	}
+
+	devsetup->self_managed = sc_streq(self_managed_value, "true");
+	devsetup->non_strict = sc_streq(non_strict_value, "true");
+}
+
+static sc_device_cgroup_mode device_cgroup_mode_for_snap(sc_invocation *inv)
+{
+    /** Conditionally create, populate and join the device cgroup. */
+	sc_device_cgroup_mode mode = SC_DEVICE_CGROUP_MODE_REQUIRED;
+
+	/* Preserve the legacy behavior of no default device cgroup for snaps
+	 * using one of the following bases. Snaps using core24 and later bases
+	 * will be placed within a device cgroup. Note that 'bare' base is also
+	 * subject to the new behavior. */
+	const char *non_required_cgroup_bases[] = {
+		"core", "core16", "core18", "core20", "core22",
+		NULL,
+	};
+	for (const char **non_required_on_base =
+	     non_required_cgroup_bases; *non_required_on_base != NULL;
+	     non_required_on_base++) {
+		if (sc_streq(inv->base_snap_name, *non_required_on_base)) {
+			debug
+			    ("device cgroup not required due to base %s",
+			     *non_required_on_base);
+			mode = SC_DEVICE_CGROUP_MODE_OPTIONAL;
+			break;
+		}
+	}
+
+	return mode;
+}
+
+static void enter_non_classic_execution_environment(sc_invocation *inv,
 						    struct sc_apparmor *aa,
 						    uid_t real_uid,
 						    gid_t real_gid,
@@ -648,8 +739,21 @@ static void enter_non_classic_execution_environment(sc_invocation * inv,
 	// Init and check rootfs_dir, apply any fallback behaviors.
 	sc_check_rootfs_dir(inv);
 
-	/** Conditionally create, populate and join the device cgroup. */
-	sc_setup_device_cgroup(inv->security_tag);
+	// Set up a device cgroup, unless the snap has been allowed to manage the
+	// device cgroup by itself.
+	struct sc_device_cgroup_options cgdevopts = { false, false };
+	sc_get_device_cgroup_setup(inv, &cgdevopts);
+	bool in_container = sc_is_in_container();
+	if (cgdevopts.self_managed) {
+		debug("device cgroup is self-managed by the snap");
+	} else if (cgdevopts.non_strict) {
+		debug("device cgroup skipped, snap in non-strict confinement");
+	} else if (in_container) {
+		debug("device cgroup skipped, executing inside a container");
+	} else {
+		sc_device_cgroup_mode mode = device_cgroup_mode_for_snap(inv);
+		sc_setup_device_cgroup(inv->security_tag, mode);
+	}
 
 	/**
 	 * is_normal_mode controls if we should pivot into the base snap.
@@ -714,7 +818,7 @@ static void enter_non_classic_execution_environment(sc_invocation * inv,
 	sc_maybe_fixup_permissions();
 	sc_maybe_fixup_udev();
 
-	/* User mount profiles do not apply to non-root users. */
+	/* User mount profiles only apply to non-root users. */
 	if (real_uid != 0) {
 		debug("joining preserved per-user mount namespace");
 		retval =

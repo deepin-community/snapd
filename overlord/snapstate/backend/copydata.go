@@ -22,7 +22,6 @@ package backend
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -235,7 +234,7 @@ func (b Backend) UndoHideSnapData(snapName string) error {
 		if firstErr == nil {
 			firstErr = err
 		} else {
-			logger.Noticef(err.Error())
+			logger.Notice(err.Error())
 		}
 	}
 
@@ -286,7 +285,7 @@ func (b Backend) UndoHideSnapData(snapName string) error {
 }
 
 var removeIfEmpty = func(dir string) error {
-	files, err := ioutil.ReadDir(dir)
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
@@ -351,7 +350,7 @@ func (b Backend) InitExposedSnapHome(snapName string, rev snap.Revision, opts *d
 		undoInfo.Created = append(undoInfo.Created, newUserHome)
 
 		userData := snap.UserDataDir(usr.HomeDir, snapName, rev, opts)
-		files, err := ioutil.ReadDir(userData)
+		files, err := os.ReadDir(userData)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				// there's nothing to copy into ~/Snap/<snap> (like on a fresh install)
@@ -400,7 +399,7 @@ func (b Backend) UndoInitExposedSnapHome(snapName string, undoInfo *UndoInfo) er
 		if firstErr == nil {
 			firstErr = err
 		} else {
-			logger.Noticef(err.Error())
+			logger.Notice(err.Error())
 		}
 	}
 

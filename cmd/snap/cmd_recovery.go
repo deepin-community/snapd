@@ -56,10 +56,21 @@ func init() {
 }
 
 func notesForSystem(sys *client.System) string {
+	var notes []string
+
 	if sys.Current {
-		return "current"
+		notes = append(notes, "current")
 	}
-	return "-"
+
+	if sys.DefaultRecoverySystem {
+		notes = append(notes, "default-recovery")
+	}
+
+	if len(notes) == 0 {
+		return "-"
+	}
+
+	return strings.Join(notes, ",")
 }
 
 func (x *cmdRecovery) showKeys(w io.Writer) error {
@@ -93,7 +104,7 @@ func (x *cmdRecovery) Execute(args []string) error {
 		return err
 	}
 	if len(systems) == 0 {
-		fmt.Fprintf(Stderr, i18n.G("No recovery systems available.\n"))
+		fmt.Fprint(Stderr, i18n.G("No recovery systems available.\n"))
 		return nil
 	}
 

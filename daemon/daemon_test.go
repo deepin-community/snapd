@@ -20,9 +20,11 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -47,6 +49,7 @@ import (
 	"github.com/snapcore/snapd/overlord/patch"
 	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
+	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/standby"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
@@ -83,6 +86,9 @@ func (s *daemonSuite) SetUpTest(c *check.C) {
 	}
 	s.notified = nil
 	s.AddCleanup(ifacestate.MockSecurityBackends(nil))
+	s.AddCleanup(MockRebootNoticeWait(0))
+
+	c.Assert(os.MkdirAll(filepath.Dir(dirs.SnapdSocket), 0755), check.IsNil)
 }
 
 func (s *daemonSuite) TearDownTest(c *check.C) {
@@ -317,7 +323,7 @@ func (s *daemonSuite) TestMaintenanceJsonDeletedOnStart(c *check.C) {
 	b, err := json.Marshal(maintErr)
 	c.Assert(err, check.IsNil)
 	c.Assert(os.MkdirAll(filepath.Dir(dirs.SnapdMaintenanceFile), 0755), check.IsNil)
-	c.Assert(ioutil.WriteFile(dirs.SnapdMaintenanceFile, b, 0644), check.IsNil)
+	c.Assert(os.WriteFile(dirs.SnapdMaintenanceFile, b, 0644), check.IsNil)
 
 	d := s.newTestDaemon(c)
 	makeDaemonListeners(c, d)
@@ -325,7 +331,7 @@ func (s *daemonSuite) TestMaintenanceJsonDeletedOnStart(c *check.C) {
 	s.markSeeded(d)
 
 	// after starting, maintenance.json should be removed
-	c.Assert(d.Start(), check.IsNil)
+	c.Assert(d.Start(context.Background()), check.IsNil)
 	c.Assert(dirs.SnapdMaintenanceFile, testutil.FileAbsent)
 	d.Stop(nil)
 }
@@ -609,7 +615,7 @@ func (s *daemonSuite) TestStartStop(c *check.C) {
 	si := &snap.SideInfo{RealName: "core", Revision: snap.R(1), SnapID: "core-snap-id"}
 	snapstate.Set(st, "core", &snapstate.SnapState{
 		Active:   true,
-		Sequence: []*snap.SideInfo{si},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si}),
 		Current:  snap.R(1),
 	})
 	st.Unlock()
@@ -629,7 +635,7 @@ version: 1`, si)
 	snapAccept := make(chan struct{})
 	d.snapListener = &witnessAcceptListener{Listener: l2, accept: snapAccept}
 
-	c.Assert(d.Start(), check.IsNil)
+	c.Assert(d.Start(context.Background()), check.IsNil)
 
 	c.Check(s.notified, check.DeepEquals, []string{extendedTimeoutUSec, "READY=1"})
 
@@ -664,6 +670,7 @@ version: 1`, si)
 
 func (s *daemonSuite) TestRestartWiring(c *check.C) {
 	d := s.newTestDaemon(c)
+
 	// mark as already seeded
 	s.markSeeded(d)
 
@@ -676,7 +683,7 @@ func (s *daemonSuite) TestRestartWiring(c *check.C) {
 	snapAccept := make(chan struct{})
 	d.snapListener = &witnessAcceptListener{Listener: l, accept: snapAccept}
 
-	c.Assert(d.Start(), check.IsNil)
+	c.Assert(d.Start(context.Background()), check.IsNil)
 	stoppedYet := false
 	defer func() {
 		if !stoppedYet {
@@ -747,7 +754,7 @@ func (s *daemonSuite) TestGracefulStop(c *check.C) {
 	si := &snap.SideInfo{RealName: "core", Revision: snap.R(1), SnapID: "core-snap-id"}
 	snapstate.Set(st, "core", &snapstate.SnapState{
 		Active:   true,
-		Sequence: []*snap.SideInfo{si},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si}),
 		Current:  snap.R(1),
 	})
 	st.Unlock()
@@ -767,7 +774,7 @@ version: 1`, si)
 	snapAccept := make(chan struct{})
 	d.snapListener = &witnessAcceptListener{Listener: snapL, accept: snapAccept}
 
-	c.Assert(d.Start(), check.IsNil)
+	c.Assert(d.Start(context.Background()), check.IsNil)
 
 	snapdAccepting := make(chan struct{})
 	go func() {
@@ -798,7 +805,7 @@ version: 1`, si)
 		res, err := http.Get(fmt.Sprintf("http://%s/endp", snapdL.Addr()))
 		c.Assert(err, check.IsNil)
 		c.Check(res.StatusCode, check.Equals, 200)
-		body, err := ioutil.ReadAll(res.Body)
+		body, err := io.ReadAll(res.Body)
 		res.Body.Close()
 		c.Assert(err, check.IsNil)
 		c.Check(string(body), check.Equals, "OKOK")
@@ -862,7 +869,7 @@ func (s *daemonSuite) TestGracefulStopHasLimits(c *check.C) {
 	snapAccept := make(chan struct{})
 	d.snapListener = &witnessAcceptListener{Listener: snapL, accept: snapAccept}
 
-	c.Assert(d.Start(), check.IsNil)
+	c.Assert(d.Start(context.Background()), check.IsNil)
 
 	snapdAccepting := make(chan struct{})
 	go func() {
@@ -958,7 +965,7 @@ func (s *daemonSuite) testRestartSystemWiring(c *check.C, prep func(d *Daemon), 
 		return nil
 	}
 
-	c.Assert(d.Start(), check.IsNil)
+	c.Assert(d.Start(context.Background()), check.IsNil)
 	defer d.Stop(nil)
 
 	st := d.overlord.State()
@@ -1015,6 +1022,9 @@ func (s *daemonSuite) testRestartSystemWiring(c *check.C, prep func(d *Daemon), 
 
 	err = d.Stop(nil)
 
+	// ensure Stop waited for at least rebootWaitTimeout
+	timeToStop := time.Since(now)
+	c.Check(timeToStop > rebootWaitTimeout+rebootNoticeWait, check.Equals, true)
 	c.Check(err, check.ErrorMatches, fmt.Sprintf("expected %s did not happen", expectedAction))
 
 	c.Check(delays, check.HasLen, 2)
@@ -1038,7 +1048,7 @@ func (s *daemonSuite) testRestartSystemWiring(c *check.C, prep func(d *Daemon), 
 
 	// finally check that maintenance.json was written appropriate for this
 	// restart reason
-	b, err := ioutil.ReadFile(dirs.SnapdMaintenanceFile)
+	b, err := os.ReadFile(dirs.SnapdMaintenanceFile)
 	c.Assert(err, check.IsNil)
 
 	maintErr := &errorResult{}
@@ -1147,7 +1157,7 @@ func (s *daemonSuite) TestRestartShutdownWithSigtermInBetween(c *check.C) {
 			c.Check(ri, check.IsNil)
 		case 2:
 			c.Check(d, check.Equals, 1*time.Minute)
-			c.Check(ri, check.DeepEquals, &boot.RebootInfo{})
+			c.Check(ri, check.IsNil)
 		default:
 			c.Error("reboot called more times than expected")
 		}
@@ -1160,7 +1170,7 @@ func (s *daemonSuite) TestRestartShutdownWithSigtermInBetween(c *check.C) {
 	makeDaemonListeners(c, d)
 	s.markSeeded(d)
 
-	c.Assert(d.Start(), check.IsNil)
+	c.Assert(d.Start(context.Background()), check.IsNil)
 	st := d.overlord.State()
 
 	st.Lock()
@@ -1200,7 +1210,7 @@ func (s *daemonSuite) TestRestartShutdown(c *check.C) {
 			c.Check(ri, check.IsNil)
 		case 2:
 			c.Check(d, check.Equals, 1*time.Minute)
-			c.Check(ri, check.DeepEquals, &boot.RebootInfo{})
+			c.Check(ri, check.IsNil)
 		default:
 			c.Error("reboot called more times than expected")
 		}
@@ -1213,7 +1223,7 @@ func (s *daemonSuite) TestRestartShutdown(c *check.C) {
 	makeDaemonListeners(c, d)
 	s.markSeeded(d)
 
-	c.Assert(d.Start(), check.IsNil)
+	c.Assert(d.Start(context.Background()), check.IsNil)
 	st := d.overlord.State()
 
 	st.Lock()
@@ -1237,7 +1247,7 @@ func (s *daemonSuite) TestRestartExpectedRebootDidNotHappen(c *check.C) {
 	c.Assert(err, check.IsNil)
 
 	fakeState := []byte(fmt.Sprintf(`{"data":{"patch-level":%d,"patch-sublevel":%d,"some":"data","refresh-privacy-key":"0123456789ABCDEF","system-restart-from-boot-id":%q,"daemon-system-restart-at":"%s"},"changes":null,"tasks":null,"last-change-id":0,"last-task-id":0,"last-lane-id":0}`, patch.Level, patch.Sublevel, curBootID, time.Now().UTC().Format(time.RFC3339)))
-	err = ioutil.WriteFile(dirs.SnapStateFile, fakeState, 0600)
+	err = os.WriteFile(dirs.SnapStateFile, fakeState, 0600)
 	c.Assert(err, check.IsNil)
 
 	oldRebootNoticeWait := rebootNoticeWait
@@ -1272,7 +1282,7 @@ func (s *daemonSuite) TestRestartExpectedRebootDidNotHappen(c *check.C) {
 	c.Check(err, check.IsNil)
 	c.Check(n, check.Equals, 1)
 
-	c.Assert(d.Start(), check.IsNil)
+	c.Assert(d.Start(context.Background()), check.IsNil)
 
 	c.Check(s.notified, check.DeepEquals, []string{"READY=1"})
 
@@ -1292,7 +1302,7 @@ func (s *daemonSuite) TestRestartExpectedRebootDidNotHappen(c *check.C) {
 
 func (s *daemonSuite) TestRestartExpectedRebootOK(c *check.C) {
 	fakeState := []byte(fmt.Sprintf(`{"data":{"patch-level":%d,"patch-sublevel":%d,"some":"data","refresh-privacy-key":"0123456789ABCDEF","system-restart-from-boot-id":%q,"daemon-system-restart-at":"%s"},"changes":null,"tasks":null,"last-change-id":0,"last-task-id":0,"last-lane-id":0}`, patch.Level, patch.Sublevel, "boot-id-0", time.Now().UTC().Format(time.RFC3339)))
-	err := ioutil.WriteFile(dirs.SnapStateFile, fakeState, 0600)
+	err := os.WriteFile(dirs.SnapStateFile, fakeState, 0600)
 	c.Assert(err, check.IsNil)
 
 	cmd := testutil.MockCommand(c, "shutdown", "")
@@ -1316,7 +1326,7 @@ func (s *daemonSuite) TestRestartExpectedRebootGiveUp(c *check.C) {
 	c.Assert(err, check.IsNil)
 
 	fakeState := []byte(fmt.Sprintf(`{"data":{"patch-level":%d,"patch-sublevel":%d,"some":"data","refresh-privacy-key":"0123456789ABCDEF","system-restart-from-boot-id":%q,"daemon-system-restart-at":"%s","daemon-system-restart-tentative":3},"changes":null,"tasks":null,"last-change-id":0,"last-task-id":0,"last-lane-id":0}`, patch.Level, patch.Sublevel, curBootID, time.Now().UTC().Format(time.RFC3339)))
-	err = ioutil.WriteFile(dirs.SnapStateFile, fakeState, 0600)
+	err = os.WriteFile(dirs.SnapStateFile, fakeState, 0600)
 	c.Assert(err, check.IsNil)
 
 	cmd := testutil.MockCommand(c, "shutdown", "")
@@ -1346,7 +1356,7 @@ func (s *daemonSuite) TestRestartIntoSocketModeNoNewChanges(c *check.C) {
 	// go into socket activation mode
 	s.markSeeded(d)
 
-	c.Assert(d.Start(), check.IsNil)
+	c.Assert(d.Start(context.Background()), check.IsNil)
 	// pretend some ensure happened
 	for i := 0; i < 5; i++ {
 		c.Check(d.overlord.StateEngine().Ensure(), check.IsNil)
@@ -1376,7 +1386,7 @@ func (s *daemonSuite) TestRestartIntoSocketModePendingChanges(c *check.C) {
 	s.markSeeded(d)
 	st := d.overlord.State()
 
-	c.Assert(d.Start(), check.IsNil)
+	c.Assert(d.Start(context.Background()), check.IsNil)
 	// pretend some ensure happened
 	for i := 0; i < 5; i++ {
 		c.Check(d.overlord.StateEngine().Ensure(), check.IsNil)
@@ -1458,4 +1468,112 @@ func (s *daemonSuite) TestDegradedModeReply(c *check.C) {
 	d.SetDegradedMode(nil)
 	rec = doTestReq(c, cmd, "POST")
 	c.Check(rec.Code, check.Equals, 200)
+}
+
+func (s *daemonSuite) TestHandleUnexpectedRestart(c *check.C) {
+	os.Setenv("SNAPD_REVERT_TO_REV", "999")
+	defer os.Unsetenv("SNAPD_REVERT_TO_REV")
+
+	d := s.newTestDaemon(c)
+
+	// mark as already seeded
+	s.markSeeded(d)
+
+	c.Assert(d.Start(context.Background()), check.Equals, ErrNoFailureRecoveryNeeded)
+}
+
+func clientForSnapdSocket() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Dial: func(_, _ string) (net.Conn, error) {
+				return net.Dial("unix", dirs.SnapdSocket)
+			},
+		},
+	}
+}
+
+func (s *daemonSuite) TestRequestContextCanceledOnStop(c *check.C) {
+	d, err := New()
+	c.Assert(err, check.IsNil)
+	// don't talk to the store, needs to be called after daemon.New()
+	snapstate.CanAutoRefresh = nil
+
+	// mark as already seeded
+	s.markSeeded(d)
+
+	c.Assert(d.Init(), check.IsNil)
+
+	gotReqC := make(chan struct{})
+	reqErrC := make(chan error, 1)
+	d.router.HandleFunc("/test-call", func(w http.ResponseWriter, r *http.Request) {
+		close(gotReqC)
+		// since Stop() is called in the test, the request will get
+		// canceled
+		<-r.Context().Done()
+		reqErrC <- r.Context().Err()
+		w.WriteHeader(500)
+	})
+
+	client := clientForSnapdSocket()
+
+	req, err := http.NewRequest("GET", "http://localhost/test-call", nil)
+	c.Assert(err, check.IsNil)
+
+	c.Assert(d.Start(context.Background()), check.IsNil)
+
+	clientC := make(chan struct{})
+	go func() {
+		// this will block until we call stop
+		r, err := client.Do(req)
+		if r != nil {
+			defer r.Body.Close()
+		}
+		c.Check(err, check.IsNil)
+		close(clientC)
+	}()
+
+	<-gotReqC
+	d.Stop(nil)
+	reqErr := <-reqErrC
+	c.Check(errors.Is(reqErr, context.Canceled), check.Equals, true,
+		check.Commentf("unexpected error %v", reqErr))
+	<-clientC
+}
+
+func (s *daemonSuite) TestRequestContextPropagated(c *check.C) {
+	d, err := New()
+	c.Assert(err, check.IsNil)
+	// don't talk to the store, needs to be called after daemon.New()
+	snapstate.CanAutoRefresh = nil
+
+	// mark as already seeded
+	s.markSeeded(d)
+
+	c.Assert(d.Init(), check.IsNil)
+
+	type testKey struct{}
+
+	reqC := make(chan any, 1)
+	d.router.HandleFunc("/test-call", func(w http.ResponseWriter, r *http.Request) {
+		defer close(reqC)
+		reqC <- r.Context().Value(testKey{})
+	})
+
+	client := clientForSnapdSocket()
+
+	req, err := http.NewRequest("GET", "http://localhost/test-call", nil)
+	c.Assert(err, check.IsNil)
+
+	ctx := context.WithValue(context.Background(), testKey{}, "hello")
+	c.Assert(d.Start(ctx), check.IsNil)
+
+	r, err := client.Do(req)
+	if r != nil {
+		defer r.Body.Close()
+	}
+	c.Check(err, check.IsNil)
+
+	v := <-reqC
+	c.Assert(v, check.DeepEquals, "hello")
+	d.Stop(nil)
 }

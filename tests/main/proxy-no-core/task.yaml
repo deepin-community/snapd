@@ -1,5 +1,12 @@
 summary: Ensure that the core.proxy.* settings are honored without core
 
+details: |
+  Snapd provides the core.proxy.* config which can be used to setup the proxy used.
+
+  This test verifies that when a proxy config is set, the snapd commands go through
+  the proxy. In this scenario it is verified that snap install works even without
+  an installed core (to install core).
+
 # only needs a test on classic
 systems: [ubuntu-16.04-64, ubuntu-18.04-64]
 
@@ -21,8 +28,6 @@ execute: |
        echo "SKIP: need python3"
        exit 0
     fi
-    #shellcheck source=tests/lib/systemd.sh
-    . "$TESTSLIB"/systemd.sh
     systemctl stop snapd.socket snapd.service
     rm -rf /var/lib/snapd/state.json
     systemctl start snapd.socket snapd.service
@@ -34,9 +39,7 @@ execute: |
 
     # run a proxy that can access http/https (via the owner rule)
     systemd-run --service-type=notify --uid=test --unit tinyproxy -- python3 "$TESTSLIB/tinyproxy/tinyproxy.py"
-    # shellcheck source=tests/lib/systemd.sh
-    . "$TESTSLIB/systemd.sh"
-    wait_for_service tinyproxy
+    tests.systemd wait-for-service -n 30 --state active tinyproxy
 
     echo "Ensure normal install without proxy does not work"
     if snap install core; then

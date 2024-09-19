@@ -1,5 +1,11 @@
-summary: |
-    Test a remodel that switches to a new kernel
+summary: Test a remodel that switches to a new kernel
+
+details: |
+    Check that is it possible to `snap remodel` to a new kernel.
+    Verify after the reboot the new kernel is installed, the new
+    model assertion is being used and it is not possible to remove
+    the new kernel snap. Finally check it is possible to remodel
+    back to the initial model.
 
 # FIXME: add core18 test as well
 # TODO:UC20: enable for UC20
@@ -12,8 +18,6 @@ environment:
 prepare: |
     #shellcheck source=tests/lib/core-config.sh
     . "$TESTSLIB"/core-config.sh
-    #shellcheck source=tests/lib/systemd.sh
-    . "$TESTSLIB"/systemd.sh
 
     # Save the revision of the pc-kernel snap.
     readlink /snap/"$OLD_KERNEL"/current > original-revision.txt
@@ -38,8 +42,6 @@ prepare: |
 restore: |
     #shellcheck source=tests/lib/core-config.sh
     . "$TESTSLIB"/core-config.sh
-    #shellcheck source=tests/lib/systemd.sh
-    . "$TESTSLIB"/systemd.sh
 
     # Wait for the final refresh to complete (if needed).
     snap watch --last=refresh?

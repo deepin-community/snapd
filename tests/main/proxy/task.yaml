@@ -1,5 +1,11 @@
 summary: Ensure that the core.proxy.* settings are honored
 
+details: |
+  Snapd provides the core.proxy.* config which can be used to setup the proxy used.
+
+  This test verifies that when a proxy config is set, the snapd commands go through
+  the proxy.
+
 # ubuntu-14.04 does not have systemd-run
 systems: [-ubuntu-14.04-*]
 
@@ -19,9 +25,7 @@ execute: |
     fi
 
     systemd-run --service-type=notify --unit tinyproxy -- python3 "$TESTSLIB/tinyproxy/tinyproxy.py"
-    # shellcheck source=tests/lib/systemd.sh
-    . "$TESTSLIB/systemd.sh"
-    wait_for_service tinyproxy
+    tests.systemd wait-for-service -n 30 --state active tinyproxy
 
     echo "Setup proxy config"
     snap set core proxy.https=http://localhost:3128

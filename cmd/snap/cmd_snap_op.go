@@ -36,6 +36,7 @@ import (
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/release"
+	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/channel"
 	"github.com/snapcore/snapd/strutil"
 )
@@ -54,6 +55,12 @@ The install command installs the named snaps on the system.
 
 To install multiple instances of the same snap, append an underscore and a
 unique identifier (for each instance) to a snap's name.
+
+Parallel instances are installed with --unaliased passed implicitly to avoid
+conflicts with existing installs. This behaviour can be altered by passing
+--prefer which will enable all aliases of the given snap in preference to
+conflicting aliases of other snaps whose automatic aliases will be disabled and
+manual aliases will be removed.
 
 With no further options, the snaps are installed tracking the stable channel,
 with strict security confinement. All available channels of a snap are listed in
@@ -132,10 +139,73 @@ type cmdRemove struct {
 	} `positional-args:"yes" required:"yes"`
 }
 
-func (x *cmdRemove) removeOne(opts *client.SnapOptions) error {
-	name := string(x.Positional.Snaps[0])
+func showRemoved(expectedSnaps []string, expectedComps map[string][]string, snapToRev map[string]string, removed *changedSnapsData) {
+	showRemovedSnaps(expectedSnaps, removed.names, snapToRev)
+	showRemovedComponents(expectedComps, removed.comps)
+}
 
-	changeID, err := x.client.Remove(name, opts)
+func showRemovedSnaps(expectedSnaps []string, removedSnaps []string, snapToRev map[string]string) {
+	seen := make(map[string]bool)
+	for _, name := range removedSnaps {
+		if rev, ok := snapToRev[name]; ok {
+			fmt.Fprintf(Stdout, i18n.G("%s (revision %s) removed\n"), name, rev)
+		} else {
+			fmt.Fprintf(Stdout, i18n.G("%s removed\n"), name)
+		}
+		seen[name] = true
+	}
+	for _, name := range expectedSnaps {
+		if !seen[name] {
+			// FIXME: this is the only reason why a name can be
+			// skipped, but it does feel awkward
+			fmt.Fprintf(Stdout, i18n.G("%s not installed\n"), name)
+		}
+	}
+}
+
+func showRemovedComponents(expectedBySnap, removedBySnap map[string][]string) {
+	snapCompsSeen := make(map[string]bool, len(removedBySnap))
+	for snapName, removedComps := range removedBySnap {
+		snapCompsSeen[snapName] = true
+
+		for _, comp := range removedComps {
+			fmt.Fprintf(Stdout, i18n.G("component %s for %s removed\n"), comp, snapName)
+		}
+
+		expected := expectedBySnap[snapName]
+		for _, comp := range expected {
+			if strutil.ListContains(removedComps, comp) {
+				continue
+			}
+			// FIXME: this is the only reason why a name can be
+			// skipped, but it does feel awkward
+			fmt.Fprintf(Stdout, i18n.G("component %s for %s is not installed\n"),
+				comp, snapName)
+		}
+	}
+	// Case of no component of the expected ones removed for a snap
+	for snapWithComps, expected := range expectedBySnap {
+		if _, ok := snapCompsSeen[snapWithComps]; ok {
+			continue
+		}
+		for _, comp := range expected {
+			// See FIXME comment above
+			fmt.Fprintf(Stdout, i18n.G("component %s for %s is not installed\n"),
+				comp, snapWithComps)
+		}
+	}
+}
+
+func (x *cmdRemove) removeOne(opts *client.SnapOptions) error {
+	arg := string(x.Positional.Snaps[0])
+
+	name, comps := snap.SplitSnapInstanceAndComponents(arg)
+	if name == "" {
+		return errors.New(i18n.G("no snap for the component(s) was specified"))
+	}
+	// If there are components, only the components will be removed,
+	// otherwise the full snap with its components will be removed.
+	changeID, err := x.client.Remove(name, comps, opts)
 	if err != nil {
 		msg, err := errorToCmdMessage(name, "remove", err, opts)
 		if err != nil {
@@ -145,24 +215,66 @@ func (x *cmdRemove) removeOne(opts *client.SnapOptions) error {
 		return nil
 	}
 
-	if _, err := x.wait(changeID); err != nil {
+	chg, err := x.wait(changeID)
+	if err != nil {
 		if err == noWait {
 			return nil
 		}
 		return err
 	}
 
-	if opts.Revision != "" {
-		fmt.Fprintf(Stdout, i18n.G("%s (revision %s) removed\n"), name, opts.Revision)
-	} else {
-		fmt.Fprintf(Stdout, i18n.G("%s removed\n"), name)
+	changes, err := changedSnapsFromChange(chg)
+	if err != nil {
+		return err
 	}
+
+	expectedRemovedSnaps := []string{}
+	snapToRev := map[string]string{}
+	if len(comps) == 0 {
+		expectedRemovedSnaps = []string{name}
+		if opts.Revision != "" {
+			snapToRev[name] = opts.Revision
+		}
+	}
+	showRemoved(expectedRemovedSnaps, map[string][]string{name: comps}, snapToRev, changes)
+
 	return nil
+}
+
+// snapInstancesAndComponentsFromNames splits a slice of names of the form
+// <snap_instance>+<comp1>...+<compN> into a slice of snap instances and a map
+// from these instances to components.
+func snapInstancesAndComponentsFromNames(names []string, forInstall bool) ([]string, map[string][]string, error) {
+	snaps := make([]string, 0, len(names))
+	allComps := make(map[string][]string, len(names))
+	for _, name := range names {
+		snap, comps := snap.SplitSnapInstanceAndComponents(name)
+		if snap == "" {
+			return nil, nil, errors.New(i18n.G("no snap for the component(s) was specified"))
+		}
+		// When installing we implicitly want to install the snap when
+		// we have specified also components, but when removing we
+		// actually want to remove only components if any of them have
+		// been specified.
+		if forInstall || len(comps) == 0 {
+			snaps = append(snaps, snap)
+		}
+		if len(comps) > 0 {
+			allComps[snap] = comps
+		}
+	}
+	return snaps, allComps, nil
 }
 
 func (x *cmdRemove) removeMany(opts *client.SnapOptions) error {
 	names := installedSnapNames(x.Positional.Snaps)
-	changeID, err := x.client.RemoveMany(names, opts)
+
+	const forInstall = false
+	names, comps, err := snapInstancesAndComponentsFromNames(names, forInstall)
+	if err != nil {
+		return err
+	}
+	changeID, err := x.client.RemoveMany(names, comps, opts)
 	if err != nil {
 		var name string
 		if cerr, ok := err.(*client.Error); ok {
@@ -187,26 +299,13 @@ func (x *cmdRemove) removeMany(opts *client.SnapOptions) error {
 		return err
 	}
 
-	var removed []string
-	if err := chg.Get("snap-names", &removed); err != nil && err != client.ErrNoData {
+	changes, err := changedSnapsFromChange(chg)
+	if err != nil {
 		return err
 	}
 
-	seen := make(map[string]bool)
-	for _, name := range removed {
-		fmt.Fprintf(Stdout, i18n.G("%s removed\n"), name)
-		seen[name] = true
-	}
-	for _, name := range names {
-		if !seen[name] {
-			// FIXME: this is the only reason why a name can be
-			// skipped, but it does feel awkward
-			fmt.Fprintf(Stdout, i18n.G("%s not installed\n"), name)
-		}
-	}
-
+	showRemoved(names, comps, nil, changes)
 	return nil
-
 }
 
 func (x *cmdRemove) Execute([]string) error {
@@ -344,10 +443,118 @@ func maybeWithSudoSecurePath() bool {
 	return release.DistroLike("fedora", "opensuse", "debian")
 }
 
+// changedSnapsData stores api data returned for snap actions.
+type changedSnapsData struct {
+	// snap instance names
+	names []string
+	// Map of snap instance names to components
+	comps map[string][]string
+}
+
+func changedSnapsFromChange(chg *client.Change) (*changedSnapsData, error) {
+	var snapNames []string
+	err := chg.Get("snap-names", &snapNames)
+	// No snap-names could be ok if there are components
+	if err != nil && !errors.Is(err, client.ErrNoData) {
+		return nil, err
+	}
+
+	var compsPerSnap map[string][]string
+	compErr := chg.Get("components", &compsPerSnap)
+	if compErr != nil && !errors.Is(compErr, client.ErrNoData) {
+		return nil, err
+	}
+
+	if err != nil && compErr != nil {
+		// Must be client.ErrNoData
+		return nil, err
+	}
+
+	return &changedSnapsData{
+		names: snapNames,
+		comps: compsPerSnap,
+	}, nil
+}
+
+func (csd *changedSnapsData) hasChanges() bool {
+	return len(csd.names) > 0 || len(csd.comps) > 0
+}
+
+// changedSnaps returns the snaps names touched by a change and a set of the
+// snaps for which the change was not exclusively because of changes to its
+// components.
+func (csd *changedSnapsData) changedSnaps() (names []string, notOnlyComps map[string]bool) {
+	names = make([]string, 0, len(csd.comps)+len(csd.names))
+	notOnlyComps = make(map[string]bool, len(csd.names))
+	for inst := range csd.comps {
+		names = append(names, inst)
+	}
+	for _, inst := range csd.names {
+		notOnlyComps[inst] = true
+		// if in comps, it has already been added
+		if _, ok := csd.comps[inst]; ok {
+			continue
+		}
+		names = append(names, inst)
+	}
+
+	return names, notOnlyComps
+}
+
+func compByName(compName string, snap *client.Snap) *client.Component {
+	for _, comp := range snap.Components {
+		if compName == comp.Name {
+			return &comp
+		}
+	}
+	return nil
+}
+
+func showDoneSnap(snap *client.Snap, channel, action string, esc *escapes) {
+	if snap.Publisher != nil {
+		// TRANSLATORS: the args are a snap name optionally followed by
+		// a channel, then a version, then the developer name (e.g.
+		// "some-snap (beta) 1.3 from Alice installed")
+		fmt.Fprintf(Stdout, i18n.G("%s%s %s from %s %s\n"),
+			snap.Name, channel, snap.Version, longPublisher(esc, snap.Publisher), action)
+	} else {
+		// TRANSLATORS: the args are a snap name optionally followed by
+		// a channel, then a version (e.g. "some-snap (beta) 1.3
+		// installed")
+		fmt.Fprintf(Stdout, i18n.G("%s%s %s %s\n"), snap.Name, channel, snap.Version, action)
+	}
+}
+
+func showDoneComps(snap *client.Snap, compsForSnap []string, channel, action string) {
+	for _, compName := range compsForSnap {
+		comp := compByName(compName, snap)
+		if comp == nil {
+			fmt.Fprintf(Stdout, i18n.G("Warning: component %s for %s%s %s not present\n"),
+				compName, snap.Name, channel, snap.Version)
+		} else {
+			fmt.Fprintf(Stdout, i18n.G("component %s %s for %s%s %s %s\n"),
+				compName, comp.Version, snap.Name, channel, snap.Version, action)
+		}
+	}
+}
+
 // show what has been done
-func showDone(cli *client.Client, names []string, op string, opts *client.SnapOptions, esc *escapes) error {
-	snaps, err := cli.List(names, nil)
+func showDone(cli *client.Client, chg *client.Change, snapsData *changedSnapsData, op string, opts *client.SnapOptions, esc *escapes) error {
+	if chg.Status == "Wait" {
+		fmt.Fprintf(Stdout, i18n.G("Change %v waiting on external action to be completed\n"), chg.ID)
+		return nil
+	}
+
+	instances, notOnlyComps := snapsData.changedSnaps()
+	snaps, err := cli.List(instances, nil)
 	if err != nil {
+		// XXX: When this is called snapd might have gone down - so we add detection code here
+		// even thought it does not belong here. The detection code for snapd being down
+		// and the maintenance message should be commonly handled in doSync() in the client
+		// code and not here (/wait.go)
+		if e, ok := cli.Maintenance().(*client.Error); ok && e.Kind == client.ErrorKindSystemRestart {
+			return e
+		}
 		return err
 	}
 
@@ -365,35 +572,34 @@ func showDone(cli *client.Client, names []string, op string, opts *client.SnapOp
 		}
 		switch op {
 		case "install":
-			if needsPathWarning {
-				head := i18n.G("Warning:")
-				warn := fill(fmt.Sprintf(i18n.G("%s was not found in your $PATH. If you've not restarted your session since you installed snapd, try doing that. Please see https://forum.snapcraft.io/t/9469 for more details."), dirs.SnapBinariesDir), utf8.RuneCountInString(head)+1) // +1 for the space
-				fmt.Fprint(Stderr, esc.bold, head, esc.end, " ", warn, "\n\n")
-				needsPathWarning = false
-			}
+			if notOnlyComps[snap.Name] {
+				if needsPathWarning {
+					head := i18n.G("Warning:")
+					warn := fill(fmt.Sprintf(i18n.G("%s was not found in your $PATH. If you've not restarted your session since you installed snapd, try doing that. Please see https://forum.snapcraft.io/t/9469 for more details."), dirs.SnapBinariesDir), utf8.RuneCountInString(head)+1) // +1 for the space
+					fmt.Fprint(Stderr, esc.bold, head, esc.end, " ", warn, "\n\n")
+					needsPathWarning = false
+				}
 
-			if opts != nil && opts.Classic && snap.Confinement != client.ClassicConfinement {
-				// requested classic but the snap is not classic
-				head := i18n.G("Warning:")
-				// TRANSLATORS: the arg is a snap name (e.g. "some-snap")
-				warn := fill(fmt.Sprintf(i18n.G("flag --classic ignored for strictly confined snap %s"), snap.Name), utf8.RuneCountInString(head)+1) // +1 for the space
-				fmt.Fprint(Stderr, esc.bold, head, esc.end, " ", warn, "\n\n")
-			}
+				if opts != nil && opts.Classic && snap.Confinement != client.ClassicConfinement {
+					// requested classic but the snap is not classic
+					head := i18n.G("Warning:")
+					// TRANSLATORS: the arg is a snap name (e.g. "some-snap")
+					warn := fill(fmt.Sprintf(i18n.G("flag --classic ignored for strictly confined snap %s"), snap.Name), utf8.RuneCountInString(head)+1) // +1 for the space
+					fmt.Fprint(Stderr, esc.bold, head, esc.end, " ", warn, "\n\n")
+				}
 
-			if snap.Publisher != nil {
-				// TRANSLATORS: the args are a snap name optionally followed by a channel, then a version, then the developer name (e.g. "some-snap (beta) 1.3 from Alice installed")
-				fmt.Fprintf(Stdout, i18n.G("%s%s %s from %s installed\n"), snap.Name, channelStr, snap.Version, longPublisher(esc, snap.Publisher))
-			} else {
-				// TRANSLATORS: the args are a snap name optionally followed by a channel, then a version (e.g. "some-snap (beta) 1.3 installed")
-				fmt.Fprintf(Stdout, i18n.G("%s%s %s installed\n"), snap.Name, channelStr, snap.Version)
+				showDoneSnap(snap, channelStr, "installed", esc)
+			}
+			if comps, ok := snapsData.comps[snap.Name]; ok {
+				showDoneComps(snap, comps, channelStr, "installed")
 			}
 		case "refresh":
-			if snap.Publisher != nil {
-				// TRANSLATORS: the args are a snap name optionally followed by a channel, then a version, then the developer name (e.g. "some-snap (beta) 1.3 from Alice refreshed")
-				fmt.Fprintf(Stdout, i18n.G("%s%s %s from %s refreshed\n"), snap.Name, channelStr, snap.Version, longPublisher(esc, snap.Publisher))
-			} else {
-				// TRANSLATORS: the args are a snap name optionally followed by a channel, then a version (e.g. "some-snap (beta) 1.3 refreshed")
-				fmt.Fprintf(Stdout, i18n.G("%s%s %s refreshed\n"), snap.Name, channelStr, snap.Version)
+			if notOnlyComps[snap.Name] {
+				showDoneSnap(snap, channelStr, "refreshed", esc)
+
+			}
+			if comps, ok := snapsData.comps[snap.Name]; ok {
+				showDoneComps(snap, comps, channelStr, "refreshed")
 			}
 		case "revert":
 			// TRANSLATORS: first %s is a snap name, second %s is a revision
@@ -490,6 +696,7 @@ type cmdInstall struct {
 	ForceDangerous bool `long:"force-dangerous" hidden:"yes"`
 
 	Unaliased bool `long:"unaliased"`
+	Prefer    bool `long:"prefer"`
 
 	Name string `long:"name"`
 
@@ -509,7 +716,7 @@ func (x *cmdInstall) installOne(nameOrPath, desiredName string, opts *client.Sna
 	var snapName string
 	var path string
 
-	if isLocalSnap(nameOrPath) {
+	if isLocalContainer(nameOrPath) {
 		// don't log the request's body because the encoded snap is large.
 		x.client.SetMayLogBody(false)
 		path = nameOrPath
@@ -519,7 +726,13 @@ func (x *cmdInstall) installOne(nameOrPath, desiredName string, opts *client.Sna
 		if desiredName != "" {
 			return errors.New(i18n.G("cannot use explicit name when installing from store"))
 		}
-		changeID, err = x.client.Install(snapName, opts)
+
+		name, comps := snap.SplitSnapInstanceAndComponents(snapName)
+		if name == "" {
+			return errors.New(i18n.G("no snap for the component(s) was specified"))
+		}
+
+		changeID, err = x.client.Install(name, comps, opts)
 	}
 	if err != nil {
 		msg, err := errorToCmdMessage(nameOrPath, "install", err, opts)
@@ -538,26 +751,30 @@ func (x *cmdInstall) installOne(nameOrPath, desiredName string, opts *client.Sna
 		return err
 	}
 
-	// extract the snapName from the change, important for sideloaded
-	if path != "" {
-		if err := chg.Get("snap-name", &snapName); err != nil {
-			return fmt.Errorf("cannot extract the snap-name from local file %q: %s", nameOrPath, err)
-		}
+	changedSnaps, err := changedSnapsFromChange(chg)
+
+	// TODO: if we're waiting, then there won't be any changed snaps. showDone
+	// will catch the case where we're waiting. might want to move this code
+	// around a bit
+	if err != nil && chg.Status != "Wait" {
+		return fmt.Errorf("cannot extract the snap-name from change: %w", err)
 	}
 
 	// TODO: mention details of the install (e.g. like switch does)
-	return showDone(x.client, []string{snapName}, "install", opts, x.getEscapes())
+	return showDone(x.client, chg, changedSnaps, "install", opts, x.getEscapes())
 }
 
-func isLocalSnap(name string) bool {
-	return strings.Contains(name, "/") || strings.HasSuffix(name, ".snap") || strings.Contains(name, ".snap.")
+func isLocalContainer(name string) bool {
+	return strings.Contains(name, "/") ||
+		strings.HasSuffix(name, ".snap") || strings.Contains(name, ".snap.") ||
+		strings.HasSuffix(name, ".comp") || strings.Contains(name, ".comp.")
 }
 
 func (x *cmdInstall) installMany(names []string, opts *client.SnapOptions) error {
-	isLocal := isLocalSnap(names[0])
+	isLocal := isLocalContainer(names[0])
 	for _, name := range names {
-		if isLocalSnap(name) != isLocal {
-			return fmt.Errorf(i18n.G("cannot install local and store snaps at the same time"))
+		if isLocalContainer(name) != isLocal {
+			return errors.New(i18n.G("cannot install local and store snaps at the same time"))
 		}
 	}
 
@@ -573,7 +790,12 @@ func (x *cmdInstall) installMany(names []string, opts *client.SnapOptions) error
 			return errors.New(i18n.G("cannot specify mode for multiple store snaps (only for one store snap or several local ones)"))
 		}
 
-		changeID, err = x.client.InstallMany(names, opts)
+		const forInstall = true
+		names, compsBySnap, e := snapInstancesAndComponentsFromNames(names, forInstall)
+		if e != nil {
+			return e
+		}
+		changeID, err = x.client.InstallMany(names, compsBySnap, opts)
 	}
 
 	if err != nil {
@@ -597,13 +819,14 @@ func (x *cmdInstall) installMany(names []string, opts *client.SnapOptions) error
 		return err
 	}
 
-	var installed []string
-	if err := chg.Get("snap-names", &installed); err != nil && err != client.ErrNoData {
+	changedSnaps, err := changedSnapsFromChange(chg)
+	if err != nil && err != client.ErrNoData {
 		return err
 	}
 
-	if len(installed) > 0 {
-		if err := showDone(x.client, installed, "install", opts, x.getEscapes()); err != nil {
+	// changedSnaps might be nil in some operations with the fakestore
+	if changedSnaps != nil && changedSnaps.hasChanges() {
+		if err := showDone(x.client, chg, changedSnaps, "install", opts, x.getEscapes()); err != nil {
 			return err
 		}
 	}
@@ -615,8 +838,10 @@ func (x *cmdInstall) installMany(names []string, opts *client.SnapOptions) error
 
 	// show skipped
 	seen := make(map[string]bool)
-	for _, name := range installed {
-		seen[name] = true
+	if changedSnaps != nil {
+		for _, name := range changedSnaps.names {
+			seen[name] = true
+		}
 	}
 	for _, name := range names {
 		if !seen[name] {
@@ -648,6 +873,7 @@ func (x *cmdInstall) Execute([]string) error {
 		IgnoreRunning:    x.IgnoreRunning,
 		Transaction:      x.Transaction,
 		QuotaGroupName:   x.QuotaGroupName,
+		Prefer:           x.Prefer,
 	}
 	x.setModes(opts)
 
@@ -667,6 +893,9 @@ func (x *cmdInstall) Execute([]string) error {
 	}
 	if x.IgnoreValidation {
 		return errors.New(i18n.G("a single snap name must be specified when ignoring validation"))
+	}
+	if x.Prefer {
+		return errors.New(i18n.G("a single snap name is needed to specify the prefer flag"))
 	}
 
 	if x.Name != "" {
@@ -712,13 +941,14 @@ func (x *cmdRefresh) refreshMany(snaps []string, opts *client.SnapOptions) error
 		return err
 	}
 
-	var refreshed []string
-	if err := chg.Get("snap-names", &refreshed); err != nil && err != client.ErrNoData {
+	changedSnaps, err := changedSnapsFromChange(chg)
+	if err != nil && err != client.ErrNoData {
 		return err
 	}
 
-	if len(refreshed) > 0 {
-		return showDone(x.client, refreshed, "refresh", opts, x.getEscapes())
+	// changedSnaps might be nil in some operations with the fakestore
+	if changedSnaps != nil && changedSnaps.hasChanges() {
+		return showDone(x.client, chg, changedSnaps, "refresh", opts, x.getEscapes())
 	}
 
 	fmt.Fprintln(Stderr, i18n.G("All snaps up to date."))
@@ -737,7 +967,8 @@ func (x *cmdRefresh) refreshOne(name string, opts *client.SnapOptions) error {
 		return nil
 	}
 
-	if _, err := x.wait(changeID); err != nil {
+	chg, err := x.wait(changeID)
+	if err != nil {
 		if err == noWait {
 			return nil
 		}
@@ -746,7 +977,7 @@ func (x *cmdRefresh) refreshOne(name string, opts *client.SnapOptions) error {
 
 	// TODO: this doesn't really tell about all the things you
 	// could set while refreshing (something switch does)
-	return showDone(x.client, []string{name}, "refresh", opts, x.getEscapes())
+	return showDone(x.client, chg, &changedSnapsData{names: []string{name}, comps: nil}, "refresh", opts, x.getEscapes())
 }
 
 func parseSysinfoTime(s string) time.Time {
@@ -982,7 +1213,7 @@ func (x *cmdRefresh) unholdRefreshes() (err error) {
 	}
 
 	if len(names) == 0 {
-		fmt.Fprintf(Stdout, i18n.G("Removed auto-refresh hold on all snaps\n"))
+		fmt.Fprint(Stdout, i18n.G("Removed auto-refresh hold on all snaps\n"))
 	} else {
 		fmt.Fprintf(Stdout, i18n.G("Removed general refresh hold of %s\n"), strutil.Quoted(names))
 	}
@@ -1030,7 +1261,7 @@ func (x *cmdTry) Execute([]string) error {
 			}
 		}
 		if name == "" {
-			return fmt.Errorf(i18n.G("error: the `<snap-dir>` argument was not provided and couldn't be inferred"))
+			return errors.New(i18n.G("error: the `<snap-dir>` argument was not provided and couldn't be inferred"))
 		}
 	}
 
@@ -1059,12 +1290,16 @@ func (x *cmdTry) Execute([]string) error {
 	}
 
 	// extract the snap name
-	var snapName string
-	if err := chg.Get("snap-name", &snapName); err != nil {
+	changedSnaps, err := changedSnapsFromChange(chg)
+	if err != nil {
 		// TRANSLATORS: %q gets the snap name, %v gets the resulting error message
 		return fmt.Errorf(i18n.G("cannot extract the snap-name from local file %q: %v"), name, err)
 	}
-	name = snapName
+	if len(changedSnaps.names) != 1 {
+		return errors.New(i18n.G("internal error, wrong number of snaps in change"))
+	}
+
+	name = changedSnaps.names[0]
 
 	// show output as speced
 	snaps, err := x.client.List([]string{name}, nil)
@@ -1176,14 +1411,16 @@ func (x *cmdRevert) Execute(args []string) error {
 		return err
 	}
 
-	if _, err := x.wait(changeID); err != nil {
+	chg, err := x.wait(changeID)
+	if err != nil {
 		if err == noWait {
 			return nil
 		}
 		return err
 	}
 
-	return showDone(x.client, []string{name}, "revert", nil, nil)
+	return showDone(x.client, chg, &changedSnapsData{names: []string{name}, comps: nil},
+		"revert", nil, nil)
 }
 
 var shortSwitchHelp = i18n.G("Switches snap to a different channel")
@@ -1221,10 +1458,10 @@ func (x cmdSwitch) Execute(args []string) error {
 	// the 5 valid cases are handled by showDone.
 	if switchCohort && x.LeaveCohort {
 		// this one counts as two (no channel filter)
-		return fmt.Errorf(i18n.G("cannot specify both --cohort and --leave-cohort"))
+		return errors.New(i18n.G("cannot specify both --cohort and --leave-cohort"))
 	}
 	if !switchCohort && !x.LeaveCohort && !switchChannel {
-		return fmt.Errorf(i18n.G("nothing to switch; specify --channel (and/or one of --cohort/--leave-cohort)"))
+		return errors.New(i18n.G("nothing to switch; specify --channel (and/or one of --cohort/--leave-cohort)"))
 	}
 
 	opts := &client.SnapOptions{
@@ -1237,14 +1474,16 @@ func (x cmdSwitch) Execute(args []string) error {
 		return err
 	}
 
-	if _, err := x.wait(changeID); err != nil {
+	chg, err := x.wait(changeID)
+	if err != nil {
 		if err == noWait {
 			return nil
 		}
 		return err
 	}
 
-	return showDone(x.client, []string{name}, "switch", opts, nil)
+	return showDone(x.client, chg, &changedSnapsData{names: []string{name}, comps: nil},
+		"switch", opts, nil)
 }
 
 func init() {
@@ -1277,6 +1516,8 @@ func init() {
 			"transaction": i18n.G("Have one transaction per-snap or one for all the specified snaps"),
 			// TRANSLATORS: This should not start with a lowercase letter.
 			"quota-group": i18n.G("Add the snap to a quota group on install"),
+			// TRANSLATORS: This should not start with a lowercase letter.
+			"prefer": i18n.G("Enable all aliases of the given snap in preference to conflicting aliases of other snaps"),
 		}), nil)
 	addCommand("refresh", shortRefreshHelp, longRefreshHelp, func() flags.Commander { return &cmdRefresh{} },
 		colorDescs.also(waitDescs).also(channelDescs).also(modeDescs).also(timeDescs).also(map[string]string{

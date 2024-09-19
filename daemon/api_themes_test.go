@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2020 Canonical Ltd
+ * Copyright (C) 2020-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -72,8 +72,8 @@ func (s *themesSuite) daemon(c *C) *daemon.Daemon {
 }
 
 func (s *themesSuite) expectThemesAccess() {
-	s.expectReadAccess(daemon.ThemesOpenAccess{})
-	s.expectWriteAccess(daemon.ThemesAuthenticatedAccess{Polkit: "io.snapcraft.snapd.manage"})
+	s.expectReadAccess(daemon.InterfaceOpenAccess{Interfaces: []string{"snap-themes-control"}})
+	s.expectWriteAccess(daemon.InterfaceAuthenticatedAccess{Interfaces: []string{"snap-themes-control"}, Polkit: "io.snapcraft.snapd.manage"})
 }
 
 func (s *themesSuite) TestInstalledThemes(c *C) {
@@ -416,9 +416,13 @@ func (s *themesSuite) TestThemesCmdPost(c *C) {
 			},
 		},
 	}
-	restore := daemon.MockSnapstateInstallMany(func(s *state.State, names []string, _ []*snapstate.RevisionOptions, _ int, _ *snapstate.Flags) ([]string, []*state.TaskSet, error) {
-		t := s.NewTask("fake-theme-install", "Theme install")
-		return names, []*state.TaskSet{state.NewTaskSet(t)}, nil
+	restore := daemon.MockSnapstateInstallWithGoal(func(ctx context.Context, st *state.State, g snapstate.InstallGoal, opts snapstate.Options) ([]*snap.Info, []*state.TaskSet, error) {
+		goal, ok := g.(*storeInstallGoalRecorder)
+		c.Assert(ok, Equals, true, Commentf("unexpected InstallGoal type %T", g))
+		c.Assert(goal.snaps, HasLen, 3)
+
+		t := st.NewTask("fake-theme-install", "Theme install")
+		return storeSnapInfos(goal.snaps), []*state.TaskSet{state.NewTaskSet(t)}, nil
 	})
 	defer restore()
 

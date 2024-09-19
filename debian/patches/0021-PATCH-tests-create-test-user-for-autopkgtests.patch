@@ -1,0 +1,24 @@
+From: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+Date: Tue, 4 Jun 2024 11:10:02 +0200
+Subject: tests: create test user for autopkgtests
+
+The smoke test suite depends on running things as the unprivilege
+user "test" with the specific UID 12345.
+
+Signed-off-by: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+---
+ tests/lib/prepare-restore.sh | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/tests/lib/prepare-restore.sh b/tests/lib/prepare-restore.sh
+index db64b2c..5015ed7 100755
+--- a/tests/lib/prepare-restore.sh
++++ b/tests/lib/prepare-restore.sh
+@@ -269,6 +269,7 @@ prepare_project() {
+     # no need to modify anything further for autopkgtest
+     # we want to run as pristine as possible
+     if [ "$SPREAD_BACKEND" = autopkgtest ]; then
++        create_test_user
+         exit 0
+     fi
+ 

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/kcmdline"
 )
 
 // A Logger is a fairly minimal logging tool.
@@ -75,7 +76,14 @@ func Panicf(format string, v ...interface{}) {
 // Noticef notifies the user of something
 func Noticef(format string, v ...interface{}) {
 	msg := fmt.Sprintf(format, v...)
+	lock.Lock()
+	defer lock.Unlock()
 
+	logger.Notice(msg)
+}
+
+// Notice notifies the user of something
+func Notice(msg string) {
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -85,7 +93,14 @@ func Noticef(format string, v ...interface{}) {
 // Debugf records something in the debug log
 func Debugf(format string, v ...interface{}) {
 	msg := fmt.Sprintf(format, v...)
+	lock.Lock()
+	defer lock.Unlock()
 
+	logger.Debug(msg)
+}
+
+// Debug records something in the debug log
+func Debug(msg string) {
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -107,7 +122,7 @@ func NoGuardDebugf(format string, v ...interface{}) {
 func MockLogger() (buf *bytes.Buffer, restore func()) {
 	buf = &bytes.Buffer{}
 	oldLogger := logger
-	l, err := New(buf, DefaultFlags)
+	l, err := New(buf, DefaultFlags, &LoggerOptions{})
 	if err != nil {
 		panic(err)
 	}
@@ -165,11 +180,21 @@ func (l *Log) NoGuardDebug(msg string) {
 	l.log.Output(3, "DEBUG: "+msg)
 }
 
-// New creates a log.Logger using the given io.Writer and flag.
-func New(w io.Writer, flag int) (Logger, error) {
+type LoggerOptions struct {
+	// ForceDebug can be set if we want debug traces even if not directly
+	// enabled by environment or kernel command line.
+	ForceDebug bool
+}
+
+// New creates a log.Logger using the given io.Writer and flag, using the
+// options from opts.
+func New(w io.Writer, flag int, opts *LoggerOptions) (Logger, error) {
+	if opts == nil {
+		opts = &LoggerOptions{}
+	}
 	logger := &Log{
 		log:   log.New(w, "", flag),
-		debug: debugEnabledOnKernelCmdline(),
+		debug: opts.ForceDebug || debugEnabledOnKernelCmdline(),
 	}
 	return logger, nil
 }
@@ -184,9 +209,9 @@ func buildFlags() int {
 }
 
 // SimpleSetup creates the default (console) logger
-func SimpleSetup() error {
+func SimpleSetup(opts *LoggerOptions) error {
 	flags := buildFlags()
-	l, err := New(os.Stderr, flags)
+	l, err := New(os.Stderr, flags, opts)
 	if err == nil {
 		SetLogger(l)
 	}
@@ -197,7 +222,7 @@ func SimpleSetup() error {
 // initramfs, where we want to consider the quiet kernel option.
 func BootSetup() error {
 	flags := buildFlags()
-	m, _ := osutil.KernelCommandLineKeyValues("quiet")
+	m, _ := kcmdline.KeyValues("quiet")
 	_, quiet := m["quiet"]
 	logger := &Log{
 		log:   log.New(os.Stderr, "", flags),
@@ -220,7 +245,7 @@ func debugEnabledOnKernelCmdline() bool {
 	if osutil.IsTestBinary() && procCmdlineUseDefaultMockInTests {
 		return false
 	}
-	m, _ := osutil.KernelCommandLineKeyValues("snapd.debug")
+	m, _ := kcmdline.KeyValues("snapd.debug")
 	return m["snapd.debug"] == "1"
 }
 

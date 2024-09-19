@@ -362,35 +362,35 @@ dbus (send)
     path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
     interface=com.canonical.dbusmenu
     member="{LayoutUpdated,ItemsPropertiesUpdated}"
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (receive)
     bus=session
     path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
     interface="{com.canonical.dbusmenu,org.freedesktop.DBus.Properties}"
     member=Get*
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (receive)
     bus=session
     path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
     interface=com.canonical.dbusmenu
     member="{AboutTo*,Event*}"
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (receive)
     bus=session
     path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
     interface=org.freedesktop.DBus.Introspectable
     member=Introspect
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (receive)
     bus=session
     path=/com/canonical/dbusmenu
     interface=org.freedesktop.DBus.Properties
     member=Get*
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 # app-indicators
 dbus (send)
@@ -423,35 +423,35 @@ dbus (send)
     path=/{StatusNotifierWatcher,org/ayatana/NotificationItem/*}
     interface=org.kde.StatusNotifierWatcher
     member=RegisterStatusNotifierItem
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (send)
     bus=session
     path=/{StatusNotifierItem,org/ayatana/NotificationItem/*}
     interface=org.kde.StatusNotifierItem
     member="New{AttentionIcon,Icon,IconThemePath,OverlayIcon,Status,Title,ToolTip}"
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (receive)
     bus=session
     path=/{StatusNotifierItem,org/ayatana/NotificationItem/*}
     interface=org.kde.StatusNotifierItem
     member={Activate,ContextMenu,Scroll,SecondaryActivate,ProvideXdgActivationToken,XAyatanaSecondaryActivate}
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (send)
     bus=session
     path=/{StatusNotifierItem/menu,org/ayatana/NotificationItem/*/Menu}
     interface=com.canonical.dbusmenu
     member="{LayoutUpdated,ItemsPropertiesUpdated}"
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (receive)
     bus=session
     path=/{StatusNotifierItem,StatusNotifierItem/menu,org/ayatana/NotificationItem/**}
     interface={org.freedesktop.DBus.Properties,com.canonical.dbusmenu}
     member={Get*,AboutTo*,Event*}
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 # notifications
 dbus (send)
@@ -459,14 +459,14 @@ dbus (send)
     path=/org/freedesktop/Notifications
     interface=org.freedesktop.Notifications
     member="{GetCapabilities,GetServerInformation,Notify,CloseNotification}"
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (receive)
     bus=session
     path=/org/freedesktop/Notifications
     interface=org.freedesktop.Notifications
     member={ActionInvoked,NotificationClosed,NotificationReplied}
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 # KDE Plasma's Inhibited property indicating "do not disturb" mode
 # https://invent.kde.org/plasma/plasma-workspace/-/blob/master/libnotificationmanager/dbus/org.freedesktop.Notifications.xml#L42
@@ -475,21 +475,21 @@ dbus (send)
     path=/org/freedesktop/Notifications
     interface=org.freedesktop.DBus.Properties
     member="Get{,All}"
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (receive)
     bus=session
     path=/org/freedesktop/Notifications
     interface=org.freedesktop.DBus.Properties
     member=PropertiesChanged
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 dbus (send)
     bus=session
     path=/org/ayatana/NotificationItem/*
     interface=org.kde.StatusNotifierItem
     member=XAyatanaNew*
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 # unity launcher
 dbus (send)
@@ -591,7 +591,7 @@ dbus (receive)
     path=/com/canonical/menu/[0-9]*
     interface="{org.freedesktop.DBus.Properties,com.canonical.dbusmenu}"
     member="{GetAll,GetLayout}"
-    peer=(label=unconfined),
+    peer=(label="{plasmashell,unconfined}"),
 
 # Allow requesting interest in receiving media key events. This tells Gnome
 # settings that our application should be notified when key events we are
@@ -689,12 +689,14 @@ func (iface *unity7Interface) AppArmorConnectedPlug(spec *apparmor.Specification
 	new = strings.Replace(new, "+", "_", -1)
 	old := "###UNITY_SNAP_NAME###"
 	snippet := strings.Replace(unity7ConnectedPlugAppArmor, old, new, -1)
-
-	old = "###SNAP_DESKTOP_FILE_RULES###"
-	new = strings.Join(getDesktopFileRules(plug.Snap().DesktopPrefix()), "\n")
-	snippet = strings.Replace(snippet, old, new+"\n", -1)
-
 	spec.AddSnippet(snippet)
+
+	// the DesktopFileRules can conflict with the rules in other, more privileged,
+	// interfaces (like desktop-launch), so they are added here with the minimum
+	// priority, while those other, more privileged, interfaces will add an empty
+	// string with a bigger privilege value.
+	desktopSnippet := strings.Join(getDesktopFileRules(plug.Snap().DesktopPrefix()), "\n")
+	spec.AddPrioritizedSnippet(desktopSnippet, prioritizedSnippetDesktopFileAccess, desktopLegacyAndUnity7Priority)
 	return nil
 }
 

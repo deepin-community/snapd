@@ -115,6 +115,12 @@ func init() {
 	// system.faillock
 	addFSOnlyHandler(validateFaillockSettings, handleFaillockConfiguration, coreOnly)
 
+	// store.access
+	addFSOnlyHandler(validateStoreAccess, handleStoreAccess, coreOnly)
+
+	// system.coredump
+	addFSOnlyHandler(validateCoredumpSettings, handleCoredumpConfiguration, coreOnly)
+
 	sysconfig.ApplyFilesystemOnlyDefaultsImpl = filesystemOnlyApply
 }
 

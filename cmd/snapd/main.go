@@ -20,6 +20,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -27,7 +29,6 @@ import (
 	"time"
 
 	"github.com/snapcore/snapd/daemon"
-	"github.com/snapcore/snapd/errtracker"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/sandbox"
@@ -42,13 +43,10 @@ var (
 )
 
 func init() {
-	err := logger.SimpleSetup()
+	err := logger.SimpleSetup(nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "WARNING: failed to activate logging: %s\n", err)
 	}
-	// set here to avoid accidental submits in e.g. unit tests
-	errtracker.CrashDbURLBase = "https://daisy.ubuntu.com/"
-	errtracker.SnapdVersion = snapdtool.Version
 }
 
 func main() {
@@ -59,16 +57,29 @@ func main() {
 		snapdtool.ExecInSnapdOrCoreSnap()
 	}
 
+	if err := snapdtool.MaybeSetupFIPS(); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot check or enable FIPS mode: %v", err)
+		os.Exit(1)
+	}
+
+	// TODO look into signal.NotifyContext
 	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	if err := run(ch); err != nil {
-		if err == daemon.ErrRestartSocket {
+		if errors.Is(err, daemon.ErrRestartSocket) {
 			// Note that we don't prepend: "error: " here because
 			// ErrRestartSocket is not an error as such.
-			fmt.Fprintf(os.Stdout, "%v\n", err)
+			fmt.Fprintln(os.Stdout, err)
 			// the exit code must be in sync with
 			// data/systemd/snapd.service.in:SuccessExitStatus=
 			os.Exit(42)
+		} else if errors.Is(err, daemon.ErrNoFailureRecoveryNeeded) {
+			// Similar consideration as above.
+			fmt.Fprintln(os.Stdout, err)
+			// We were invoked from a failure handler, but there is
+			// nothing to recover from in the state, as such the
+			// failure handling was successful.
+			return
 		}
 		fmt.Fprintf(os.Stderr, "cannot run daemon: %v\n", err)
 		os.Exit(1)
@@ -108,6 +119,8 @@ func runWatchdog(d *daemon.Daemon) (*time.Ticker, error) {
 var checkRunningConditionsRetryDelay = 300 * time.Second
 
 func run(ch chan os.Signal) error {
+	ctx := context.Background()
+
 	t0 := time.Now().Truncate(time.Millisecond)
 	snapdenv.SetUserAgentFromVersion(snapdtool.Version, sandbox.ForceDevMode)
 
@@ -134,7 +147,7 @@ func run(ch chan os.Signal) error {
 
 	d.Version = snapdtool.Version
 
-	if err := d.Start(); err != nil {
+	if err := d.Start(ctx); err != nil {
 		return err
 	}
 

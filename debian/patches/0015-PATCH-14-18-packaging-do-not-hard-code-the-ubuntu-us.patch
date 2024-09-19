@@ -1,0 +1,25 @@
+From: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+Date: Fri, 26 Jan 2024 01:11:46 +0100
+Subject: packaging: do not hard-code the "ubuntu" username/password
+
+Spread needs to login to an account with a non-empty password. Set the password
+of the autopkgtest user account to the same value as the account name.
+
+Signed-off-by: Zygmunt Krynicki <zygmunt.krynicki@canonical.com>
+---
+ packaging/debian-sid/tests/integrationtests | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/packaging/debian-sid/tests/integrationtests b/packaging/debian-sid/tests/integrationtests
+index 2267e71..eee0d33 100644
+--- a/packaging/debian-sid/tests/integrationtests
++++ b/packaging/debian-sid/tests/integrationtests
+@@ -24,7 +24,7 @@ printf '%s\n' "-950" > /proc/$$/oom_score_adj
+ cat /proc/meminfo
+ 
+ # ensure we can do a connect to localhost
+-echo ubuntu:ubuntu|chpasswd
++echo "${AUTOPKGTEST_NORMAL_USER}":"${AUTOPKGTEST_NORMAL_USER}" | chpasswd
+ sed -i 's/\(PermitRootLogin\|PasswordAuthentication\)\>.*/\1 yes/' /etc/ssh/sshd_config
+ systemctl reload ssh.service
+ 

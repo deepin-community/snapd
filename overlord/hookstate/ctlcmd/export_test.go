@@ -20,12 +20,16 @@
 package ctlcmd
 
 import (
-	"fmt"
+	"context"
+	"errors"
+	"os/user"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/client/clientutil"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/servicestate"
+	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/testutil"
@@ -63,10 +67,22 @@ func MockKmodUnloadModule(f func(string) error) (restore func()) {
 	return r
 }
 
-func MockServicestateControlFunc(f func(*state.State, []*snap.AppInfo, *servicestate.Instruction, *servicestate.Flags, *hookstate.Context) ([]*state.TaskSet, error)) (restore func()) {
+func MockServicestateControlFunc(f func(*state.State, []*snap.AppInfo, *servicestate.Instruction, *user.User, *servicestate.Flags, *hookstate.Context) ([]*state.TaskSet, error)) (restore func()) {
 	old := servicestateControl
 	servicestateControl = f
 	return func() { servicestateControl = old }
+}
+
+func MockSnapstateInstallComponentsFunc(f func(ctx context.Context, st *state.State, names []string, info *snap.Info, opts snapstate.Options) ([]*state.TaskSet, error)) (restore func()) {
+	old := snapstateInstallComponents
+	snapstateInstallComponents = f
+	return func() { snapstateInstallComponents = old }
+}
+
+func MockSnapstateRemoveComponentsFunc(f func(st *state.State, snapName string, compName []string, opts snapstate.RemoveComponentsOpts) ([]*state.TaskSet, error)) (restore func()) {
+	old := snapstateRemoveComponents
+	snapstateRemoveComponents = f
+	return func() { snapstateRemoveComponents = old }
 }
 
 func MockDevicestateSystemModeInfoFromState(f func(*state.State) (*devicestate.SystemModeInfo, error)) (restore func()) {
@@ -126,15 +142,15 @@ func (c *MockCommand) Execute(args []string) error {
 	c.Args = args
 
 	if c.FakeStdout != "" {
-		c.printf(c.FakeStdout)
+		c.print(c.FakeStdout)
 	}
 
 	if c.FakeStderr != "" {
-		c.errorf(c.FakeStderr)
+		c.error(c.FakeStderr)
 	}
 
 	if c.ExecuteError {
-		return fmt.Errorf("failed at user request")
+		return errors.New("failed at user request")
 	}
 
 	return nil
@@ -154,4 +170,10 @@ func MockAutoRefreshForGatingSnap(f func(st *state.State, gatingSnap string) err
 	return func() {
 		autoRefreshForGatingSnap = old
 	}
+}
+
+func MockNewStatusDecorator(f func(ctx context.Context, isGlobal bool, uid string) clientutil.StatusDecorator) (restore func()) {
+	restore = testutil.Backup(&newStatusDecorator)
+	newStatusDecorator = f
+	return restore
 }

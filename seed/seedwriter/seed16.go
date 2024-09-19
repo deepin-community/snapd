@@ -20,8 +20,8 @@
 package seedwriter
 
 import (
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -115,11 +115,6 @@ func (pol *policy16) checkBase(info *snap.Info, modes []string, availableByMode 
 	}
 
 	return fmt.Errorf("cannot add snap %q without also adding its base %q explicitly", info.SnapName(), info.Base)
-}
-
-func (pol *policy16) checkAvailable(snapRef naming.SnapRef, modes []string, availableByMode map[string]*naming.SnapSet) bool {
-	availableSnaps := availableByMode["run"]
-	return availableSnaps.Contains(snapRef)
 }
 
 func (pol *policy16) needsImplicitSnaps(availableByMode map[string]*naming.SnapSet) (bool, error) {
@@ -216,6 +211,14 @@ func (tr *tree16) localSnapPath(sn *SeedSnap) (string, error) {
 	return filepath.Join(tr.snapsDirPath, sn.Info.Filename()), nil
 }
 
+func (tr *tree16) componentPath(sn *SeedSnap, sc *SeedComponent) (string, error) {
+	return "", errors.New("components not supported on UC16")
+}
+
+func (tr *tree16) localComponentPath(sc *SeedComponent) (string, error) {
+	return "", errors.New("components not supported on UC16")
+}
+
 func (tr *tree16) writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Ref, snapsFromModel []*SeedSnap, extraSnaps []*SeedSnap) error {
 	seedAssertsDir := filepath.Join(tr.opts.SeedDir, "assertions")
 	if err := os.MkdirAll(seedAssertsDir, 0755); err != nil {
@@ -235,7 +238,7 @@ func (tr *tree16) writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Re
 			if err != nil {
 				return fmt.Errorf("internal error: lost saved assertion")
 			}
-			if err = ioutil.WriteFile(filepath.Join(seedAssertsDir, afn), asserts.Encode(a), 0644); err != nil {
+			if err = os.WriteFile(filepath.Join(seedAssertsDir, afn), asserts.Encode(a), 0644); err != nil {
 				return err
 			}
 		}

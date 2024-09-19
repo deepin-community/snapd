@@ -281,13 +281,15 @@ func (s *attrConstraintsSuite) TestCompileErrors(c *C) {
 		_, err := asserts.CompileAttributeConstraints(map[string]interface{}{
 			"foo": wrong,
 		})
-		c.Check(err, ErrorMatches, fmt.Sprintf(`cannot compile "foo" constraint "%s": not a valid \$SLOT\(\)/\$PLUG\(\) constraint`, regexp.QuoteMeta(wrong)))
+		c.Check(err, ErrorMatches, fmt.Sprintf(`cannot compile "foo" constraint "%s": not a valid \$SLOT\(\)/\$PLUG\(\)/\$PLUG_PUBLISHER_ID/\$SLOT_PUBLISHER_ID constraint`, regexp.QuoteMeta(wrong)))
 
 	}
 }
 
 type testEvalAttr struct {
-	comp func(side string, arg string) (interface{}, error)
+	comp            func(side string, arg string) (interface{}, error)
+	plugPublisherID string
+	slotPublisherID string
 }
 
 func (ca testEvalAttr) SlotAttr(arg string) (interface{}, error) {
@@ -296,6 +298,14 @@ func (ca testEvalAttr) SlotAttr(arg string) (interface{}, error) {
 
 func (ca testEvalAttr) PlugAttr(arg string) (interface{}, error) {
 	return ca.comp("plug", arg)
+}
+
+func (ca testEvalAttr) PlugPublisherID() string {
+	return ca.plugPublisherID
+}
+
+func (ca testEvalAttr) SlotPublisherID() string {
+	return ca.slotPublisherID
 }
 
 func (s *attrConstraintsSuite) TestEvalCheck(c *C) {
@@ -323,7 +333,7 @@ bar: bar
 	err = cstrs.Check(attrs(`
 foo: foo
 bar: bar.baz
-`), testEvalAttr{comp1})
+`), testEvalAttr{comp: comp1})
 	c.Check(err, IsNil)
 
 	c.Check(calls, DeepEquals, map[[2]string]bool{
@@ -341,7 +351,7 @@ bar: bar.baz
 	err = cstrs.Check(attrs(`
 foo: foo
 bar: bar.baz
-`), testEvalAttr{comp2})
+`), testEvalAttr{comp: comp2})
 	c.Check(err, ErrorMatches, `attribute "bar" constraint \$PLUG\(bar\.baz\) cannot be evaluated: boom`)
 
 	comp3 := func(op string, arg string) (interface{}, error) {
@@ -354,8 +364,72 @@ bar: bar.baz
 	err = cstrs.Check(attrs(`
 foo: foo
 bar: bar.baz
-`), testEvalAttr{comp3})
+`), testEvalAttr{comp: comp3})
 	c.Check(err, ErrorMatches, `attribute "foo" does not match \$SLOT\(foo\): foo != other-value`)
+}
+
+func (s *attrConstraintsSuite) TestCheckWithAttrPlugPublisherID(c *C) {
+	m, err := asserts.ParseHeaders([]byte(`attrs:
+  my-attr: $PLUG_PUBLISHER_ID`))
+	c.Assert(err, IsNil)
+
+	cstrs, err := asserts.CompileAttributeConstraints(m["attrs"].(map[string]interface{}))
+	c.Assert(err, IsNil)
+	c.Check(asserts.RuleFeature(cstrs, "publisher-id-constraints"), Equals, true)
+
+	helper := testEvalAttr{plugPublisherID: "my-account"}
+
+	err = cstrs.Check(attrs(`
+my-attr: my-account
+`), nil)
+	c.Check(err, ErrorMatches, `attribute "my-attr" cannot be matched without context`)
+
+	err = cstrs.Check(attrs(`
+my-attr: my-account
+`), helper)
+	c.Check(err, IsNil)
+
+	err = cstrs.Check(attrs(`
+my-attr: other-account
+`), helper)
+	c.Check(err, ErrorMatches, `.*attribute "my-attr" does not match \$PLUG_PUBLISHER_ID\: other-account != my-account`)
+
+	err = cstrs.Check(attrs(`
+my-attr: 1
+`), helper)
+	c.Check(err, ErrorMatches, `.*attribute "my-attr" is not expected string type: int64`)
+}
+
+func (s *attrConstraintsSuite) TestCheckWithAttrSlotPublisherID(c *C) {
+	m, err := asserts.ParseHeaders([]byte(`attrs:
+  my-attr: $SLOT_PUBLISHER_ID`))
+	c.Assert(err, IsNil)
+
+	cstrs, err := asserts.CompileAttributeConstraints(m["attrs"].(map[string]interface{}))
+	c.Assert(err, IsNil)
+	c.Check(asserts.RuleFeature(cstrs, "publisher-id-constraints"), Equals, true)
+
+	helper := testEvalAttr{slotPublisherID: "my-account"}
+
+	err = cstrs.Check(attrs(`
+my-attr: my-account
+`), nil)
+	c.Check(err, ErrorMatches, `attribute "my-attr" cannot be matched without context`)
+
+	err = cstrs.Check(attrs(`
+my-attr: my-account
+`), helper)
+	c.Check(err, IsNil)
+
+	err = cstrs.Check(attrs(`
+my-attr: other-account
+`), helper)
+	c.Check(err, ErrorMatches, `.*attribute "my-attr" does not match \$SLOT_PUBLISHER_ID\: other-account != my-account`)
+
+	err = cstrs.Check(attrs(`
+my-attr: 1
+`), helper)
+	c.Check(err, ErrorMatches, `.*attribute "my-attr" is not expected string type: int64`)
 }
 
 func (s *attrConstraintsSuite) TestNeverMatchAttributeConstraints(c *C) {
@@ -1157,19 +1231,19 @@ func (s *plugSlotRulesSuite) TestCompilePlugRuleErrors(c *C) {
 		{`iface:
   allow-connection:
     slot-snap-ids:
-      - foo`, `allow-connection in plug rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, slot-publisher-id, slot-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-store, on-brand, on-model`},
+      - foo`, `allow-connection in plug rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, slot-publisher-id, slot-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-core-desktop, on-store, on-brand, on-model`},
 		{`iface:
   deny-connection:
     slot-snap-ids:
-      - foo`, `deny-connection in plug rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, slot-publisher-id, slot-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-store, on-brand, on-model`},
+      - foo`, `deny-connection in plug rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, slot-publisher-id, slot-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-core-desktop, on-store, on-brand, on-model`},
 		{`iface:
   allow-auto-connection:
     slot-snap-ids:
-      - foo`, `allow-auto-connection in plug rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, slot-publisher-id, slot-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-store, on-brand, on-model`},
+      - foo`, `allow-auto-connection in plug rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, slot-publisher-id, slot-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-core-desktop, on-store, on-brand, on-model`},
 		{`iface:
   deny-auto-connection:
     slot-snap-ids:
-      - foo`, `deny-auto-connection in plug rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, slot-publisher-id, slot-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-store, on-brand, on-model`},
+      - foo`, `deny-auto-connection in plug rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, slot-publisher-id, slot-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-core-desktop, on-store, on-brand, on-model`},
 		{`iface:
   allow-connect: true`, `plug rule for interface "iface" must specify at least one of allow-installation, deny-installation, allow-connection, deny-connection, allow-auto-connection, deny-auto-connection`},
 		{`iface:
@@ -1686,6 +1760,7 @@ func (s *plugSlotRulesSuite) TestCompileSlotRuleInstallationConstraintsSlotNames
 func (s *plugSlotRulesSuite) TestCompileSlotRuleConnectionConstraintsIDConstraints(c *C) {
 	rule, err := asserts.CompileSlotRule("iface", map[string]interface{}{
 		"allow-connection": map[string]interface{}{
+			"slot-snap-type":    []interface{}{"core"},
 			"plug-snap-type":    []interface{}{"core", "kernel", "gadget", "app"},
 			"plug-snap-id":      []interface{}{"snapidsnapidsnapidsnapidsnapid01", "snapidsnapidsnapidsnapidsnapid02"},
 			"plug-publisher-id": []interface{}{"pubidpubidpubidpubidpubidpubid09", "canonical", "$SAME"},
@@ -1695,6 +1770,7 @@ func (s *plugSlotRulesSuite) TestCompileSlotRuleConnectionConstraintsIDConstrain
 
 	c.Assert(rule.AllowConnection, HasLen, 1)
 	cstrs := rule.AllowConnection[0]
+	c.Check(cstrs.SlotSnapTypes, DeepEquals, []string{"core"})
 	c.Check(cstrs.PlugSnapTypes, DeepEquals, []string{"core", "kernel", "gadget", "app"})
 	c.Check(cstrs.PlugSnapIDs, DeepEquals, []string{"snapidsnapidsnapidsnapidsnapid01", "snapidsnapidsnapidsnapidsnapid02"})
 	c.Check(cstrs.PlugPublisherIDs, DeepEquals, []string{"pubidpubidpubidpubidpubidpubid09", "canonical", "$SAME"})
@@ -1979,6 +2055,10 @@ func (s *plugSlotRulesSuite) TestCompileSlotRuleErrors(c *C) {
       - foo`, `plug-snap-id in allow-connection in slot rule for interface "iface" contains an invalid element: "foo"`},
 		{`iface:
   allow-connection:
+    slot-snap-type:
+      - foo`, `slot-snap-type in allow-connection in slot rule for interface "iface" contains an invalid element: "foo"`},
+		{`iface:
+  allow-connection:
     plug-snap-type:
       - foo`, `plug-snap-type in allow-connection in slot rule for interface "iface" contains an invalid element: "foo"`},
 		{`iface:
@@ -1996,19 +2076,19 @@ func (s *plugSlotRulesSuite) TestCompileSlotRuleErrors(c *C) {
 		{`iface:
   allow-connection:
     plug-snap-ids:
-      - foo`, `allow-connection in slot rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, plug-snap-type, plug-publisher-id, plug-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-store, on-brand, on-model`},
+      - foo`, `allow-connection in slot rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, plug-snap-type, plug-publisher-id, plug-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-core-desktop, on-store, on-brand, on-model`},
 		{`iface:
   deny-connection:
     plug-snap-ids:
-      - foo`, `deny-connection in slot rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, plug-snap-type, plug-publisher-id, plug-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-store, on-brand, on-model`},
+      - foo`, `deny-connection in slot rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, plug-snap-type, plug-publisher-id, plug-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-core-desktop, on-store, on-brand, on-model`},
 		{`iface:
   allow-auto-connection:
     plug-snap-ids:
-      - foo`, `allow-auto-connection in slot rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, plug-snap-type, plug-publisher-id, plug-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-store, on-brand, on-model`},
+      - foo`, `allow-auto-connection in slot rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, plug-snap-type, plug-publisher-id, plug-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-core-desktop, on-store, on-brand, on-model`},
 		{`iface:
   deny-auto-connection:
     plug-snap-ids:
-      - foo`, `deny-auto-connection in slot rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, plug-snap-type, plug-publisher-id, plug-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-store, on-brand, on-model`},
+      - foo`, `deny-auto-connection in slot rule for interface "iface" must specify at least one of plug-names, slot-names, plug-attributes, slot-attributes, slot-snap-type, plug-snap-type, plug-publisher-id, plug-snap-id, slots-per-plug, plugs-per-slot, on-classic, on-core-desktop, on-store, on-brand, on-model`},
 		{`iface:
   allow-connect: true`, `slot rule for interface "iface" must specify at least one of allow-installation, deny-installation, allow-connection, deny-connection, allow-auto-connection, deny-auto-connection`},
 		{`iface:

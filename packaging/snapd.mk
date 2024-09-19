@@ -65,10 +65,16 @@ endif
 .PHONY: all
 all: $(go_binaries) 
 
+# FIXME: not all Go toolchains we build with support '-B gobuildid', replace a
+# random GNU build ID with something more predictable, use something similar to
+# https://pagure.io/go-rpm-macros/c/1980932bf3a21890a9571effaa23fbe034fd388d
 $(builddir)/snap: GO_TAGS += nomanagers
 $(builddir)/snap $(builddir)/snap-seccomp $(builddir)/snapd-apparmor:
 	go build -o $@ $(if $(GO_TAGS),-tags "$(GO_TAGS)") \
-		-buildmode=pie -ldflags=-w -mod=vendor \
+		-buildmode=pie \
+		-ldflags="-B 0x$$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \n') $(EXTRA_GO_LDFLAGS)" \
+		-mod=vendor \
+		$(EXTRA_GO_BUILD_FLAGS) \
 		$(import_path)/cmd/$(notdir $@)
 
 # Those three need to be built as static binaries. They run on the inside of a
@@ -79,14 +85,19 @@ $(builddir)/snap-update-ns $(builddir)/snap-exec $(builddir)/snapctl:
 	# used
 	go build -o $@ -buildmode=default -mod=vendor \
 		$(if $(GO_TAGS),-tags "$(GO_TAGS)") \
-		-ldflags '-linkmode external -extldflags "-static"' \
+		-ldflags '-linkmode external -extldflags "-static" $(EXTRA_GO_LDFLAGS)' \
+		$(EXTRA_GO_BUILD_FLAGS) \
 		$(import_path)/cmd/$(notdir $@)
 
+# XXX see the note about build ID in rule for building 'snap'
 # Snapd can be built with test keys. This is only used by the internal test
 # suite to add test assertions. Do not enable this in distribution packages.
 $(builddir)/snapd:
-	go build -o $@ -buildmode=pie -ldflags=-w -mod=vendor \
+	go build -o $@ -buildmode=pie \
+		-ldflags="-B 0x$$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \n') $(EXTRA_GO_LDFLAGS)" \
+		-mod=vendor \
 		$(if $(GO_TAGS),-tags "$(GO_TAGS)") \
+		$(EXTRA_GO_BUILD_FLAGS) \
 		$(import_path)/cmd/$(notdir $@)
 
 # Know how to create certain directories.
@@ -108,8 +119,8 @@ install:: | $(DESTDIR)$(bindir)
 	ln -s $(libexecdir)/snapd/snapctl $|/snapctl
 
 # Generate and install man page for snap command
-install:: snap | $(DESTDIR)$(mandir)/man8
-	./snap help --man > $|/snap.8
+install:: $(builddir)/snap | $(DESTDIR)$(mandir)/man8
+	$(builddir)/snap help --man > $|/snap.8
 
 # Install the directory structure in /var/lib/snapd
 install::
@@ -117,11 +128,13 @@ install::
 	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/apparmor/snap-confine
 	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/assertions
 	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/cache
+	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/cgroup
 	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/cookie
 	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/dbus-1/services
 	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/dbus-1/system-services
 	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/desktop/applications
 	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/device
+	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/environment
 	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/hostfs
 	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/inhibit
 	install -m 755 -d $(DESTDIR)/$(sharedstatedir)/snapd/lib/gl
@@ -156,12 +169,6 @@ install::
 install::
 	install -m 755 -d $(DESTDIR)$(localstatedir)/cache/snapd
 	install -m 755 -d $(DESTDIR)$(datadir)/polkit-1/actions
-
-# Remove traces of ubuntu-core-launcher. It is a phased-out executable that is
-# still partially present in the tree but should be removed in the subsequent
-# release.
-install::
-	rm -f $(DESTDIR)$(bindir)/ubuntu-core-launcher
 
 # Do not ship snap-preseed. It is currently only useful on ubuntu and tailored
 # for preseeding of ubuntu cloud images due to certain assumptions about

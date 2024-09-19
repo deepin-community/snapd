@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2022 Canonical Ltd
+ * Copyright (C) 2014-2023 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -33,8 +33,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/snapcore/snapd/asserts"
@@ -80,6 +82,86 @@ type seed20 struct {
 	// modes holds a matching applicable modes set for each snap in snaps
 	modes             [][]string
 	essentialSnapsNum int
+}
+
+// Copy implement Copier interface.
+func (s *seed20) Copy(seedDir string, label string, tm timings.Measurer) (err error) {
+	srcSystemDir, err := filepath.Abs(s.systemDir)
+	if err != nil {
+		return err
+	}
+
+	if label == "" {
+		label = filepath.Base(srcSystemDir)
+	}
+
+	destSeedDir, err := filepath.Abs(seedDir)
+	if err != nil {
+		return err
+	}
+
+	if err := os.Mkdir(filepath.Join(destSeedDir, "systems"), 0755); err != nil && !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+
+	destSystemDir := filepath.Join(destSeedDir, "systems", label)
+	if osutil.FileExists(destSystemDir) {
+		return fmt.Errorf("cannot create system: system %q already exists at %q", label, destSystemDir)
+	}
+
+	// note: we don't clean up asserted snaps that were copied over
+	defer func() {
+		if err != nil {
+			os.RemoveAll(destSystemDir)
+		}
+	}()
+
+	if err := s.LoadMeta(AllModes, nil, tm); err != nil {
+		return err
+	}
+
+	span := tm.StartSpan("copy-recovery-system", fmt.Sprintf("copy recovery system from %s to %s", srcSystemDir, destSystemDir))
+	defer span.Stop()
+
+	// copy all files (including unasserted snaps) from the seed to the
+	// destination
+	err = filepath.Walk(srcSystemDir, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		destPath := filepath.Join(destSeedDir, "systems", label, strings.TrimPrefix(path, srcSystemDir))
+		if info.IsDir() {
+			return os.Mkdir(destPath, info.Mode())
+		}
+
+		return osutil.CopyFile(path, destPath, osutil.CopyFlagDefault)
+	})
+	if err != nil {
+		return err
+	}
+
+	destAssertedSnapDir := filepath.Join(destSeedDir, "snaps")
+
+	if err := os.MkdirAll(destAssertedSnapDir, 0755); err != nil {
+		return err
+	}
+
+	// copy the asserted snaps that the seed needs
+	for _, sn := range s.snaps {
+		// unasserted snaps are already copied above, skip them
+		if sn.ID() == "" {
+			continue
+		}
+
+		destSnapPath := filepath.Join(destAssertedSnapDir, filepath.Base(sn.Path))
+
+		if err := osutil.CopyFile(sn.Path, destSnapPath, osutil.CopyFlagOverwrite); err != nil {
+			return fmt.Errorf("cannot copy asserted snap: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (s *seed20) LoadAssertions(db asserts.RODatabase, commitTo func(*asserts.Batch) error) error {
@@ -271,7 +353,7 @@ func (e *noSnapDeclarationError) Error() string {
 	return fmt.Sprintf("cannot find snap-declaration for snap name: %s", e.snapRef.SnapName())
 }
 
-func (s *seed20) lookupVerifiedRevision(snapRef naming.SnapRef, essType snap.Type, handler SnapHandler, snapsDir string, tm timings.Measurer) (snapPath string, snapRev *asserts.SnapRevision, snapDecl *asserts.SnapDeclaration, err error) {
+func (s *seed20) lookupVerifiedRevision(snapRef naming.SnapRef, handler ContainerHandler, snapsDir string, tm timings.Measurer) (snapPath string, snapRev *asserts.SnapRevision, snapDecl *asserts.SnapDeclaration, err error) {
 	snapID := snapRef.ID()
 	if snapID != "" {
 		snapDecl = s.snapDeclsByID[snapID]
@@ -307,7 +389,8 @@ func (s *seed20) lookupVerifiedRevision(snapRef naming.SnapRef, essType snap.Typ
 		return "", nil, nil, fmt.Errorf("cannot validate %q for snap %q (snap-id %q), wrong size", snapPath, snapName, snapID)
 	}
 
-	newPath, snapSHA3_384, _, err := handler.HandleAndDigestAssertedSnap(snapName, snapPath, essType, snapRev, nil, tm)
+	cpi := snap.MinimalSnapContainerPlaceInfo(snapName, snap.R(snapRev.SnapRevision()))
+	newPath, snapSHA3_384, _, err := handler.HandleAndDigestAssertedContainer(cpi, snapPath, tm)
 	if err != nil {
 		return "", nil, nil, err
 	}
@@ -335,7 +418,7 @@ func (s *seed20) lookupVerifiedRevision(snapRef naming.SnapRef, essType snap.Typ
 	return snapPath, snapRev, snapDecl, nil
 }
 
-func (s *seed20) lookupSnap(snapRef naming.SnapRef, essType snap.Type, optSnap *internal.Snap20, channel string, handler SnapHandler, snapsDir string, tm timings.Measurer) (*Snap, error) {
+func (s *seed20) lookupSnap(snapRef naming.SnapRef, optSnap *internal.Snap20, channel string, handler ContainerHandler, snapsDir string, tm timings.Measurer) (*Snap, error) {
 	if optSnap != nil && optSnap.Channel != "" {
 		channel = optSnap.Channel
 	}
@@ -348,7 +431,9 @@ func (s *seed20) lookupSnap(snapRef naming.SnapRef, essType snap.Type, optSnap *
 		if err != nil {
 			return nil, fmt.Errorf("cannot read unasserted snap: %v", err)
 		}
-		newPath, err := handler.HandleUnassertedSnap(info.SnapName(), path, tm)
+
+		pinfo := snap.MinimalSnapContainerPlaceInfo(info.SnapName(), snap.Revision{N: -1})
+		newPath, err := handler.HandleUnassertedContainer(pinfo, path, tm)
 		if err != nil {
 			return nil, err
 		}
@@ -363,7 +448,7 @@ func (s *seed20) lookupSnap(snapRef naming.SnapRef, essType snap.Type, optSnap *
 		timings.Run(tm, "derive-side-info", fmt.Sprintf("hash and derive side info for snap %q", snapRef.SnapName()), func(nested timings.Measurer) {
 			var snapRev *asserts.SnapRevision
 			var snapDecl *asserts.SnapDeclaration
-			path, snapRev, snapDecl, err = s.lookupVerifiedRevision(snapRef, essType, handler, snapsDir, tm)
+			path, snapRev, snapDecl, err = s.lookupVerifiedRevision(snapRef, handler, snapsDir, tm)
 			if err == nil {
 				sideInfo = snapasserts.SideInfoFromSnapAssertions(snapDecl, snapRev)
 			}
@@ -402,7 +487,7 @@ type snapToConsider struct {
 
 var errSkipped = errors.New("skipped optional snap")
 
-func (s *seed20) doLoadMetaOne(sntoc *snapToConsider, handler SnapHandler, tm timings.Measurer) (*Snap, error) {
+func (s *seed20) doLoadMetaOne(sntoc *snapToConsider, handler ContainerHandler, tm timings.Measurer) (*Snap, error) {
 	var snapRef naming.SnapRef
 	var channel string
 	var snapsDir string
@@ -425,7 +510,7 @@ func (s *seed20) doLoadMetaOne(sntoc *snapToConsider, handler SnapHandler, tm ti
 		channel = "latest/stable"
 		snapsDir = "snaps"
 	}
-	seedSnap, err := s.lookupSnap(snapRef, essType, sntoc.optSnap, channel, handler, snapsDir, tm)
+	seedSnap, err := s.lookupSnap(snapRef, sntoc.optSnap, channel, handler, snapsDir, tm)
 	if err != nil {
 		if _, ok := err.(*noSnapDeclarationError); ok && !required {
 			// skipped optional snap is ok
@@ -455,7 +540,7 @@ func (s *seed20) doLoadMetaOne(sntoc *snapToConsider, handler SnapHandler, tm ti
 	return seedSnap, nil
 }
 
-func (s *seed20) doLoadMeta(handler SnapHandler, tm timings.Measurer) error {
+func (s *seed20) doLoadMeta(handler ContainerHandler, tm timings.Measurer) error {
 	var cacheEssential func(snType string, essSnap *Snap)
 	var cachedEssential func(snType string) *Snap
 	if handler != nil {
@@ -501,6 +586,11 @@ func (s *seed20) doLoadMeta(handler SnapHandler, tm timings.Measurer) error {
 	for j := 1; j <= njobs; j++ {
 		jtm := tm.StartSpan(fmt.Sprintf("do-load-meta[%d]", j), fmt.Sprintf("snap metadata loading job #%d", j))
 		go func() {
+			var jobErr error
+			// defers are LIFO, make sure that time snap is stopped
+			// before we let the parent know that the goroutine is
+			// done
+			defer func() { outcomesCh <- jobErr }()
 			defer jtm.Stop()
 		Consider:
 			for sntoc := range s.snapsToConsiderCh {
@@ -526,7 +616,7 @@ func (s *seed20) doLoadMeta(handler SnapHandler, tm timings.Measurer) error {
 						if err == errSkipped {
 							continue
 						}
-						outcomesCh <- err
+						jobErr = err
 						return
 					}
 					if essential {
@@ -537,7 +627,6 @@ func (s *seed20) doLoadMeta(handler SnapHandler, tm timings.Measurer) error {
 				s.snaps[i] = seedSnap
 				s.modes[i] = modes
 			}
-			outcomesCh <- nil
 		}()
 	}
 	var firstErr error
@@ -592,7 +681,7 @@ func (s *seed20) considerModelSnap(modelSnap *asserts.ModelSnap, essential bool,
 	}
 }
 
-func (s *seed20) LoadMeta(mode string, handler SnapHandler, tm timings.Measurer) error {
+func (s *seed20) LoadMeta(mode string, handler ContainerHandler, tm timings.Measurer) error {
 	const otherSnapsFollow = true
 	if err := s.queueEssentialMeta(nil, otherSnapsFollow, tm); err != nil {
 		return err
@@ -624,7 +713,7 @@ func (s *seed20) LoadEssentialMeta(essentialTypes []snap.Type, tm timings.Measur
 	return s.LoadEssentialMetaWithSnapHandler(essentialTypes, nil, tm)
 }
 
-func (s *seed20) LoadEssentialMetaWithSnapHandler(essentialTypes []snap.Type, handler SnapHandler, tm timings.Measurer) error {
+func (s *seed20) LoadEssentialMetaWithSnapHandler(essentialTypes []snap.Type, handler ContainerHandler, tm timings.Measurer) error {
 	var filterEssential func(*asserts.ModelSnap) bool
 	if len(essentialTypes) != 0 {
 		filterEssential = essentialSnapTypesToModelFilter(essentialTypes)
@@ -837,6 +926,11 @@ func (s *seed20) LoadPreseedAssertion() (*asserts.Preseed, error) {
 		return nil, err
 	}
 	preseedAs := a.(*asserts.Preseed)
+
+	if !strutil.ListContains(model.PreseedAuthority(), preseedAs.AuthorityID()) {
+		return nil, fmt.Errorf("preseed authority-id %q is not allowed by the model", preseedAs.AuthorityID())
+	}
+
 	switch {
 	case preseedAs.SystemLabel() != sysLabel:
 		return nil, fmt.Errorf("preseed assertion system label %q doesn't match system label %q", preseedAs.SystemLabel(), sysLabel)

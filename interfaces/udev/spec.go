@@ -43,9 +43,21 @@ type Specification struct {
 	entries  []entry
 	iface    string
 
+	appSet *interfaces.SnapAppSet
+
 	securityTags             []string
 	udevadmSubsystemTriggers []string
 	controlsDeviceCgroup     bool
+}
+
+func NewSpecification(appSet *interfaces.SnapAppSet) *Specification {
+	return &Specification{
+		appSet: appSet,
+	}
+}
+
+func (spec *Specification) SnapAppSet() *interfaces.SnapAppSet {
+	return spec.appSet
 }
 
 // SetControlsDeviceCgroup marks a specification as needing to control
@@ -84,8 +96,16 @@ func (spec *Specification) AddSnippet(snippet string) {
 	spec.addEntry(snippet, "")
 }
 
+// udevTag converts a security tag into a string that can be used as a udev tag.
+// systemd only allows alphanumeric characters, underscores and hyphens in tags.
+// Our security tags can contain periods and plus signs, so we replace them with
+// underscores. Periods are replaced with single underscores, and plus signs are
+// replaced with two underscores.
+// Examples:
+//   - "snap.foo+bar.hook.install" -> "snap_foo__bar_hook_install"
+//   - "snap.foo.bar" -> "snap_foo_bar"
 func udevTag(securityTag string) string {
-	return strings.Replace(securityTag, ".", "_", -1)
+	return strings.ReplaceAll(strings.ReplaceAll(securityTag, "+", "__"), ".", "_")
 }
 
 // TagDevice adds an app/hook specific udev tag to devices described by the
@@ -144,7 +164,12 @@ func (spec *Specification) AddConnectedPlug(iface interfaces.Interface, plug *in
 	}
 	ifname := iface.Name()
 	if iface, ok := iface.(definer); ok {
-		spec.securityTags = plug.SecurityTags()
+		tags, err := spec.appSet.SecurityTagsForConnectedPlug(plug)
+		if err != nil {
+			return err
+		}
+
+		spec.securityTags = tags
 		spec.iface = ifname
 		defer func() { spec.securityTags = nil; spec.iface = "" }()
 		return iface.UDevConnectedPlug(spec, plug, slot)
@@ -159,7 +184,12 @@ func (spec *Specification) AddConnectedSlot(iface interfaces.Interface, plug *in
 	}
 	ifname := iface.Name()
 	if iface, ok := iface.(definer); ok {
-		spec.securityTags = slot.SecurityTags()
+		tags, err := spec.appSet.SecurityTagsForConnectedSlot(slot)
+		if err != nil {
+			return err
+		}
+
+		spec.securityTags = tags
 		spec.iface = ifname
 		defer func() { spec.securityTags = nil; spec.iface = "" }()
 		return iface.UDevConnectedSlot(spec, plug, slot)
@@ -174,7 +204,12 @@ func (spec *Specification) AddPermanentPlug(iface interfaces.Interface, plug *sn
 	}
 	ifname := iface.Name()
 	if iface, ok := iface.(definer); ok {
-		spec.securityTags = plug.SecurityTags()
+		tags, err := spec.appSet.SecurityTagsForPlug(plug)
+		if err != nil {
+			return err
+		}
+
+		spec.securityTags = tags
 		spec.iface = ifname
 		defer func() { spec.securityTags = nil; spec.iface = "" }()
 		return iface.UDevPermanentPlug(spec, plug)
@@ -189,7 +224,12 @@ func (spec *Specification) AddPermanentSlot(iface interfaces.Interface, slot *sn
 	}
 	ifname := iface.Name()
 	if iface, ok := iface.(definer); ok {
-		spec.securityTags = slot.SecurityTags()
+		tags, err := spec.appSet.SecurityTagsForSlot(slot)
+		if err != nil {
+			return err
+		}
+
+		spec.securityTags = tags
 		spec.iface = ifname
 		defer func() { spec.securityTags = nil; spec.iface = "" }()
 		return iface.UDevPermanentSlot(spec, slot)

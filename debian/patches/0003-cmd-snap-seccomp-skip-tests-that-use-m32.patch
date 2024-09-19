@@ -1,7 +1,6 @@
-From 3b9980d774be5ae8458ed006f712e584ae0ce97d Mon Sep 17 00:00:00 2001
 From: Zygmunt Krynicki <me@zygoon.pl>
 Date: Thu, 17 Jan 2019 17:21:22 +0200
-Subject: [PATCH 3/9] cmd/snap-seccomp: skip tests that use -m32
+Subject: cmd/snap-seccomp: skip tests that use -m32
 
 Apparently Debian's amd64 compiler somehow cannot compile -m32 mode
 binaries. The compilation error is:
@@ -24,11 +23,11 @@ Signed-off-by: Zygmunt Krynicki <me@zygoon.pl>
  cmd/snap-seccomp/main_test.go | 8 ++++++++
  1 file changed, 8 insertions(+)
 
-Index: snapd/cmd/snap-seccomp/main_test.go
-===================================================================
---- snapd.orig/cmd/snap-seccomp/main_test.go
-+++ snapd/cmd/snap-seccomp/main_test.go
-@@ -192,6 +192,14 @@ func (s *snapSeccompSuite) SetUpSuite(c
+diff --git a/cmd/snap-seccomp/main_test.go b/cmd/snap-seccomp/main_test.go
+index 0706c0e..9f98c39 100644
+--- a/cmd/snap-seccomp/main_test.go
++++ b/cmd/snap-seccomp/main_test.go
+@@ -226,6 +226,14 @@ func (s *snapSeccompSuite) SetUpSuite(c *C) {
  	// Ideally we would build for ppc64el->powerpc and arm64->armhf but
  	// it seems tricky to find the right gcc-multilib for this.
  	if arch.DpkgArchitecture() == "amd64" && s.canCheckCompatArch {
