@@ -1,3 +1,19 @@
+snapd (2.65.3-1) unstable; urgency=medium
+
+  [ Ernest Lotter ]
+  * New upstream release, LP: #2077473
+    - Fix missing aux info from store on snap setup
+
+ -- Zygmunt Krynicki <me@zygoon.pl>  Thu, 19 Sep 2024 14:43:40 +0200
+
+snapd (2.65.2-1) unstable; urgency=medium
+
+  * New upstream release, LP: #2077473
+    - Bump squashfuse from version 0.5.0 to 0.5.2 (used in snapd deb
+      only)
+
+ -- Ernest Lotter <ernest.lotter@canonical.com>  Fri, 06 Sep 2024 17:08:45 +0200
+
 snapd (2.65.1-1) unstable; urgency=medium
 
   [ Ernest Lotter ]
