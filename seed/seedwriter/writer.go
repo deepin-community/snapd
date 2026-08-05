@@ -32,6 +32,7 @@ import (
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/channel"
 	"github.com/snapcore/snapd/snap/naming"
+	"github.com/snapcore/snapd/snap/squashfs"
 	"github.com/snapcore/snapd/strutil"
 )
 
@@ -55,6 +56,10 @@ type Options struct {
 	// ManifestPath if set, specifies the file path where the
 	// seed.manifest file should be written.
 	ManifestPath string
+
+	// IgnoreOptionFileExtentions if set, snaps and components will not be
+	// required to end in .snap or .comp, respectively.
+	IgnoreOptionFileExtentions bool
 }
 
 // manifest returns either the manifest already provided by the
@@ -70,7 +75,6 @@ func (opts *Options) manifest() *Manifest {
 // E.g. a component passed to ubuntu-image via --comp <snap_name>+<comp_name>.
 type OptionsComponent struct {
 	Name string
-	// Path is set when a file is passed around.
 	Path string
 }
 
@@ -291,7 +295,7 @@ type tree interface {
 	componentPath(*SeedSnap, *SeedComponent) (string, error)
 
 	localSnapPath(*SeedSnap) (string, error)
-	localComponentPath(*SeedComponent) (string, error)
+	localComponentPath(*SeedComponent, string) (string, error)
 
 	writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Ref, snapsFromModel []*SeedSnap, extraSnaps []*SeedSnap) error
 
@@ -418,7 +422,7 @@ func (w *Writer) warningf(format string, a ...interface{}) {
 	w.warnings = append(w.warnings, fmt.Sprintf(format, a...))
 }
 
-func validateComponent(optComp *OptionsComponent) error {
+func (w *Writer) validateComponent(optComp *OptionsComponent) error {
 	if optComp.Name != "" {
 		if optComp.Path != "" {
 			return fmt.Errorf("cannot specify both name and path for component %q",
@@ -428,7 +432,7 @@ func validateComponent(optComp *OptionsComponent) error {
 			return err
 		}
 	} else {
-		if !strings.HasSuffix(optComp.Path, ".comp") {
+		if !strings.HasSuffix(optComp.Path, ".comp") && !w.opts.IgnoreOptionFileExtentions {
 			return fmt.Errorf("local option component %q does not end in .comp", optComp.Path)
 		}
 		if !osutil.FileExists(optComp.Path) {
@@ -470,7 +474,7 @@ func (w *Writer) SetOptionsSnaps(optSnaps []*OptionsSnap) error {
 			}
 			w.byNameOptSnaps.Add(sn)
 		} else {
-			if !strings.HasSuffix(sn.Path, ".snap") {
+			if !strings.HasSuffix(sn.Path, ".snap") && !w.opts.IgnoreOptionFileExtentions {
 				return fmt.Errorf("local option snap %q does not end in .snap", sn.Path)
 			}
 			if !osutil.FileExists(sn.Path) {
@@ -490,7 +494,7 @@ func (w *Writer) SetOptionsSnaps(optSnaps []*OptionsSnap) error {
 			}
 		}
 		for _, comp := range sn.Components {
-			if err := validateComponent(&comp); err != nil {
+			if err := w.validateComponent(&comp); err != nil {
 				return err
 			}
 		}
@@ -967,11 +971,18 @@ func (w *Writer) extraSnapToSeed(optSnap *OptionsSnap) (*SeedSnap, error) {
 	sn := w.localSnaps[optSnap]
 	if sn == nil {
 		// not local, to download
+		seedComps := make([]SeedComponent, 0, len(optSnap.Components))
+		for _, optComp := range optSnap.Components {
+			seedComps = append(seedComps, SeedComponent{
+				ComponentRef: naming.NewComponentRef(optSnap.Name, optComp.Name),
+			})
+		}
 		sn = &SeedSnap{
 			SnapRef: optSnap,
 
 			local:      false,
 			optionSnap: optSnap,
+			Components: seedComps,
 		}
 	}
 	if sn.SnapName() == "" {
@@ -1528,8 +1539,10 @@ func (w *Writer) validationSets() (*snapasserts.ValidationSets, error) {
 
 func (w *Writer) installedSnaps() []*snapasserts.InstalledSnap {
 	installedSnap := func(snap *SeedSnap) *snapasserts.InstalledSnap {
-		return snapasserts.NewInstalledSnap(snap.SnapName(), snap.ID(), snap.Info.Revision)
+		return snapasserts.NewInstalledSnap(snap.SnapName(), snap.ID(), snap.Info.Revision, nil)
 	}
+
+	// TODO:COMPS: add components
 
 	var installedSnaps []*snapasserts.InstalledSnap
 	for _, sn := range w.snapsFromModel {
@@ -1598,11 +1611,11 @@ func (w *Writer) SeedSnaps(copySnap func(name, src, dst string) error) error {
 				}
 			} else {
 				var snapPath func(*SeedSnap) (string, error)
-				var compPath func(*SeedComponent) (string, error)
+				var compPath func(*SeedComponent, string) (string, error)
 				if sn.Info.ID() != "" {
 					// actually asserted
 					snapPath = w.tree.snapPath
-					compPath = func(sc *SeedComponent) (string, error) {
+					compPath = func(sc *SeedComponent, snapVersion string) (string, error) {
 						return w.tree.componentPath(sn, sc)
 					}
 				} else {
@@ -1618,16 +1631,18 @@ func (w *Writer) SeedSnaps(copySnap func(name, src, dst string) error) error {
 					return err
 				}
 				// copy components
-				for _, comp := range sn.Components {
-					compDst, err := compPath(&comp)
+				for i, comp := range sn.Components {
+					compDst, err := compPath(&comp, sn.Info.Version)
 					if err != nil {
 						return err
 					}
 					if err := copySnap(comp.ComponentRef.String(), comp.Path, compDst); err != nil {
 						return err
 					}
+					// record final destination path (for correct options.yaml)
+					sn.Components[i].Path = compDst
 				}
-				// record final destination path
+				// record final destination path (for correct options.yaml)
 				sn.Path = dst
 			}
 			if !info.Revision.Unset() {
@@ -1742,4 +1757,52 @@ func (w *Writer) UnassertedSnaps() ([]naming.SnapRef, error) {
 		res = append(res, sn.SnapRef)
 	}
 	return res, nil
+}
+
+func (w *Writer) VerifySnapBootstrapCompatibility() error {
+	var kernelSnap, snapdSnap *SeedSnap
+
+	saveSnap := func(sn *SeedSnap) {
+		switch sn.Info.SnapType {
+		case snap.TypeSnapd:
+			snapdSnap = sn
+		case snap.TypeKernel:
+			kernelSnap = sn
+		}
+	}
+	for _, sn := range w.snapsFromModel {
+		saveSnap(sn)
+	}
+	for _, sn := range w.extraSnaps {
+		saveSnap(sn)
+	}
+
+	if kernelSnap == nil || snapdSnap == nil {
+		return nil
+	}
+
+	kernelVersion, _, err := snap.SnapdInfoFromSnapFile(squashfs.New(kernelSnap.Path), snap.TypeKernel)
+	if err != nil {
+		return fmt.Errorf("error while reading snapd-info from kernel snap: %w", err)
+	}
+	snapdVersion, _, err := snap.SnapdInfoFromSnapFile(squashfs.New(snapdSnap.Path), snap.TypeSnapd)
+	if err != nil {
+		return fmt.Errorf("error while reading snapd-info from snapd snap: %w", err)
+	}
+
+	res, err := strutil.VersionCompare(snapdVersion, "2.68")
+	if err != nil {
+		return fmt.Errorf("could not parse version %s: %w", snapdVersion, err)
+	}
+	if res >= 0 {
+		res, err = strutil.VersionCompare(kernelVersion, "2.68")
+		if err != nil {
+			return fmt.Errorf("could not parse version %s: %w", kernelVersion, err)
+		}
+		if res < 0 {
+			return fmt.Errorf("snapd 2.68+ is not compatible with a kernel containing snapd prior to 2.68")
+		}
+	}
+
+	return nil
 }

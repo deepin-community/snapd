@@ -30,6 +30,7 @@ import (
 	"sync"
 
 	"github.com/snapcore/snapd/jsonutil"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/state"
 )
 
@@ -144,6 +145,10 @@ func shadowsExternalConfig(instanceName string, key string, value interface{}) e
 func (t *Transaction) Set(instanceName, key string, value interface{}) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	if key == "" {
+		return errors.New("internal error: key cannot be an empty string")
+	}
 
 	config := t.changes[instanceName]
 	if config == nil {
@@ -565,4 +570,13 @@ func RegisterExternalConfig(snapName, key string, vf ExternalCfgFunc) error {
 	}
 	externalConfigMap[snapName][key] = vf
 	return nil
+}
+
+// ClearExternalConfigMap must only be used for testing.
+func ClearExternalConfigMap() {
+	osutil.MustBeTestBinary("ClearExternalConfigMap only can be used in tests")
+
+	externalConfigMu.Lock()
+	defer externalConfigMu.Unlock()
+	externalConfigMap = nil
 }

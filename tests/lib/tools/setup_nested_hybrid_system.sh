@@ -19,6 +19,7 @@ run_muinstaller() {
     local kernel_assertion="${6}"
     local label="${7}"
     local disk="${8}"
+    local kern_mods_comp="${9:-}"
 
     # ack the needed assertions
     snap ack "${kernel_assertion}"
@@ -36,18 +37,25 @@ run_muinstaller() {
     tests.nested secboot-sign gadget pc-gadget "${snakeoil_key}" "${snakeoil_cert}"
     snap pack --filename=pc.snap pc-gadget/
 
+    build_snapd_snap .
+    mv snapd_*.snap snapd.snap
+
     # prepare a classic seed
-    # TODO:
-    # - repacked snapd snap
+    kmodsarg=""
+    if [ -n "$kern_mods_comp" ]
+    then kmodsarg="--comp $kern_mods_comp"
+    fi
+    # shellcheck disable=SC2086
     snap prepare-image --classic \
         --channel=edge \
         --snap "${kernel_snap}" \
+        $kmodsarg \
         --snap pc.snap \
+        --snap snapd.snap \
         "${model_assertion}" \
         ./classic-seed
 
     mv ./classic-seed/system-seed/systems/* "./classic-seed/system-seed/systems/${label}"
-    cp -a ./classic-seed/system-seed/ /var/lib/snapd/seed
 
     if [ -n "${store_dir}" ]; then
         # if we have a store setup, then we should take it down for now
@@ -55,7 +63,9 @@ run_muinstaller() {
     fi
 
     # build the muinstaller snap
-    snap install snapcraft --candidate --classic
+    if [ -z "$(command -v snapcraft)" ]; then
+        snap install snapcraft --candidate --classic
+    fi
     "${TESTSTOOLS}/lxd-state" prepare-snap
     (cd "${TESTSLIB}/muinstaller" && snapcraft)
 
@@ -94,7 +104,7 @@ run_muinstaller() {
     # TODO: this abuses /var/lib/snapd to store the deb so that mk-initramfs-classic
     # can pick it up. the real installer will also need a very recent snapd
     # in its on disk-image to support seeding
-    remote.push "${SPREAD_PATH}"/../snapd_*.deb
+    remote.push "${GOHOME}"/snapd_*.deb
     remote.exec "sudo mv snapd_*.deb /var/lib/snapd/"
     remote.exec "sudo apt install -y /var/lib/snapd/snapd_*.deb"
 
@@ -138,8 +148,25 @@ run_muinstaller() {
     # run installation
     local install_disk
     install_disk=$(remote.exec "readlink -f /dev/disk/by-id/virtio-target")
-    remote.exec "sudo muinstaller ${label} \
-        ${install_disk} /snap/muinstaller/current/bin/mk-classic-rootfs.sh"
+
+    if [ -n "${HYBRID_SYSTEM_MK_ROOT_FS-}" ]; then
+        remote.push "${HYBRID_SYSTEM_MK_ROOT_FS}" /home/user1/custom-rootfs.sh
+        remote.exec "chmod +x /home/user1/custom-rootfs.sh"
+    fi
+    remote.exec "tee /home/user1/mk-classic-rootfs-wrapper.sh" <<\EOF
+#!/bin/bash
+set -eu
+/snap/muinstaller/current/bin/mk-classic-rootfs.sh "$@"
+if [ -x /home/user1/custom-rootfs.sh ]; then
+  /home/user1/custom-rootfs.sh "$@"
+fi
+EOF
+    remote.exec "chmod +x /home/user1/mk-classic-rootfs-wrapper.sh"
+
+    remote.exec "sudo muinstaller \
+        -label ${label} \
+        -device ${install_disk} \
+        -rootfs-creator /home/user1/mk-classic-rootfs-wrapper.sh"
 
     remote.exec "sudo sync"
 
@@ -154,7 +181,7 @@ run_muinstaller() {
 
     # Change seed part label to capitals so we cover that use case
     image_path="${NESTED_IMAGES_DIR}/${image_name}"
-    kpartx -asv "${image_path}"
+    kpartx -asv "$image_path"
     fatlabel /dev/disk/by-label/ubuntu-seed UBUNTU-SEED
     if ! kpartx -d "${image_path}"; then
         # Sometimes there are random failures, let's wait and re-try
@@ -168,7 +195,7 @@ run_muinstaller() {
     fi
 
     # Start installed image
-    tests.nested create-vm core --tpm-no-restart
+    tests.nested create-vm core --keep-firmware-state
 }
 
 main() {
@@ -180,6 +207,7 @@ main() {
     local kernel_assertion=""
     local label="classic"
     local disk=""
+    local kern_mods_comp=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --model)
@@ -212,6 +240,11 @@ main() {
                 ;;
             --disk)
                 disk="${2}"
+                shift 2
+                ;;
+            --kmods-comp)
+                # Only on kernel-modules component supported atm
+                kern_mods_comp="${2}"
                 shift 2
                 ;;
             --*|-*)
@@ -271,37 +304,40 @@ main() {
         kernel_assertion="$(realpath "${kernel_assertion}")"
     fi
 
+    if [ -n "${kern_mods_comp}" ]; then
+        kern_mods_comp="$(realpath "${kern_mods_comp}")"
+    fi
+
     # start a subshell and change directories so that we can change directories
     # to keep all of our generated files together
     (
-    cd "$(mktemp -d --tmpdir="${PWD}")"
+        cd "$(mktemp -d --tmpdir="${PWD}")"
 
-    # create new disk (if the caller didn't provide one) for the installer to
-    # work on and attach to the VM
-    if [ -z "${disk}" ]; then
-        disk="${PWD}/disk.img"
-        truncate --size=6G "${disk}"
-    fi
+        # create new disk (if the caller didn't provide one) for the installer to
+        # work on and attach to the VM
+        if [ -z "${disk}" ]; then
+            disk="${PWD}/disk.img"
+            truncate --size=6G "${disk}"
+        fi
 
-    # if a gadget wasn't provided, download one we know should work for hybrid
-    # systems
-    if [ -z "${gadget_snap}" ]; then
-        snap download --channel="classic-23.10/stable" --basename=pc pc
-        gadget_snap="${PWD}/pc.snap"
-        gadget_assertion="${PWD}/pc.assert"
-    fi
+        # if a gadget wasn't provided, download one we know should work for hybrid
+        # systems
+        if [ -z "${gadget_snap}" ]; then
+            snap download --channel="classic-23.10/stable" --basename=pc pc
+            gadget_snap="${PWD}/pc.snap"
+            gadget_assertion="${PWD}/pc.assert"
+        fi
 
-    # if a kernel wasn't provided, download one
-    if [ -z "${kernel_snap}" ]; then
-        snap download --channel="23.10/stable" --basename=pc-kernel pc-kernel
-        kernel_snap="${PWD}/pc-kernel.snap"
-        kernel_assertion="${PWD}/pc-kernel.assert"
-    fi
+        # if a kernel wasn't provided, download one
+        if [ -z "${kernel_snap}" ]; then
+            snap download --channel="23.10/stable" --basename=pc-kernel pc-kernel
+            kernel_snap="${PWD}/pc-kernel.snap"
+            kernel_assertion="${PWD}/pc-kernel.assert"
+        fi
 
-    run_muinstaller "${model_assertion}" "${store_dir}" "${gadget_snap}" \
-        "${gadget_assertion}" "${kernel_snap}" "${kernel_assertion}" "${label}" \
-        "${disk}"
-
+        run_muinstaller "${model_assertion}" "${store_dir}" "${gadget_snap}" \
+                        "${gadget_assertion}" "${kernel_snap}" "${kernel_assertion}" "${label}" \
+                        "${disk}" "${kern_mods_comp}"
     )
 }
 

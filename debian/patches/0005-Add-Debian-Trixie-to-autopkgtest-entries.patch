@@ -1,0 +1,43 @@
+From: "me@zygoon.pl" <me@zygoon.pl>
+Date: Mon, 14 Jul 2025 20:32:25 +0000
+Subject: Add Debian 13 to autopkgtest entries
+
+This should fix autopkgtest in for non-sid.
+
+Signed-off-by: Zygmunt Krynicki <Zygmunt Krynicki me@zygoon.pl>
+---
+ spread.yaml | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/spread.yaml b/spread.yaml
+index 4b67bce..50ef70e 100644
+--- a/spread.yaml
++++ b/spread.yaml
+@@ -494,7 +494,26 @@ backends:
+             - ubuntu-22.04-arm64:
+                   username: ubuntu
+                   password: ubuntu
+-            # Debian
++            # Debian Trixie
++            - debian-13-amd64:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++            - debian-13-i386:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++            - debian-13-armhf:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++            - debian-13-ppc64el:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++            - debian-13-s390x:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++            - debian-13-arm64:
++                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
++            # Debian Sid
+             - debian-sid-amd64:
+                   username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+                   password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'

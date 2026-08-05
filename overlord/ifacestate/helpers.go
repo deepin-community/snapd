@@ -43,7 +43,6 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
-	"github.com/snapcore/snapd/snap/snapdir"
 	"github.com/snapcore/snapd/systemd"
 	"github.com/snapcore/snapd/timings"
 )
@@ -220,7 +219,7 @@ func (m *InterfaceManager) regenerateAllSecurityProfiles(tm timings.Measurer) er
 			logger.Noticef("cannot get current info for snap %q: %s", snapName, err)
 			return interfaces.ConfinementOptions{}
 		}
-		opts, err := m.buildConfinementOptions(m.state, snapInfo, snapst.Flags)
+		opts, err := m.buildConfinementOptions(m.state, nil, snapInfo, snapst.Flags)
 		if err != nil {
 			logger.Noticef("cannot get confinement options for snap %q: %s", snapName, err)
 		}
@@ -1104,17 +1103,12 @@ func snapsWithSecurityProfiles(st *state.State) ([]*interfaces.SnapAppSet, error
 
 			components := make([]*snap.ComponentInfo, 0, len(snapst.PendingSecurity.Components))
 			for _, csi := range snapst.PendingSecurity.Components {
-				cpi := snap.MinimalComponentContainerPlaceInfo(
-					csi.Component.ComponentName,
-					csi.Revision,
-					instanceName,
-				)
-				container := snapdir.New(cpi.MountDir())
-				ci, err := snap.ReadComponentInfoFromContainer(container, snapInfo, csi)
+				ci, err := snapstate.ReadComponentInfo(snapInfo, csi)
 				if err != nil {
 					logger.Noticef("cannot read component info for snap %q: %s", instanceName, err)
 					continue
 				}
+
 				components = append(components, ci)
 			}
 

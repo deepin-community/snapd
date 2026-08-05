@@ -23,7 +23,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -36,13 +38,13 @@ import (
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/gadget/install"
 	"github.com/snapcore/snapd/gadget/quantity"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/disks"
 	"github.com/snapcore/snapd/osutil/mkfs"
-	"github.com/snapcore/snapd/secboot"
 )
 
 func waitForDevice() string {
@@ -154,7 +156,7 @@ func maybeCreatePartitionTable(bootDevice, schema string) error {
 	return nil
 }
 
-func createPartitions(bootDevice string, volumes map[string]*gadget.Volume, encType secboot.EncryptionType) ([]*gadget.OnDiskAndGadgetStructurePair, error) {
+func createPartitions(bootDevice string, volumes map[string]*gadget.Volume) ([]*gadget.OnDiskAndGadgetStructurePair, error) {
 	vol := firstVol(volumes)
 	// snapd does not create partition tables so we have to do it here
 	// or gadget.OnDiskVolumeFromDevice() will fail
@@ -188,9 +190,16 @@ func runMntFor(label string) string {
 	return filepath.Join(dirs.GlobalRootDir, "/run/muinstaller-mnt/", label)
 }
 
+type volumeAuthOptions struct {
+	passphrase string
+	kdfType    string
+	kdfTime    time.Duration
+}
+
 func postSystemsInstallSetupStorageEncryption(cli *client.Client,
 	details *client.SystemDetails, bootDevice string,
-	dgpairs []*gadget.OnDiskAndGadgetStructurePair) (map[string]string, error) {
+	dgpairs []*gadget.OnDiskAndGadgetStructurePair,
+	volumesAuth volumeAuthOptions) (map[string]string, error) {
 
 	// We are modifiying the details struct here
 	for _, gadgetVol := range details.Volumes {
@@ -209,6 +218,14 @@ func postSystemsInstallSetupStorageEncryption(cli *client.Client,
 	opts := &client.InstallSystemOptions{
 		Step:      client.InstallStepSetupStorageEncryption,
 		OnVolumes: details.Volumes,
+	}
+	if volumesAuth.passphrase != "" {
+		opts.VolumesAuth = &device.VolumesAuthOptions{
+			Mode:       device.AuthModePassphrase,
+			Passphrase: volumesAuth.passphrase,
+			KDFType:    volumesAuth.kdfType,
+			KDFTime:    volumesAuth.kdfTime,
+		}
 	}
 	chgId, err := cli.InstallSystem(details.Label, opts)
 	if err != nil {
@@ -265,7 +282,7 @@ func nodeForPartLabel(dgpairs []*gadget.OnDiskAndGadgetStructurePair, name strin
 // TODO laidoutStructs is used to get the devices, when encryption is
 // happening maybe we need to find the information differently.
 func postSystemsInstallFinish(cli *client.Client,
-	details *client.SystemDetails, bootDevice string,
+	details *client.SystemDetails, bootDevice string, optionalInstallPath string,
 	dgpairs []*gadget.OnDiskAndGadgetStructurePair) error {
 
 	vols := make(map[string]*gadget.Volume)
@@ -282,10 +299,16 @@ func postSystemsInstallFinish(cli *client.Client,
 		vols[volName] = gadgetVol
 	}
 
+	optionalInstall, err := maybeGetOptionalInstall(optionalInstallPath)
+	if err != nil {
+		return err
+	}
+
 	// Finish steps does the writing of assets
 	opts := &client.InstallSystemOptions{
-		Step:      client.InstallStepFinish,
-		OnVolumes: vols,
+		Step:            client.InstallStepFinish,
+		OnVolumes:       vols,
+		OptionalInstall: optionalInstall,
 	}
 	chgId, err := cli.InstallSystem(details.Label, opts)
 	if err != nil {
@@ -293,6 +316,25 @@ func postSystemsInstallFinish(cli *client.Client,
 	}
 	fmt.Printf("Change %s created\n", chgId)
 	return waitChange(chgId)
+}
+
+func maybeGetOptionalInstall(path string) (*client.OptionalInstallRequest, error) {
+	if path == "" {
+		return nil, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var req client.OptionalInstallRequest
+	if err := json.NewDecoder(f).Decode(&req); err != nil {
+		return nil, err
+	}
+
+	return &req, nil
 }
 
 // createAndMountFilesystems creates and mounts filesystems. It returns
@@ -403,7 +445,7 @@ func copySeedToDataPartition() error {
 	return copySeedDir(src, dst)
 }
 
-func detectStorageEncryption(seedLabel string) (bool, error) {
+func detectStorageEncryption(seedLabel string, volumesAuth volumeAuthOptions) (bool, error) {
 	cli := client.New(nil)
 	details, err := cli.SystemDetails(seedLabel)
 	if err != nil {
@@ -413,6 +455,20 @@ func detectStorageEncryption(seedLabel string) (bool, error) {
 	if details.StorageEncryption.Support == client.StorageEncryptionSupportDefective {
 		return false, errors.New(details.StorageEncryption.UnavailableReason)
 	}
+
+	if volumesAuth.passphrase != "" {
+		passphraseAuthAvailable := false
+		for _, feat := range details.StorageEncryption.Features {
+			if feat == client.StorageEncryptionFeaturePassphraseAuth {
+				passphraseAuthAvailable = true
+				break
+			}
+		}
+		if !passphraseAuthAvailable {
+			return false, errors.New("--passphrase specified but snapd support for passphrases is missing")
+		}
+	}
+
 	return details.StorageEncryption.Support == client.StorageEncryptionSupportAvailable, nil
 }
 
@@ -497,8 +553,7 @@ func fillPartiallyDefinedVolume(vol *gadget.Volume, bootDevice string) error {
 	return nil
 }
 
-func run(seedLabel, bootDevice, rootfsCreator string) error {
-	isCore := rootfsCreator == ""
+func run(seedLabel, bootDevice, rootfsCreator, optionalInstallPath string, volumesAuth volumeAuthOptions) error {
 	logger.Noticef("installing on %q", bootDevice)
 
 	cli := client.New(nil)
@@ -506,7 +561,7 @@ func run(seedLabel, bootDevice, rootfsCreator string) error {
 	if err != nil {
 		return err
 	}
-	shouldEncrypt, err := detectStorageEncryption(seedLabel)
+	shouldEncrypt, err := detectStorageEncryption(seedLabel, volumesAuth)
 	if err != nil {
 		return err
 	}
@@ -521,17 +576,13 @@ func run(seedLabel, bootDevice, rootfsCreator string) error {
 	}
 
 	// TODO: grow the data-partition based on disk size
-	encType := secboot.EncryptionTypeNone
-	if shouldEncrypt {
-		encType = secboot.EncryptionTypeLUKS
-	}
-	dgpairs, err := createPartitions(bootDevice, details.Volumes, encType)
+	dgpairs, err := createPartitions(bootDevice, details.Volumes)
 	if err != nil {
 		return fmt.Errorf("cannot setup partitions: %v", err)
 	}
 	var encryptedDevices = make(map[string]string)
 	if shouldEncrypt {
-		encryptedDevices, err = postSystemsInstallSetupStorageEncryption(cli, details, bootDevice, dgpairs)
+		encryptedDevices, err = postSystemsInstallSetupStorageEncryption(cli, details, bootDevice, dgpairs, volumesAuth)
 		if err != nil {
 			return fmt.Errorf("cannot setup storage encryption: %v", err)
 		}
@@ -540,18 +591,25 @@ func run(seedLabel, bootDevice, rootfsCreator string) error {
 	if err != nil {
 		return fmt.Errorf("cannot create filesystems: %v", err)
 	}
+
+	hasSystemSeed := checkForRole(details, gadget.SystemSeed)
+	isCore := rootfsCreator == ""
+	if isCore || !hasSystemSeed {
+		if err := copySeedToDataPartition(); err != nil {
+			return fmt.Errorf("cannot create seed on data partition: %v", err)
+		}
+	}
+
 	if !isCore {
 		if err := createClassicRootfsIfNeeded(rootfsCreator); err != nil {
 			return fmt.Errorf("cannot create classic rootfs: %v", err)
 		}
 	}
-	if err := copySeedToDataPartition(); err != nil {
-		return fmt.Errorf("cannot create seed on data partition: %v", err)
-	}
+
 	if err := unmountFilesystems(mntPts); err != nil {
 		return fmt.Errorf("cannot unmount filesystems: %v", err)
 	}
-	if err := postSystemsInstallFinish(cli, details, bootDevice, dgpairs); err != nil {
+	if err := postSystemsInstallFinish(cli, details, bootDevice, optionalInstallPath, dgpairs); err != nil {
 		return fmt.Errorf("cannot finalize install: %v", err)
 	}
 	// TODO: reboot here automatically (optional)
@@ -559,26 +617,46 @@ func run(seedLabel, bootDevice, rootfsCreator string) error {
 	return nil
 }
 
+func checkForRole(details *client.SystemDetails, role string) bool {
+	for _, v := range details.Volumes {
+		for _, vs := range v.Structure {
+			if vs.Role == role {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func main() {
-	if len(os.Args) < 3 || len(os.Args) > 4 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <seed-label> <target-device> [rootfs-creator]\n"+
-			"If [rootfs-creator] is specified, classic Ubuntu with core boot will be installed.\n"+
-			"Otherwise, Ubuntu Core will be installed\n", os.Args[0])
+	seedLabel := flag.String("label", "", "seed label (required)")
+	bootDevice := flag.String("device", "", "target device (required)")
+	rootfsCreator := flag.String("rootfs-creator", "", "rootfs creator (optional). If specified, classic Ubuntu with core boot will be installed.\nOtherwise, Ubuntu Core will be installed")
+	optionalInstallPath := flag.String("optional", "", "path to optional snaps and components JSON file (optional)")
+	passphrase := flag.String("passphrase", "", "encryption passphrase (optional). If specified and encryption is suppported, passphrase authentication will be enabled")
+	kdfType := flag.String("kdf-type", "", "KDF type for passphrase [\"argon2id\", \"argon2i\" or \"pbkdf2\"] (optional)")
+	kdfTime := flag.Duration("kdf-time", 0, "length of time to run the KDF (optional)")
+
+	flag.Parse()
+
+	if *seedLabel == "" || *bootDevice == "" {
+		flag.Usage()
 		os.Exit(1)
 	}
+
 	logger.SimpleSetup(nil)
 
-	seedLabel := os.Args[1]
-	bootDevice := os.Args[2]
-	rootfsCreator := ""
-	if len(os.Args) > 3 {
-		rootfsCreator = os.Args[3]
-	}
-	if bootDevice == "auto" {
-		bootDevice = waitForDevice()
+	if *bootDevice == "auto" {
+		*bootDevice = waitForDevice()
 	}
 
-	if err := run(seedLabel, bootDevice, rootfsCreator); err != nil {
+	volumesAuth := volumeAuthOptions{
+		passphrase: *passphrase,
+		kdfType:    *kdfType,
+		kdfTime:    *kdfTime,
+	}
+
+	if err := run(*seedLabel, *bootDevice, *rootfsCreator, *optionalInstallPath, volumesAuth); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
 	}

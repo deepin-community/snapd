@@ -25,18 +25,23 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/confdb"
+	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/interfaces"
-	"github.com/snapcore/snapd/overlord/assertstate"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/configstate"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/ifacestate/ifacerepo"
-	"github.com/snapcore/snapd/overlord/registrystate"
 	"github.com/snapcore/snapd/overlord/state"
-	"github.com/snapcore/snapd/registry"
 	"github.com/snapcore/snapd/snap"
+)
+
+var (
+	confdbstateGetView              = confdbstate.GetView
+	confdbstateNewTransaction       = confdbstate.NewTransaction
+	confdbstateGetStoredTransaction = confdbstate.GetStoredTransaction
 )
 
 type getCommand struct {
@@ -45,7 +50,8 @@ type getCommand struct {
 	// these two options are mutually exclusive
 	ForceSlotSide bool `long:"slot" description:"return attribute values from the slot side of the connection"`
 	ForcePlugSide bool `long:"plug" description:"return attribute values from the plug side of the connection"`
-	View          bool `long:"view" description:"return registry values from the view declared in the plug"`
+	View          bool `long:"view" description:"return confdb values from the view declared in the plug"`
+	Pristine      bool `long:"pristine" description:"return confdb values disregarding changes from the current transaction"`
 
 	Positional struct {
 		PlugOrSlotSpec string   `positional-args:"true" positional-arg-name:":<plug|slot>"`
@@ -159,6 +165,9 @@ func (c *getCommand) Execute(args []string) error {
 	if c.Typed && c.Document {
 		return fmt.Errorf("cannot use -d and -t together")
 	}
+	if c.Pristine && !c.View {
+		return fmt.Errorf("cannot use --pristine without --view")
+	}
 
 	if strings.Contains(c.Positional.PlugOrSlotSpec, ":") {
 		parts := strings.SplitN(c.Positional.PlugOrSlotSpec, ":", 2)
@@ -169,15 +178,20 @@ func (c *getCommand) Execute(args []string) error {
 		if snap != "" {
 			return fmt.Errorf(`"snapctl get %s" not supported, use "snapctl get :%s" instead`, c.Positional.PlugOrSlotSpec, parts[1])
 		}
-		// registry views can be read without fields
-		if !c.View && len(c.Positional.Keys) == 0 {
+
+		if c.View {
+			if err := validateConfdbsFeatureFlag(context.State()); err != nil {
+				return err
+			}
+
+			requests := c.Positional.Keys
+			return c.getConfdbValues(context, name, requests, c.Pristine)
+		}
+
+		if len(c.Positional.Keys) == 0 {
 			return errors.New(i18n.G("get which attribute?"))
 		}
 
-		if c.View {
-			requests := c.Positional.Keys
-			return c.getRegistryValues(context, name, requests)
-		}
 		return c.getInterfaceSetting(context, name)
 	}
 
@@ -357,24 +371,29 @@ func (c *getCommand) getInterfaceSetting(context *hookstate.Context, plugOrSlot 
 	})
 }
 
-func (c *getCommand) getRegistryValues(ctx *hookstate.Context, plugName string, requests []string) error {
+func (c *getCommand) getConfdbValues(ctx *hookstate.Context, plugName string, requests []string, pristine bool) error {
 	if c.ForcePlugSide || c.ForceSlotSide {
 		return errors.New(i18n.G("cannot use --plug or --slot with --view"))
 	}
 	ctx.Lock()
 	defer ctx.Unlock()
 
-	view, err := getRegistryView(ctx, plugName)
-	if err != nil {
-		return fmt.Errorf("cannot get registry: %v", err)
-	}
-
-	tx, err := registrystate.RegistryTransaction(ctx, view.Registry())
+	account, confdbName, viewName, err := getConfdbViewID(ctx, plugName)
 	if err != nil {
 		return err
 	}
 
-	res, err := registrystate.GetViaViewInTx(tx, view, requests)
+	view, err := confdbstateGetView(ctx.State(), account, confdbName, viewName)
+	if err != nil {
+		return err
+	}
+
+	bag, err := c.getDatabag(ctx, view, pristine)
+	if err != nil {
+		return err
+	}
+
+	res, err := confdbstate.GetViaView(bag, view, requests)
 	if err != nil {
 		return err
 	}
@@ -382,36 +401,76 @@ func (c *getCommand) getRegistryValues(ctx *hookstate.Context, plugName string, 
 	return c.printPatch(res)
 }
 
-func getRegistryView(ctx *hookstate.Context, plugName string) (*registry.View, error) {
+func (c *getCommand) getDatabag(ctx *hookstate.Context, view *confdb.View, pristine bool) (bag confdb.DataBag, err error) {
+	account, confdbName := view.Confdb().Account, view.Confdb().Name
+
+	var tx *confdbstate.Transaction
+	if confdbstate.IsConfdbHook(ctx) {
+		// running in the context of a transaction, so if the referenced confdb
+		// doesn't match that tx, we only allow the caller to read the other confdb
+		t, _ := ctx.Task()
+		tx, _, err = confdbstateGetStoredTransaction(t)
+		if err != nil {
+			return nil, fmt.Errorf("cannot access confdb view %s/%s/%s: cannot get transaction: %v", account, confdbName, view.Name, err)
+		}
+
+		if tx.ConfdbAccount != account || tx.ConfdbName != confdbName {
+			// we're reading a different transaction
+			tx = nil
+		}
+	}
+
+	// reading a view but there's no ongoing transaction for it, make a temporary
+	// transaction just as a pass-through databag
+	if tx == nil {
+		tx, err = confdbstateNewTransaction(ctx.State(), account, confdbName)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if pristine {
+		return tx.Pristine(), nil
+	}
+	return tx, nil
+}
+
+func getConfdbViewID(ctx *hookstate.Context, plugName string) (account, confdbName, viewName string, err error) {
 	repo := ifacerepo.Get(ctx.State())
 
 	plug := repo.Plug(ctx.InstanceName(), plugName)
 	if plug == nil {
-		return nil, fmt.Errorf(i18n.G("cannot find plug :%s for snap %q"), plugName, ctx.InstanceName())
+		return "", "", "", fmt.Errorf(i18n.G("cannot find plug :%s for snap %q"), plugName, ctx.InstanceName())
 	}
 
-	if plug.Interface != "registry" {
-		return nil, fmt.Errorf(i18n.G("cannot use --view with non-registry plug :%s"), plugName)
+	if plug.Interface != "confdb" {
+		return "", "", "", fmt.Errorf(i18n.G("cannot use --view with non-confdb plug :%s"), plugName)
 	}
 
-	account, registryName, viewName, err := snap.RegistryPlugAttrs(plug)
+	account, confdbName, viewName, err = snap.ConfdbPlugAttrs(plug)
 	if err != nil {
-		return nil, fmt.Errorf(i18n.G("invalid plug :%s: %w"), plugName, err)
+		return "", "", "", fmt.Errorf(i18n.G("invalid plug :%s: %w"), plugName, err)
 	}
 
-	registryAssert, err := assertstate.Registry(ctx.State(), account, registryName)
-	if err != nil {
-		if errors.Is(err, &asserts.NotFoundError{}) {
-			return nil, fmt.Errorf(i18n.G("registry assertion %s/%s not found"), account, registryName)
-		}
-		return nil, err
-	}
-	reg := registryAssert.Registry()
+	return account, confdbName, viewName, nil
+}
 
-	view := reg.View(viewName)
-	if view == nil {
-		return nil, fmt.Errorf(i18n.G("view %q not found in registry %s/%s"), viewName, account, registryName)
+// validateConfdbsFeatureFlag checks whether the confdbs experimental flag
+// is enabled. The state should not be locked by the caller.
+func validateConfdbsFeatureFlag(st *state.State) error {
+	st.Lock()
+	defer st.Unlock()
+
+	tr := config.NewTransaction(st)
+	enabled, err := features.Flag(tr, features.Confdbs)
+	if err != nil && !config.IsNoOption(err) {
+		return fmt.Errorf(i18n.G("internal error: cannot check confdbs feature flag: %v"), err)
 	}
 
-	return view, nil
+	if !enabled {
+		_, confName := features.Confdbs.ConfigOption()
+		return fmt.Errorf(i18n.G(`"confdbs" feature flag is disabled: set '%s' to true`), confName)
+	}
+
+	return nil
 }

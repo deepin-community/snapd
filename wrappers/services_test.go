@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -39,6 +38,7 @@ import (
 	// imported to ensure actual interfaces are defined (in production this is guaranteed by ifacestate)
 	_ "github.com/snapcore/snapd/interfaces/builtin"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/progress"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/quota"
@@ -2751,7 +2751,7 @@ func (s *servicesTestSuite) TestAddSnapServicesAndRemoveUserDaemons(c *C) {
 }
 
 var snapdYaml = `name: snapd
-version: 1.0
+version: 2.62
 type: snapd
 `
 
@@ -3297,6 +3297,7 @@ func (s *servicesTestSuite) TestStopStartServicesWithSocketsDisableAndEnable(c *
 		// And then disable them :-)
 		{"--no-reload", "disable", "snap.hello-snap.svc1.sock1.socket", "snap.hello-snap.svc1.sock2.socket", "snap.hello-snap.svc1.service"},
 		{"daemon-reload"},
+		{"--user", "--global", "--no-reload", "disable", "snap.hello-snap.svc2.sock1.socket", "snap.hello-snap.svc2.sock2.socket", "snap.hello-snap.svc2.service"},
 	})
 
 	// For activated services, we expect StartServices to only affect the activation mechanisms
@@ -3427,6 +3428,54 @@ func (s *servicesTestSuite) TestStartServicesWithDisabledActivatedService(c *C) 
 		{"--no-reload", "enable", "snap.hello-snap.svc2.service"},
 		{"daemon-reload"},
 		{"start", "snap.hello-snap.svc2.service"},
+	})
+}
+
+func (s *servicesTestSuite) TestStartServicesWithDisabledUserServiceTriggersNoGlobalEnable(c *C) {
+	info := snaptest.MockSnap(c, packageHelloNoSrv+`
+ svc1:
+  daemon: simple
+  command: bin/hello
+  daemon-scope: user
+ svc2:
+  daemon: simple
+  command: bin/hello
+  daemon-scope: user
+`, &snap.SideInfo{Revision: snap.R(12)})
+
+	err := s.addSnapServices(info, false)
+	c.Assert(err, IsNil)
+
+	sorted := info.Services()
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Name < sorted[j].Name
+	})
+
+	// Providing a disabled map for one of the users will indicate that
+	// the service was pre-existing, meaning that it should not receive
+	// a global enable (i.e this has already occurred). Otherwise did
+	// would override the current enable-status of the services for all
+	// users
+	uid := os.Getuid()
+	disabledSvcs := &wrappers.DisabledServices{
+		// this will do nothing, svc1 is not a system service
+		SystemServices: []string{"svc1"},
+		UserServices: map[int][]string{
+			uid: {"svc2"},
+		},
+	}
+
+	s.sysdLog = nil
+	err = wrappers.StartServices(sorted, disabledSvcs, &wrappers.StartServicesOptions{Enable: true}, &progress.Null, s.perfTimings)
+	c.Assert(err, IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		// Meaning we should only see the global enable for svc1 (since that is new)
+		{"--user", "--global", "--no-reload", "enable", "snap.hello-snap.svc1.service"},
+
+		// And only see attempts at starting and enabling svc1
+		{"--user", "--no-reload", "enable", "snap.hello-snap.svc1.service"},
+		{"--user", "daemon-reload"},
+		{"--user", "start", "snap.hello-snap.svc1.service"},
 	})
 }
 
@@ -5303,6 +5352,19 @@ apps:
 		{"show", "--property=ActiveState", srvFile2Sock2},
 		{"start", srvFile2Sock1, srvFile2Sock2},
 	})
+
+	// Restart but also reload. When reloading we expect to see different behaviour.
+	// Reloading activated units is not supported by systemd, and for that reason they must
+	// not appear in the list of systemctl calls.
+	// The only call we expect to appear here is the primary service of svc1 as
+	// that one is the only one reported as active here.
+	s.sysdLog = nil
+	c.Assert(wrappers.RestartServices(services, nil, &wrappers.RestartServicesOptions{Reload: true}, progress.Null, s.perfTimings), IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2},
+		{"show", "--property=Id,ActiveState,UnitFileState,Names", srvFile2Sock1, srvFile2Sock2},
+		{"reload-or-restart", srvFile1},
+	})
 }
 
 func (s *servicesTestSuite) TestRestartWithActivatedServicesActive(c *C) {
@@ -5378,6 +5440,17 @@ apps:
 		{"show", "--property=ActiveState", srvFile2Sock1},
 		{"show", "--property=ActiveState", srvFile2Sock2},
 		{"start", srvFile2Sock1, srvFile2Sock2},
+	})
+
+	// Restart but also reload. We do not expect any services to be restarted here as
+	// both the primary units are reported inactive. (Only the activation units are
+	// reported active). The reason we don't expect to see the activation units restarted
+	// when reloading, is that these units do not support reloading by systemd.
+	s.sysdLog = nil
+	c.Assert(wrappers.RestartServices(services, nil, &wrappers.RestartServicesOptions{Reload: true}, progress.Null, s.perfTimings), IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2},
+		{"show", "--property=Id,ActiveState,UnitFileState,Names", srvFile2Sock1, srvFile2Sock2},
 	})
 }
 
@@ -5460,71 +5533,8 @@ func (s *servicesTestSuite) TestStopAndDisableServices(c *C) {
 	})
 }
 
-func (s *servicesTestSuite) TestUsersToUids(c *C) {
-	r := wrappers.MockUserLookup(func(username string) (*user.User, error) {
-		switch username {
-		case "test":
-			return &user.User{
-				Uid:      "1000",
-				Gid:      "1000",
-				Username: username,
-				Name:     "test-user",
-				HomeDir:  "~",
-			}, nil
-		case "root":
-			return &user.User{
-				Uid:      "0",
-				Gid:      "0",
-				Username: username,
-				Name:     "root",
-				HomeDir:  "/",
-			}, nil
-		default:
-			return nil, fmt.Errorf("unexpected username in test: %s", username)
-		}
-	})
-	defer r()
-
-	users, err := wrappers.UsersToUids([]string{"root", "test"})
-	c.Assert(err, IsNil)
-	c.Check(users, DeepEquals, map[int]string{
-		0:    "root",
-		1000: "test",
-	})
-}
-
-func (s *servicesTestSuite) TestUsersToUidsEmpty(c *C) {
-	users, err := wrappers.UsersToUids([]string{})
-	c.Assert(err, IsNil)
-	c.Check(users, DeepEquals, map[int]string{})
-}
-
-func (s *servicesTestSuite) TestUsersToUidsFails(c *C) {
-	r := wrappers.MockUserLookup(func(username string) (*user.User, error) {
-		c.Check(username, Equals, "test")
-		return nil, fmt.Errorf("oh no")
-	})
-	defer r()
-
-	_, err := wrappers.UsersToUids([]string{"test"})
-	c.Assert(err, ErrorMatches, `oh no`)
-}
-
-func (s *servicesTestSuite) TestUsersToUidsFailsInvalidUid(c *C) {
-	r := wrappers.MockUserLookup(func(username string) (*user.User, error) {
-		c.Check(username, Equals, "root")
-		return &user.User{
-			Uid: "hello",
-		}, nil
-	})
-	defer r()
-
-	_, err := wrappers.UsersToUids([]string{"root"})
-	c.Assert(err, ErrorMatches, `strconv.Atoi: parsing "hello": invalid syntax`)
-}
-
 func (s *servicesTestSuite) TestNewUserServiceClientNames(c *C) {
-	r := wrappers.MockUserLookup(func(username string) (*user.User, error) {
+	r := osutil.MockUserLookup(func(username string) (*user.User, error) {
 		switch username {
 		case "test":
 			return &user.User{
@@ -5554,7 +5564,7 @@ func (s *servicesTestSuite) TestNewUserServiceClientNames(c *C) {
 }
 
 func (s *servicesTestSuite) TestNewUserServiceClientNamesFails(c *C) {
-	r := wrappers.MockUserLookup(func(username string) (*user.User, error) {
+	r := osutil.MockUserLookup(func(username string) (*user.User, error) {
 		c.Check(username, Equals, "test")
 		return nil, fmt.Errorf("oh no")
 	})

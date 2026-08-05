@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -34,12 +35,12 @@ import (
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/gadget/gadgettest"
 	"github.com/snapcore/snapd/gadget/quantity"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil/disks"
 	"github.com/snapcore/snapd/osutil/kcmdline"
-	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snapfile"
 	"github.com/snapcore/snapd/snap/snaptest"
@@ -2353,7 +2354,7 @@ func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetMultiVolume(c *C) {
 	err = os.WriteFile(filepath.Join(s.dir, "u-boot.imz"), nil, 0644)
 	c.Assert(err, IsNil)
 
-	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, nil)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, device.EncryptionTypeNone, nil)
 	c.Assert(err, IsNil)
 
 	c.Assert(all, HasLen, 2)
@@ -2395,7 +2396,7 @@ func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetHappy(c *C) {
 		c.Assert(err, IsNil)
 	}
 
-	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", coreMod, secboot.EncryptionTypeNone, nil)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", coreMod, device.EncryptionTypeNone, nil)
 	c.Assert(err, IsNil)
 	c.Assert(all, HasLen, 1)
 	c.Assert(all["pc"].Volume.Bootloader, Equals, "grub")
@@ -2419,7 +2420,7 @@ func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetAndDiskHappy(c *C) {
 		4: {Name: "ubuntu-save"},
 		5: {Name: "ubuntu-data"},
 	}
-	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, nil)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, device.EncryptionTypeNone, nil)
 	c.Assert(err, IsNil)
 	c.Assert(all, HasLen, 1)
 	c.Assert(all["pc"].Volume.Bootloader, Equals, "grub")
@@ -2446,7 +2447,7 @@ func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetAndDiskFail(c *C) {
 	volToGadgetToDiskStruct := map[string]map[int]*gadget.OnDiskStructure{
 		"pc": gadgetToDiskStruct,
 	}
-	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, volToGadgetToDiskStruct)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, device.EncryptionTypeNone, volToGadgetToDiskStruct)
 	c.Assert(err.Error(), Equals, `internal error: partition "ubuntu-seed" not in disk map`)
 	c.Assert(all, IsNil)
 }
@@ -2459,7 +2460,7 @@ func (s *gadgetYamlTestSuite) testLaidOutVolumesFromGadgetUCHappy(c *C, gadgetYa
 		c.Assert(err, IsNil)
 	}
 
-	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, nil)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, device.EncryptionTypeNone, nil)
 	c.Assert(err, IsNil)
 	c.Assert(all, HasLen, 1)
 	c.Assert(all["pc"].Volume.Bootloader, Equals, "grub")
@@ -4225,6 +4226,43 @@ func (s *gadgetYamlTestSuite) TestAllDiskVolumeDeviceTraitsImplicitSystemDataHap
 	})
 }
 
+func (s *gadgetYamlTestSuite) TestAllDiskVolumeDeviceTraitsWithDeviceSetHappy(c *C) {
+	c.Assert(os.MkdirAll(filepath.Join(dirs.GlobalRootDir, "/dev/disk/by-path"), 0755), IsNil)
+
+	fakedevice := filepath.Join(dirs.GlobalRootDir, "/dev/foo")
+	c.Assert(os.Symlink(fakedevice, filepath.Join(dirs.GlobalRootDir, "/dev/disk/by-path/42:0")), IsNil)
+	c.Assert(os.WriteFile(fakedevice, nil, 0644), IsNil)
+
+	// do not mock any partitions to ensure it doesn't fall back on
+	// to that code
+
+	// mock the device name
+	restore := disks.MockDeviceNameToDiskMapping(map[string]*disks.MockDiskMapping{
+		"/dev/foo": gadgettest.MockExtraVolumeDiskMapping,
+	})
+	defer restore()
+
+	// mock the partition device node going to a particular disk
+	restore = disks.MockPartitionDeviceNodeToDiskMapping(map[string]*disks.MockDiskMapping{
+		filepath.Join(dirs.GlobalRootDir, "/dev/foop1"): gadgettest.MockExtraVolumeDiskMapping,
+	})
+	defer restore()
+
+	vol, err := gadgettest.LayoutFromYaml(c.MkDir(), gadgettest.MockExtraVolumeYAML, nil)
+	c.Assert(err, IsNil)
+
+	vol.AssignedDevice = "/dev/disk/by-path/42:0"
+	m := map[string]*gadget.Volume{
+		"foo": vol.Volume,
+	}
+	traitsMap, err := gadget.AllDiskVolumeDeviceTraits(m, nil)
+	c.Assert(err, IsNil)
+
+	c.Assert(traitsMap, DeepEquals, map[string]gadget.DiskVolumeDeviceTraits{
+		"foo": gadgettest.MockExtraVolumeDeviceTraits,
+	})
+}
+
 func (s *gadgetYamlTestSuite) TestGadgetInfoHasSameYamlAndJsonTags(c *C) {
 	// TODO: once we move to go 1.17 just use
 	//       reflect.StructField.IsExported() directly
@@ -4337,7 +4375,7 @@ func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromClassicWithModesGadgetHappy(
 		c.Assert(err, IsNil)
 	}
 
-	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", classicWithModesMod, secboot.EncryptionTypeNone, nil)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", classicWithModesMod, device.EncryptionTypeNone, nil)
 	c.Assert(err, IsNil)
 	c.Assert(all, HasLen, 1)
 	c.Assert(all["pc"].Volume.Bootloader, Equals, "grub")
@@ -4425,30 +4463,38 @@ kernel-cmdline:
 	}
 }
 
-func (s *gadgetYamlTestSuite) testVolumeMinSize(c *C, gadgetYaml []byte, volSizes map[string]quantity.Size) {
+func (s *gadgetYamlTestSuite) testVolumeSize(c *C, gadgetYaml []byte, volSizes map[string]quantity.Size, volumeSizer func(*gadget.Volume) quantity.Size) {
 	ginfo, err := gadget.InfoFromGadgetYaml(gadgetYaml, nil)
 	c.Assert(err, IsNil)
 
 	c.Assert(len(ginfo.Volumes), Equals, len(volSizes))
 	for k, v := range ginfo.Volumes {
 		c.Logf("checking size of volume %s", k)
-		c.Check(v.MinSize(), Equals, quantity.Size(volSizes[k]))
+		c.Check(volumeSizer(v), Equals, quantity.Size(volSizes[k]))
 	}
 }
 
-func (s *gadgetYamlTestSuite) TestVolumeMinSize(c *C) {
+func (s *gadgetYamlTestSuite) TestVolumeSizes(c *C) {
 	for _, tc := range []struct {
-		gadgetYaml []byte
-		volsSizes  map[string]quantity.Size
+		gadgetYaml   []byte
+		volsMinSizes map[string]quantity.Size
+		volsSizes    map[string]quantity.Size
 	}{
 		{
 			gadgetYaml: gadgetYamlUnorderedParts,
+			volsMinSizes: map[string]quantity.Size{
+				"myvol": 1300 * quantity.SizeMiB,
+			},
 			volsSizes: map[string]quantity.Size{
 				"myvol": 1300 * quantity.SizeMiB,
 			},
 		},
 		{
 			gadgetYaml: mockMultiVolumeUC20GadgetYaml,
+			volsMinSizes: map[string]quantity.Size{
+				"frobinator-image":  (1 + 500 + 10 + 500 + 1024) * quantity.SizeMiB,
+				"u-boot-frobinator": 24576 + 623000,
+			},
 			volsSizes: map[string]quantity.Size{
 				"frobinator-image":  (1 + 500 + 10 + 500 + 1024) * quantity.SizeMiB,
 				"u-boot-frobinator": 24576 + 623000,
@@ -4456,6 +4502,10 @@ func (s *gadgetYamlTestSuite) TestVolumeMinSize(c *C) {
 		},
 		{
 			gadgetYaml: mockMultiVolumeGadgetYaml,
+			volsMinSizes: map[string]quantity.Size{
+				"frobinator-image":  (1 + 128 + 380) * quantity.SizeMiB,
+				"u-boot-frobinator": 24576 + 623000,
+			},
 			volsSizes: map[string]quantity.Size{
 				"frobinator-image":  (1 + 128 + 380) * quantity.SizeMiB,
 				"u-boot-frobinator": 24576 + 623000,
@@ -4463,31 +4513,44 @@ func (s *gadgetYamlTestSuite) TestVolumeMinSize(c *C) {
 		},
 		{
 			gadgetYaml: mockVolumeUpdateGadgetYaml,
+			volsMinSizes: map[string]quantity.Size{
+				"bootloader": 12345 + 88888,
+			},
 			volsSizes: map[string]quantity.Size{
 				"bootloader": 12345 + 88888,
 			},
 		},
 		{
 			gadgetYaml: gadgetYamlPC,
+			volsMinSizes: map[string]quantity.Size{
+				"pc": (1 + 1 + 50) * quantity.SizeMiB,
+			},
 			volsSizes: map[string]quantity.Size{
 				"pc": (1 + 1 + 50) * quantity.SizeMiB,
 			},
 		},
 		{
 			gadgetYaml: gadgetYamlUC20PC,
+			volsMinSizes: map[string]quantity.Size{
+				"pc": (1 + 1 + 1200 + 750 + 16 + 1024) * quantity.SizeMiB,
+			},
 			volsSizes: map[string]quantity.Size{
 				"pc": (1 + 1 + 1200 + 750 + 16 + 1024) * quantity.SizeMiB,
 			},
 		},
 		{
 			gadgetYaml: gadgetYamlMinSizePC,
-			volsSizes: map[string]quantity.Size{
+			volsMinSizes: map[string]quantity.Size{
 				"pc": (1 + 1 + 1200 + 750 + 16 + 1024) * quantity.SizeMiB,
+			},
+			volsSizes: map[string]quantity.Size{
+				"pc": (1 + 1 + 1200 + 750 + 32 + 1024) * quantity.SizeMiB,
 			},
 		},
 	} {
-		c.Logf("test min size for %s", tc.gadgetYaml)
-		s.testVolumeMinSize(c, tc.gadgetYaml, tc.volsSizes)
+		c.Logf("test sizes for %s", tc.gadgetYaml)
+		s.testVolumeSize(c, tc.gadgetYaml, tc.volsMinSizes, (*gadget.Volume).MinSize)
+		s.testVolumeSize(c, tc.gadgetYaml, tc.volsSizes, (*gadget.Volume).Size)
 	}
 }
 
@@ -5242,8 +5305,524 @@ func (s *gadgetYamlTestSuite) TestGadgetInfoHasRole(c *C) {
 			},
 		},
 	}
-
 	c.Check(info.HasRole(gadget.SystemSeed), Equals, true)
 	c.Check(info.HasRole(gadget.SystemBoot), Equals, true)
 	c.Check(info.HasRole(gadget.SystemSeedNull), Equals, false)
+}
+
+func (s *gadgetYamlTestSuite) TestVolumesHaveRole(c *C) {
+	volumes := map[string]*gadget.Volume{
+		"name": {
+			Structure: []gadget.VolumeStructure{
+				{Role: gadget.SystemSeed},
+			},
+		},
+		"other-name": {
+			Structure: []gadget.VolumeStructure{
+				{Role: gadget.SystemBoot},
+			},
+		},
+	}
+
+	c.Check(gadget.VolumesHaveRole(volumes, gadget.SystemSeed), Equals, true)
+	c.Check(gadget.VolumesHaveRole(volumes, gadget.SystemBoot), Equals, true)
+	c.Check(gadget.VolumesHaveRole(volumes, gadget.SystemSeedNull), Equals, false)
+}
+
+type gadgetYamlVolumeAssignmentSuite struct {
+	testutil.BaseTest
+
+	dir0            string
+	dir1            string
+	gadget0YamlPath string
+	gadget1YamlPath string
+}
+
+var _ = Suite(&gadgetYamlVolumeAssignmentSuite{})
+
+var mockVolumeAssignmentGadgetYamlBase = []byte(`
+volumes:
+  lun-0:
+    schema: mbr
+    bootloader: u-boot
+    id:     0C
+    structure:
+      - filesystem-label: system-boot
+        offset: 12345
+        offset-write: 777
+        size: 88888
+        type: 0C
+        filesystem: vfat
+        content:
+          - source: foo
+            target: /
+  lun-1:
+    schema: mbr
+    structure:
+      - name: system-test
+        type: bare
+        size: 16M
+        content:
+          - image: content.img
+`)
+
+var mockVolumeAssignmentGadget0Yaml = string(mockVolumeAssignmentGadgetYamlBase) + `
+volume-assignments:
+- assignment-name: foo-device
+  assignment:
+    lun-0:
+      device: /dev/disk/by-path/pci-0000:02:00.1-ata-5
+- assignment-name: bar-device
+  assignment:
+    lun-0:
+      device: /dev/disk/by-id/1
+    lun-1:
+      device: /dev/disk/by-id/wwm1234
+`
+
+var mockInvalidAssignmentGadgetYaml = string(mockVolumeAssignmentGadget0Yaml) + `
+- assignment-name: baz-device
+  assignment:
+    lun-1:
+      device: /dev/by-sda
+`
+
+var mockNonExistingAssignmentGadgetYaml = string(mockVolumeAssignmentGadget0Yaml) + `
+- assignment-name: baz-device
+  assignment:
+    lun-2:
+      device: /dev/disk/by-id/1
+`
+
+var mockNoAssignmentGadgetYaml = string(mockVolumeAssignmentGadget0Yaml) + `
+- assignment-name: baz-device
+`
+
+var mockIdenticalAssignmentOkayGadgetYaml = string(mockVolumeAssignmentGadgetYamlBase) + `
+volume-assignments:
+- assignment-name: foo-device
+  assignment:
+    lun-0:
+      device: /dev/disk/by-id/2
+    lun-1:
+      device: /dev/disk/by-path/pci-0000:06:00.1-ata-5
+- assignment-name: foo-device
+  assignment:
+    lun-0:
+      device: /dev/disk/by-id/1
+    lun-1:
+      device: /dev/disk/by-path/pci-0000:02:00.1-ata-5
+`
+
+var mockIdenticalAssignmentNotOkayGadgetYaml = string(mockVolumeAssignmentGadgetYamlBase) + `
+volume-assignments:
+- assignment-name: foo-device
+  assignment:
+    lun-0:
+      device: /dev/disk/by-id/1
+    lun-1:
+      device: /dev/disk/by-path/pci-0000:02:00.1-ata-5
+- assignment-name: bar-device
+  assignment:
+    lun-0:
+      device: /dev/disk/by-id/1
+    lun-1:
+      device: /dev/disk/by-path/pci-0000:02:00.1-ata-5
+`
+
+var mockChangedAssignmentGadget1Yaml = string(mockVolumeAssignmentGadgetYamlBase) + `
+volume-assignments:
+- assignment-name: foo-device
+  assignment:
+    lun-0:
+      device: /dev/disk/by-id/foz1234
+- assignment-name: bar-device
+  assignment:
+    lun-0:
+      device: /dev/disk/by-id/1
+    lun-1:
+      device: /dev/disk/by-path/pci-0000:02:00.1-ata-5
+`
+
+func (s *gadgetYamlVolumeAssignmentSuite) SetUpTest(c *C) {
+	s.BaseTest.SetUpTest(c)
+	dirs.SetRootDir(c.MkDir())
+
+	// This will act as the "old" gadget
+	s.dir0 = c.MkDir()
+	c.Assert(os.MkdirAll(filepath.Join(s.dir0, "meta"), 0755), IsNil)
+	s.gadget0YamlPath = filepath.Join(s.dir0, "meta", "gadget.yaml")
+
+	// This will act as the new gadget
+	s.dir1 = c.MkDir()
+	c.Assert(os.MkdirAll(filepath.Join(s.dir1, "meta"), 0755), IsNil)
+	s.gadget1YamlPath = filepath.Join(s.dir1, "meta", "gadget.yaml")
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TearDownTest(c *C) {
+	dirs.SetRootDir("/")
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestVolumesForCurrentDeviceAssignmentSimple(c *C) {
+	c.Assert(os.MkdirAll(path.Join(dirs.GlobalRootDir, "/dev/disk/by-id"), 0755), IsNil)
+	c.Assert(os.WriteFile(path.Join(dirs.GlobalRootDir, "/dev/disk/by-id/1"), []byte(``), 0644), IsNil)
+
+	gi := &gadget.Info{
+		Volumes: map[string]*gadget.Volume{
+			"p1": {
+				Name: "p1",
+			},
+		},
+		VolumeAssignments: []*gadget.VolumeAssignment{
+			{
+				Name: "assign-0",
+				Assignments: map[string]*gadget.DeviceAssignment{
+					"p1": {
+						Device: "/dev/disk/by-id/1",
+					},
+				},
+			},
+		},
+	}
+
+	vols, err := gadget.VolumesForCurrentDeviceAssignment(gi)
+	c.Check(err, IsNil)
+	c.Check(vols, DeepEquals, gi.Volumes)
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestVolumesForCurrentDeviceAssignmentNoAssignments(c *C) {
+	c.Assert(os.MkdirAll(path.Join(dirs.GlobalRootDir, "/dev/disk/by-id"), 0755), IsNil)
+	c.Assert(os.WriteFile(path.Join(dirs.GlobalRootDir, "/dev/disk/by-id/1"), []byte(``), 0644), IsNil)
+
+	gi := &gadget.Info{
+		Volumes: map[string]*gadget.Volume{
+			"p1": {
+				Name: "p1",
+			},
+		},
+		VolumeAssignments: []*gadget.VolumeAssignment{
+			{
+				Name: "assign-0",
+				Assignments: map[string]*gadget.DeviceAssignment{
+					"p1": {
+						Device: "/dev/disk/by-id/2",
+					},
+				},
+			},
+		},
+	}
+
+	_, err := gadget.VolumesForCurrentDeviceAssignment(gi)
+	c.Check(err, ErrorMatches, `no matching volume-assignment for current device`)
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestVolumesForCurrentDeviceAssignmentMultipleAssignments(c *C) {
+	c.Assert(os.MkdirAll(path.Join(dirs.GlobalRootDir, "/dev/disk/by-id"), 0755), IsNil)
+	c.Assert(os.WriteFile(path.Join(dirs.GlobalRootDir, "/dev/disk/by-id/1"), []byte(``), 0644), IsNil)
+	c.Assert(os.WriteFile(path.Join(dirs.GlobalRootDir, "/dev/disk/by-id/2"), []byte(``), 0644), IsNil)
+
+	gi := &gadget.Info{
+		Volumes: map[string]*gadget.Volume{
+			"p1": {
+				Name: "p1",
+			},
+		},
+		VolumeAssignments: []*gadget.VolumeAssignment{
+			{
+				Name: "assign-0",
+				Assignments: map[string]*gadget.DeviceAssignment{
+					"p1": {
+						Device: "/dev/disk/by-id/1",
+					},
+				},
+			},
+			{
+				Name: "assign-1",
+				Assignments: map[string]*gadget.DeviceAssignment{
+					"p1": {
+						Device: "/dev/disk/by-id/2",
+					},
+				},
+			},
+		},
+	}
+
+	_, err := gadget.VolumesForCurrentDeviceAssignment(gi)
+	c.Check(err, ErrorMatches, `multiple matching volume-assignment for current device`)
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestReadGadgetYamlInvalidDevicePath(c *C) {
+	err := os.WriteFile(s.gadget0YamlPath, []byte(mockInvalidAssignmentGadgetYaml), 0644)
+	c.Assert(err, IsNil)
+
+	_, err = gadget.ReadInfo(s.dir0, coreMod)
+	c.Assert(err, ErrorMatches, `volume-assignment variant "baz-device": "lun-1": unsupported device path "/dev/by-sda", for now only paths under /dev/disk/{by-path,by-id} are valid`)
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestReadGadgetYamlInvalidVolume(c *C) {
+	err := os.WriteFile(s.gadget0YamlPath, []byte(mockNonExistingAssignmentGadgetYaml), 0644)
+	c.Assert(err, IsNil)
+
+	_, err = gadget.ReadInfo(s.dir0, coreMod)
+	c.Assert(err, ErrorMatches, `volume-assignment variant \"baz-device\": volume \"lun-2\" is mentioned in assignment but has not been defined`)
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestReadGadgetYamlNoAssignments(c *C) {
+	err := os.WriteFile(s.gadget0YamlPath, []byte(mockNoAssignmentGadgetYaml), 0644)
+	c.Assert(err, IsNil)
+
+	_, err = gadget.ReadInfo(s.dir0, coreMod)
+	c.Assert(err, ErrorMatches, `volume-assignment variant \"baz-device\": no assignments specified`)
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestReadGadgetYamlIdenticalAssignmentsHappy(c *C) {
+	err := os.WriteFile(s.gadget0YamlPath, []byte(mockIdenticalAssignmentOkayGadgetYaml), 0644)
+	c.Assert(err, IsNil)
+
+	_, err = gadget.ReadInfo(s.dir0, coreMod)
+	c.Assert(err, IsNil)
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestReadGadgetYamlIdenticalAssignmentsFail(c *C) {
+	err := os.WriteFile(s.gadget0YamlPath, []byte(mockIdenticalAssignmentNotOkayGadgetYaml), 0644)
+	c.Assert(err, IsNil)
+
+	_, err = gadget.ReadInfo(s.dir0, coreMod)
+	c.Assert(err, ErrorMatches, `volume-assignment variant \"bar-device\": identical to \"foo-device\"`)
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestReadGadgetYamlHappy(c *C) {
+	err := os.WriteFile(s.gadget0YamlPath, []byte(mockVolumeAssignmentGadget0Yaml), 0644)
+	c.Assert(err, IsNil)
+
+	ginfo, err := gadget.ReadInfo(s.dir0, coreMod)
+	c.Assert(err, IsNil)
+	expected := &gadget.Info{
+		Volumes: map[string]*gadget.Volume{
+			"lun-0": {
+				Name:       "lun-0",
+				Schema:     "mbr",
+				Bootloader: "u-boot",
+				ID:         "0C",
+				Structure: []gadget.VolumeStructure{
+					{
+						VolumeName:  "lun-0",
+						Label:       "system-boot",
+						Role:        "system-boot", // implicit
+						Offset:      asOffsetPtr(12345),
+						OffsetWrite: mustParseGadgetRelativeOffset(c, "777"),
+						Size:        88888,
+						MinSize:     88888,
+						Type:        "0C",
+						Filesystem:  "vfat",
+						Content: []gadget.VolumeContent{
+							{
+								UnresolvedSource: "foo",
+								Target:           "/",
+								Unpack:           false,
+							},
+						},
+					},
+				},
+			},
+			"lun-1": {
+				Name:   "lun-1",
+				Schema: "mbr",
+				Structure: []gadget.VolumeStructure{
+					{
+						VolumeName: "lun-1",
+						Name:       "system-test",
+						Type:       "bare",
+						Offset:     asOffsetPtr(quantity.OffsetMiB),
+						Size:       16 * 1024 * 1024,
+						MinSize:    16 * 1024 * 1024,
+						Content: []gadget.VolumeContent{
+							{
+								Image: "content.img",
+							},
+						},
+						YamlIndex: 0,
+					},
+				},
+			},
+		},
+		VolumeAssignments: []*gadget.VolumeAssignment{
+			{
+				Name: "foo-device",
+				Assignments: map[string]*gadget.DeviceAssignment{
+					"lun-0": {
+						Device: "/dev/disk/by-path/pci-0000:02:00.1-ata-5",
+					},
+				},
+			},
+			{
+				Name: "bar-device",
+				Assignments: map[string]*gadget.DeviceAssignment{
+					"lun-0": {
+						Device: "/dev/disk/by-id/1",
+					},
+					"lun-1": {
+						Device: "/dev/disk/by-id/wwm1234",
+					},
+				},
+			},
+		},
+	}
+	gadget.SetEnclosingVolumeInStructs(expected.Volumes)
+
+	c.Check(ginfo, DeepEquals, expected)
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestUpdateApplyNoMatchingAssignment(c *C) {
+	// Without any mocking of current devices - it wont find any matching
+	// for the fake assignments, and should report an error
+	c.Assert(os.WriteFile(s.gadget0YamlPath, []byte(mockVolumeAssignmentGadget0Yaml), 0644), IsNil)
+	c.Assert(os.WriteFile(s.gadget1YamlPath, []byte(mockVolumeAssignmentGadget0Yaml), 0644), IsNil)
+
+	oldInfo, err := gadget.ReadInfo(s.dir0, coreMod)
+	c.Assert(err, IsNil)
+	oldRootDir := c.MkDir()
+	makeSizedFile(c, filepath.Join(oldRootDir, "content.img"), 10*quantity.SizeMiB, nil)
+	oldData := gadget.GadgetData{Info: oldInfo, RootDir: oldRootDir}
+
+	newInfo, err := gadget.ReadInfo(s.dir1, coreMod)
+	c.Assert(err, IsNil)
+
+	newRootDir := c.MkDir()
+	makeSizedFile(c, filepath.Join(newRootDir, "content.img"), 11*quantity.SizeMiB, nil)
+	newData := gadget.GadgetData{Info: newInfo, RootDir: newRootDir}
+
+	rollbackDir := c.MkDir()
+
+	muo := &mockUpdateProcessObserver{}
+	updaterForStructureCalls := 0
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, rootDir, rollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+		fmt.Println("update-for-structure", loc, ps, fromPs)
+		updaterForStructureCalls++
+		mu := &mockUpdater{}
+
+		return mu, nil
+	})
+	defer restore()
+
+	err = gadget.Update(uc16Model, oldData, newData, rollbackDir, nil, muo)
+	c.Check(err, ErrorMatches, `cannot update gadget assets: no matching volume-assignment for current device`)
+	c.Check(updaterForStructureCalls, Equals, 0)
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestUpdateApplyAssignmentChanged(c *C) {
+	// Create matchings - but now let us say that the once provided in the gadget
+	// has changed in an update, this must fail
+	restore := gadget.MockFindVolumesMatchingDeviceAssignment(func(gi *gadget.Info) (map[string]*gadget.Volume, error) {
+		gi.Volumes["lun-0"].AssignedDevice = gi.VolumeAssignments[1].Assignments["lun-0"].Device
+		gi.Volumes["lun-1"].AssignedDevice = gi.VolumeAssignments[1].Assignments["lun-1"].Device
+		return map[string]*gadget.Volume{
+			"lun-0": gi.Volumes["lun-0"],
+			"lun-1": gi.Volumes["lun-1"],
+		}, nil
+	})
+	defer restore()
+
+	c.Assert(os.WriteFile(s.gadget0YamlPath, []byte(mockVolumeAssignmentGadget0Yaml), 0644), IsNil)
+	c.Assert(os.WriteFile(s.gadget1YamlPath, []byte(mockChangedAssignmentGadget1Yaml), 0644), IsNil)
+
+	oldInfo, err := gadget.ReadInfo(s.dir0, coreMod)
+	c.Assert(err, IsNil)
+	oldRootDir := c.MkDir()
+	makeSizedFile(c, filepath.Join(oldRootDir, "content.img"), 10*quantity.SizeMiB, nil)
+	oldData := gadget.GadgetData{Info: oldInfo, RootDir: oldRootDir}
+
+	newInfo, err := gadget.ReadInfo(s.dir1, coreMod)
+	c.Assert(err, IsNil)
+
+	newRootDir := c.MkDir()
+	makeSizedFile(c, filepath.Join(newRootDir, "content.img"), 11*quantity.SizeMiB, nil)
+	newData := gadget.GadgetData{Info: newInfo, RootDir: newRootDir}
+
+	rollbackDir := c.MkDir()
+
+	muo := &mockUpdateProcessObserver{}
+	updaterForStructureCalls := 0
+	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, rootDir, rollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+		fmt.Println("update-for-structure", loc, ps, fromPs)
+		updaterForStructureCalls++
+		mu := &mockUpdater{}
+
+		return mu, nil
+	})
+	defer restore()
+
+	err = gadget.Update(uc16Model, oldData, newData, rollbackDir, nil, muo)
+	c.Check(err, ErrorMatches, `cannot update gadget assets: device assignment is not identical for \"lun-1\"`)
+	c.Check(updaterForStructureCalls, Equals, 0)
+}
+
+func (s *gadgetYamlVolumeAssignmentSuite) TestUpdateApplyHappy(c *C) {
+	c.Assert(os.WriteFile(s.gadget0YamlPath, []byte(mockVolumeAssignmentGadget0Yaml), 0644), IsNil)
+	c.Assert(os.WriteFile(s.gadget1YamlPath, []byte(mockVolumeAssignmentGadget0Yaml), 0644), IsNil)
+
+	oldInfo, err := gadget.ReadInfo(s.dir0, coreMod)
+	c.Assert(err, IsNil)
+	oldRootDir := c.MkDir()
+	makeSizedFile(c, filepath.Join(oldRootDir, "content.img"), 10*quantity.SizeMiB, nil)
+	oldData := gadget.GadgetData{Info: oldInfo, RootDir: oldRootDir}
+
+	newInfo, err := gadget.ReadInfo(s.dir1, coreMod)
+	c.Assert(err, IsNil)
+	// pretend we have an update
+	newInfo.Volumes["lun-1"].Structure[0].Update.Edition = 1
+
+	newRootDir := c.MkDir()
+	makeSizedFile(c, filepath.Join(newRootDir, "content.img"), 11*quantity.SizeMiB, nil)
+	newData := gadget.GadgetData{Info: newInfo, RootDir: newRootDir}
+
+	rollbackDir := c.MkDir()
+
+	restore := gadget.MockFindVolumesMatchingDeviceAssignment(func(gi *gadget.Info) (map[string]*gadget.Volume, error) {
+		gi.Volumes["lun-0"].AssignedDevice = "/dev/disk/by-id/1"
+		gi.Volumes["lun-1"].AssignedDevice = "/dev/disk/by-id/wwm1234"
+		return map[string]*gadget.Volume{
+			"lun-0": gi.Volumes["lun-0"],
+			"lun-1": gi.Volumes["lun-1"],
+		}, nil
+	})
+	defer restore()
+
+	restore = gadget.MockVolumeStructureToLocationMap(func(gm gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"lun-0": {
+					0: {
+						Device:         oldVolumes["lun-0"].AssignedDevice,
+						Offset:         quantity.OffsetMiB,
+						RootMountPoint: "/run/mnt/ubuntu-boot",
+					},
+				},
+				"lun-1": {
+					0: {
+						Device:         oldVolumes["lun-1"].AssignedDevice,
+						Offset:         quantity.OffsetMiB,
+						RootMountPoint: "/run/mnt/ubuntu-test",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"lun-0": gadget.OnDiskStructsFromGadget(oldVolumes["lun-0"]),
+				"lun-1": gadget.OnDiskStructsFromGadget(oldVolumes["lun-1"]),
+			}, nil
+	})
+	defer restore()
+
+	muo := &mockUpdateProcessObserver{}
+	updaterForStructureCalls := 0
+	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, rootDir, rollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+		fmt.Println("update-for-structure", loc, ps, fromPs)
+		updaterForStructureCalls++
+		mu := &mockUpdater{}
+
+		return mu, nil
+	})
+	defer restore()
+
+	err = gadget.Update(uc16Model, oldData, newData, rollbackDir, nil, muo)
+	c.Check(err, IsNil)
+	c.Check(updaterForStructureCalls, Equals, 1)
 }

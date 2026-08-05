@@ -109,8 +109,11 @@ type State struct {
 	pendingChangeByAttr map[string]func(*Change) bool
 
 	// task/changes observing
-	taskHandlers   map[int]func(t *Task, old, new Status)
+	taskHandlers   map[int]func(t *Task, old, new Status) (remove bool)
 	changeHandlers map[int]func(chg *Change, old, new Status)
+
+	lockWaitStart int64
+	lockHoldStart int64
 }
 
 // New returns a new empty state.
@@ -125,7 +128,7 @@ func New(backend Backend) *State {
 		modified:            true,
 		cache:               make(map[interface{}]interface{}),
 		pendingChangeByAttr: make(map[string]func(*Change) bool),
-		taskHandlers:        make(map[int]func(t *Task, old Status, new Status)),
+		taskHandlers:        make(map[int]func(t *Task, old Status, new Status) bool),
 		changeHandlers:      make(map[int]func(chg *Change, old Status, new Status)),
 	}
 	st.noticeCond = sync.NewCond(st) // use State.Lock and State.Unlock
@@ -139,8 +142,11 @@ func (s *State) Modified() bool {
 
 // Lock acquires the state lock.
 func (s *State) Lock() {
+	lockWait := lockTimestamp()
 	s.mu.Lock()
 	atomic.AddInt32(&s.muC, 1)
+	s.lockWaitStart = lockWait
+	s.lockHoldStart = lockTimestamp()
 }
 
 func (s *State) reading() {
@@ -158,7 +164,11 @@ func (s *State) writing() {
 
 func (s *State) unlock() {
 	atomic.AddInt32(&s.muC, -1)
+	lockWaitStart, lockHoldStart := s.lockWaitStart, s.lockHoldStart
+	s.lockWaitStart, s.lockHoldStart = 0, 0
+	lockHoldEnd := lockTimestamp()
 	s.mu.Unlock()
+	maybeSaveLockTime(lockWaitStart, lockHoldStart, lockHoldEnd)
 }
 
 type marshalledState struct {
@@ -536,7 +546,7 @@ func (s *State) GetMaybeTimings(timings interface{}) error {
 // of the taskrunner, so the callbacks should be as simple as possible, and return
 // as quickly as possible, and should avoid the use of i/o code or blocking, as this
 // will stop the entire task system.
-func (s *State) AddTaskStatusChangedHandler(f func(t *Task, old, new Status)) (id int) {
+func (s *State) AddTaskStatusChangedHandler(f func(t *Task, old, new Status) (remove bool)) (id int) {
 	// We are reading here as we want to ensure access to the state is serialized,
 	// and not writing as we are not changing the part of state that goes on the disk.
 	s.reading()
@@ -553,8 +563,10 @@ func (s *State) RemoveTaskStatusChangedHandler(id int) {
 
 func (s *State) notifyTaskStatusChangedHandlers(t *Task, old, new Status) {
 	s.reading()
-	for _, f := range s.taskHandlers {
-		f(t, old, new)
+	for id, f := range s.taskHandlers {
+		if remove := f(t, old, new); remove {
+			s.RemoveTaskStatusChangedHandler(id)
+		}
 	}
 }
 
@@ -607,6 +619,6 @@ func ReadState(backend Backend, r io.Reader) (*State, error) {
 	s.cache = make(map[interface{}]interface{})
 	s.pendingChangeByAttr = make(map[string]func(*Change) bool)
 	s.changeHandlers = make(map[int]func(chg *Change, old Status, new Status))
-	s.taskHandlers = make(map[int]func(t *Task, old Status, new Status))
+	s.taskHandlers = make(map[int]func(t *Task, old Status, new Status) bool)
 	return s, err
 }

@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -32,6 +31,7 @@ import (
 	"syscall"
 
 	"github.com/snapcore/snapd/osutil/sys"
+	"github.com/snapcore/snapd/osutil/user"
 )
 
 var (
@@ -370,7 +370,7 @@ func UserMaybeSudoUser() (*user.User, error) {
 		return cur, nil
 	}
 
-	real, err := user.Lookup(realName)
+	real, err := userLookup(realName)
 	// This is a best effort, see the comment in findGidNoGetentFallback in
 	// group.go.
 	//
@@ -403,4 +403,33 @@ func UidGid(u *user.User) (sys.UserID, sys.GroupID, error) {
 	}
 
 	return sys.UserID(uid), sys.GroupID(gid), nil
+}
+
+// Allow other test suites to mock this functionality
+func MockUserLookup(mock func(name string) (*user.User, error)) func() {
+	MustBeTestBinary("MockUserLookup cannot be called outside of tests")
+
+	realUserLookup := userLookup
+	userLookup = mock
+
+	return func() { userLookup = realUserLookup }
+}
+
+// UsernamesToUids converts a list of usernames to map indexed
+// by their UID, i.e the call
+// UsernamesToUids([]string{"root"}) may return { 0, "root" }
+func UsernamesToUids(users []string) (map[int]string, error) {
+	uids := make(map[int]string)
+	for _, username := range users {
+		usr, err := userLookup(username)
+		if err != nil {
+			return nil, err
+		}
+		uid, err := strconv.Atoi(usr.Uid)
+		if err != nil {
+			return nil, err
+		}
+		uids[uid] = username
+	}
+	return uids, nil
 }

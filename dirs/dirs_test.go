@@ -262,8 +262,14 @@ func (s *DirsTestSuite) TestAddRootDirCallback(c *C) {
 	c.Assert(someDerivedVar, Equals, filepath.Join("/hello", "var", "snap", "other", "mnt"))
 }
 
-func (s *DirsTestSuite) TestLibexecdirOpenSUSETW(c *C) {
-	restore := release.MockReleaseInfo(&release.OS{ID: "opensuse-tumbleweed", VersionID: "20200820"})
+func (s *DirsTestSuite) TestLibexecdirOpenSUSEFlavors(c *C) {
+	restore := release.MockReleaseInfo(&release.OS{ID: "opensuse-leap",
+		IDLike: []string{"suse", "opensuse"}, VersionID: "15.6"})
+	defer restore()
+	dirs.SetRootDir("/")
+	c.Check(dirs.DistroLibExecDir, Equals, "/usr/lib/snapd")
+
+	restore = release.MockReleaseInfo(&release.OS{ID: "opensuse-tumbleweed", VersionID: "20200820"})
 	defer restore()
 	dirs.SetRootDir("/")
 	c.Check(dirs.DistroLibExecDir, Equals, "/usr/lib/snapd")
@@ -277,4 +283,24 @@ func (s *DirsTestSuite) TestLibexecdirOpenSUSETW(c *C) {
 	defer restore()
 	dirs.SetRootDir("/")
 	c.Check(dirs.DistroLibExecDir, Equals, "/usr/libexec/snapd")
+
+	// from https://forum.snapcraft.io/t/tumbleweed-snapd-service-wont-start/42148
+	restore = release.MockReleaseInfo(&release.OS{ID: "opensuse-slowroll", VersionID: "20240904"})
+	defer restore()
+	dirs.SetRootDir("/")
+	c.Check(dirs.DistroLibExecDir, Equals, "/usr/libexec/snapd")
+}
+
+func (s *DirsTestSuite) TestWritableMountPath(c *C) {
+	release.MockOnClassic(true)
+	dirs.SetRootDir("/")
+
+	c.Check(dirs.WritableMountPath, Equals, "/")
+}
+
+func (s *DirsTestSuite) TestWritableMountPathCore(c *C) {
+	release.MockOnClassic(false)
+	dirs.SetRootDir("/")
+
+	c.Check(dirs.WritableMountPath, Equals, "/writable")
 }

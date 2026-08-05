@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -41,6 +42,7 @@ import (
 	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/gadget"
 	"github.com/snapcore/snapd/i18n"
+	"github.com/snapcore/snapd/kernel"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/auth"
@@ -52,6 +54,7 @@ import (
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/channel"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snapdenv"
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/strutil"
@@ -71,12 +74,11 @@ const (
 
 const (
 	BeginEdge                        = state.TaskSetEdge("begin")
+	SnapSetupEdge                    = state.TaskSetEdge("snap-setup")
 	BeforeHooksEdge                  = state.TaskSetEdge("before-hooks")
 	HooksEdge                        = state.TaskSetEdge("hooks")
-	BeforeMaybeRebootEdge            = state.TaskSetEdge("before-maybe-reboot")
 	MaybeRebootEdge                  = state.TaskSetEdge("maybe-reboot")
 	MaybeRebootWaitEdge              = state.TaskSetEdge("maybe-reboot-wait")
-	AfterMaybeRebootWaitEdge         = state.TaskSetEdge("after-maybe-reboot-wait")
 	LastBeforeLocalModificationsEdge = state.TaskSetEdge("last-before-local-modifications")
 	EndEdge                          = state.TaskSetEdge("end")
 )
@@ -123,7 +125,7 @@ func (ins installSnapInfo) SnapBase() string {
 }
 
 func (ins installSnapInfo) Prereq(st *state.State, prqt PrereqTracker) []string {
-	return getKeys(defaultProviderContentAttrs(st, ins.Info, prqt))
+	return keys(defaultProviderContentAttrs(st, ins.Info, prqt))
 }
 
 // InsufficientSpaceError represents an error where there is not enough disk
@@ -190,15 +192,6 @@ func isParallelInstallable(snapsup *SnapSetup) error {
 		return nil
 	}
 	return fmt.Errorf("cannot install snap of type %v as %q", snapsup.Type, snapsup.InstanceName())
-}
-
-func optedIntoSnapdSnap(st *state.State) (bool, error) {
-	tr := config.NewTransaction(st)
-	experimentalAllowSnapd, err := features.Flag(tr, features.SnapdSnap)
-	if err != nil && !config.IsNoOption(err) {
-		return false, err
-	}
-	return experimentalAllowSnapd, nil
 }
 
 // refreshRetain returns refresh.retain value if set, or the default value (different for core and classic).
@@ -271,6 +264,75 @@ func configureSnapFlags(snapst *SnapState, snapsup *SnapSetup) int {
 
 func isCoreSnap(snapName string) bool {
 	return snapName == defaultCoreSnapName
+}
+
+// removeExtraComponentsTasks creates tasks that will remove unwanted components
+// that are currently installed alongside the target snap revision. If the new
+// snap revision is not in the sequence, then we don't have anything to do. If
+// the revision is in the sequence, then we generate tasks that will unlink
+// components that are not in compsups.
+//
+// This is mostly relevant when we're moving from one snap revision to another
+// snap revision that was installed in past and is still in the sequence. The
+// target snap might have had components that were installed alongside it in the
+// past, and they are not wanted anymore.
+func removeExtraComponentsTasks(st *state.State, snapst *SnapState, targetRevision snap.Revision, compsups []ComponentSetup) (
+	unlinkTasks, discardTasks []*state.Task, err error,
+) {
+	idx := snapst.LastIndex(targetRevision)
+	if idx < 0 {
+		return nil, nil, nil
+	}
+
+	keep := make(map[naming.ComponentRef]bool, len(compsups))
+	for _, compsup := range compsups {
+		keep[compsup.CompSideInfo.Component] = true
+	}
+
+	linkedForRevision, err := snapst.ComponentInfosForRevision(targetRevision)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for _, ci := range linkedForRevision {
+		if keep[ci.Component] {
+			continue
+		}
+
+		// note that we shouldn't ever be able to lose components during a
+		// refresh without a snap revision change. this might be able to happen
+		// once we introduce components and validation sets? if that is the
+		// case, we'll need to take care here to use "unlink-current-component"
+		// and point it to the correct snap setup task.
+		if snapst.Current == targetRevision {
+			return nil, nil, errors.New("internal error: cannot lose a component during a refresh without a snap revision change")
+		}
+
+		// note that we don't need to worry about kernel module components here,
+		// since the components that we are removing are not associated with the
+		// current snap revision. unlink-component differs from
+		// unlink-current-component in that it doesn't save the state of kernel
+		// module components on the the SnapSetup.
+		unlink := st.NewTask("unlink-component", fmt.Sprintf(
+			i18n.G("Unlink component %q for snap revision %s"), ci.Component, targetRevision,
+		))
+
+		unlink.Set("component-setup", ComponentSetup{
+			CompSideInfo: &ci.ComponentSideInfo,
+			CompType:     ci.Type,
+		})
+		unlinkTasks = append(unlinkTasks, unlink)
+
+		if !snapst.Sequence.IsComponentRevInRefSeqPtInAnyOtherSeqPt(ci.Component, idx) {
+			discard := st.NewTask("discard-component", fmt.Sprintf(
+				i18n.G("Discard previous revision for component %q"), ci.Component,
+			))
+			discard.Set("component-setup-task", unlink.ID())
+			discardTasks = append(discardTasks, discard)
+		}
+	}
+
+	return unlinkTasks, discardTasks, nil
 }
 
 func doInstall(st *state.State, snapst *SnapState, snapsup SnapSetup, compsups []ComponentSetup, flags int, fromChange string, inUseCheck func(snap.Type) (boot.InUseFunc, error)) (*state.TaskSet, error) {
@@ -418,11 +480,26 @@ func doInstall(st *state.State, snapst *SnapState, snapsup SnapSetup, compsups [
 		prev = tasks[len(tasks)-1]
 	}
 
+	componentsTSS, err := splitComponentTasksForInstall(
+		compsups, st, snapst, snapsup, prepare.ID(), fromChange,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	finalBeforeLocalSystemModifications := prepare
+
 	var checkAsserts *state.Task
 	if fromStore {
 		// fetch and check assertions
 		checkAsserts = st.NewTask("validate-snap", fmt.Sprintf(i18n.G("Fetch and check assertions for snap %q%s"), snapsup.InstanceName(), revisionStr))
 		addTask(checkAsserts)
+		finalBeforeLocalSystemModifications = checkAsserts
+	}
+
+	for _, t := range componentsTSS.beforeLocalSystemModificationsTasks {
+		finalBeforeLocalSystemModifications = t
+		addTask(t)
 	}
 
 	// mount
@@ -442,24 +519,34 @@ func doInstall(st *state.State, snapst *SnapState, snapsup SnapSetup, compsups [
 		}
 	}
 
-	tasksBeforePreRefreshHook, tasksAfterLinkSnap, tasksAfterPostOpHook, tasksBeforeDiscard, compSetupIDs, err := splitComponentTasksForInstall(
-		compsups, st, snapst, snapsup, prepare.ID(), fromChange,
-	)
+	removeExtraComps, discardExtraComps, err := removeExtraComponentsTasks(st, snapst, snapsup.Revision(), compsups)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, t := range tasksBeforePreRefreshHook {
+	for _, t := range removeExtraComps {
 		addTask(t)
 	}
 
-	// run refresh hooks when updating existing snap, otherwise run install hook further down.
-	runRefreshHooks := snapst.IsInstalled() && !snapsup.Flags.Revert
+	componentsTSS.discardTasks = append(componentsTSS.discardTasks, discardExtraComps...)
+
+	for _, t := range componentsTSS.beforeLinkTasks {
+		addTask(t)
+	}
+
+	// if the snap is already installed, and the revision we are refreshing to
+	// is the same as the current revision, and we're not forcing an update,
+	// then we know that we're really modifying the state of components.
+	componentOnlyUpdate := snapst.IsInstalled() && snapsup.Revision() == snapst.Current && !snapsup.AlwaysUpdate
+
+	// run refresh hooks when updating existing snap, otherwise run install hook
+	// further down.
+	runRefreshHooks := snapst.IsInstalled() && !componentOnlyUpdate && !snapsup.Flags.Revert
 	if runRefreshHooks {
 		preRefreshHook := SetupPreRefreshHook(st, snapsup.InstanceName())
 		addTask(preRefreshHook)
 	}
-	prepare.Set("component-setup-tasks", compSetupIDs)
+	prepare.Set("component-setup-tasks", componentsTSS.compSetupTaskIDs)
 
 	if snapst.IsInstalled() {
 		// unlink-current-snap (will stop services for copy-data)
@@ -486,8 +573,8 @@ func doInstall(st *state.State, snapst *SnapState, snapsup SnapSetup, compsups [
 		return nil, err
 	}
 
-	// This task is necessary only for UC20+ and hybrid
-	if snapsup.Type == snap.TypeKernel && NeedsKernelSetup(deviceCtx.Model()) {
+	// This task is necessary only for UC24+ and hybrid 24.04+
+	if snapsup.Type == snap.TypeKernel && kernel.NeedsKernelDriversTree(deviceCtx.Model()) {
 		setupKernel := st.NewTask("prepare-kernel-snap", fmt.Sprintf(i18n.G("Prepare kernel driver tree for %q%s"), snapsup.InstanceName(), revisionStr))
 		addTask(setupKernel)
 	}
@@ -531,7 +618,7 @@ func doInstall(st *state.State, snapst *SnapState, snapsup SnapSetup, compsups [
 	linkSnap := st.NewTask("link-snap", fmt.Sprintf(i18n.G("Make snap %q%s available to the system"), snapsup.InstanceName(), revisionStr))
 	addTask(linkSnap)
 
-	for _, t := range tasksAfterLinkSnap {
+	for _, t := range componentsTSS.linkTasks {
 		addTask(t)
 	}
 
@@ -548,19 +635,31 @@ func doInstall(st *state.State, snapst *SnapState, snapsup SnapSetup, compsups [
 	autoConnect := st.NewTask("auto-connect", fmt.Sprintf(i18n.G("Automatically connect eligible plugs and slots of snap %q"), snapsup.InstanceName()))
 	addTask(autoConnect)
 
-	if snapsup.Type == snap.TypeKernel && NeedsKernelSetup(deviceCtx.Model()) {
-		// This task needs to run after we're back and running the new
-		// kernel after a reboot was requested in link-snap handler.
-		setupKernel := st.NewTask("discard-old-kernel-snap-setup", fmt.Sprintf(i18n.G("Discard previous kernel driver tree for %q%s"), snapsup.InstanceName(), revisionStr))
-		addTask(setupKernel)
-	}
-
 	// setup aliases
 	setAutoAliases := st.NewTask("set-auto-aliases", fmt.Sprintf(i18n.G("Set automatic aliases for snap %q"), snapsup.InstanceName()))
 	addTask(setAutoAliases)
 
 	setupAliases := st.NewTask("setup-aliases", fmt.Sprintf(i18n.G("Setup snap %q aliases"), snapsup.InstanceName()))
 	addTask(setupAliases)
+
+	var setupKmodComponentsPreseed *state.Task
+	if snapdenv.Preseeding() && requiresKmodSetup(snapst, compsups) {
+		// We need this task as the other
+		// prepare-kernel-modules-components defined below will not be
+		// run when creating a preseeding tarball, but we still need to
+		// have a correct driver tree in the tarball. This implies that
+		// if some kernel module is created by the install hook, it
+		// will be available only after full installation on first
+		// boot, but static modules in the components where be
+		// available early.
+		logger.Noticef("kernel-modules components present, creating preseed task for them")
+		// TODO move the setupKernel task here and make it configure
+		// kernel-modules components too so we can remove this task.
+		setupKmodComponentsPreseed = st.NewTask("prepare-kernel-modules-components",
+			fmt.Sprintf(i18n.G("Prepare kernel-modules components for %q%s"),
+				snapsup.InstanceName(), revisionStr))
+		addTask(setupKmodComponentsPreseed)
+	}
 
 	if snapsup.Flags.Prefer {
 		prefer := st.NewTask("prefer-aliases", fmt.Sprintf(i18n.G("Prefer aliases for snap %q"), snapsup.InstanceName()))
@@ -590,15 +689,30 @@ func doInstall(st *state.State, snapst *SnapState, snapsup SnapSetup, compsups [
 		addTask(installHook)
 	}
 
-	for _, t := range tasksAfterPostOpHook {
+	for _, t := range componentsTSS.postHookToDiscardTasks {
 		addTask(t)
 	}
 
-	// check if either the snap currently has kernel module components or any of
-	// the new components are kernel module components
+	// Check if either the snap currently has kernel-modules components or
+	// any of the new components are kernel-modules components (only will
+	// happen for kernel snaps).
+	var setupKmodComponents, afterSetupKmodComps *state.Task
 	if requiresKmodSetup(snapst, compsups) {
-		setupKmodComponents := st.NewTask("prepare-kernel-modules-components", fmt.Sprintf(i18n.G("Prepare kernel-modules components for %q%s"), snapsup.InstanceName(), revisionStr))
+		logger.Noticef("kernel-modules components present, delaying reboot after hooks are run")
+		// TODO move the setupKernel task here and make it configure
+		// kernel-modules components too so we can remove this task.
+		setupKmodComponents = st.NewTask("prepare-kernel-modules-components", fmt.Sprintf(i18n.G("Prepare kernel-modules components for %q%s"), snapsup.InstanceName(), revisionStr))
 		addTask(setupKmodComponents)
+	}
+
+	if snapsup.Type == snap.TypeKernel && kernel.NeedsKernelDriversTree(deviceCtx.Model()) {
+		// This task needs to run after we're back and running the new
+		// kernel after a reboot was requested in link-snap handler.
+		discardOldKernelSetup := st.NewTask("discard-old-kernel-snap-setup",
+			fmt.Sprintf(i18n.G("Discard previous kernel driver tree for %q%s"), snapsup.InstanceName(), revisionStr))
+		// Note that if requiresKmodSetup is true, NeedsKernelSetup must be too
+		afterSetupKmodComps = discardOldKernelSetup
+		addTask(discardOldKernelSetup)
 	}
 
 	if snapsup.QuotaGroupName != "" {
@@ -620,9 +734,7 @@ func doInstall(st *state.State, snapst *SnapState, snapsup SnapSetup, compsups [
 	startSnapServices := st.NewTask("start-snap-services", fmt.Sprintf(i18n.G("Start snap %q%s services"), snapsup.InstanceName(), revisionStr))
 	addTask(startSnapServices)
 
-	// TODO:COMPS: test discarding components during a snap refresh (coming
-	// soon!)
-	for _, t := range tasksBeforeDiscard {
+	for _, t := range componentsTSS.discardTasks {
 		addTask(t)
 	}
 
@@ -695,22 +807,38 @@ func doInstall(st *state.State, snapst *SnapState, snapsup SnapSetup, compsups [
 
 	installSet := state.NewTaskSet(tasks...)
 	installSet.MarkEdge(prereq, BeginEdge)
-	installSet.MarkEdge(setupAliases, BeforeHooksEdge)
-	installSet.MarkEdge(setupSecurity, BeforeMaybeRebootEdge)
-	installSet.MarkEdge(linkSnap, MaybeRebootEdge)
-	installSet.MarkEdge(autoConnect, MaybeRebootWaitEdge)
-	installSet.MarkEdge(setAutoAliases, AfterMaybeRebootWaitEdge)
+	installSet.MarkEdge(prepare, SnapSetupEdge)
+	// BeforeHooksEdge is used by preseeding to know up to which task to run
+	beforeHooksEdgeTask := setupAliases
+	if setupKmodComponentsPreseed != nil {
+		beforeHooksEdgeTask = setupKmodComponentsPreseed
+	}
+	installSet.MarkEdge(beforeHooksEdgeTask, BeforeHooksEdge)
+
+	// Let tasks know if they have to do something about restarts
+	if setupKmodComponents == nil {
+		// No kernel modules, reboot after link snap
+		installSet.MarkEdge(linkSnap, MaybeRebootEdge)
+		installSet.MarkEdge(autoConnect, MaybeRebootWaitEdge)
+		linkSnap.Set("set-next-boot", true)
+		autoConnect.Set("finish-restart", true)
+		if afterSetupKmodComps != nil {
+			afterSetupKmodComps.Set("finish-restart", false)
+		}
+	} else {
+		logger.Noticef("reboot will happen after set-up of kernel-modules")
+		installSet.MarkEdge(setupKmodComponents, MaybeRebootEdge)
+		installSet.MarkEdge(afterSetupKmodComps, MaybeRebootWaitEdge)
+		linkSnap.Set("set-next-boot", false)
+		autoConnect.Set("finish-restart", false)
+		setupKmodComponents.Set("set-next-boot", true)
+		afterSetupKmodComps.Set("finish-restart", true)
+	}
+
 	if installHook != nil {
 		installSet.MarkEdge(installHook, HooksEdge)
 	}
-	// if snap is being installed from the store, then the last task before
-	// any system modifications are done is check validate-snap, otherwise
-	// it's the prepare-snap
-	if checkAsserts != nil {
-		installSet.MarkEdge(checkAsserts, LastBeforeLocalModificationsEdge)
-	} else {
-		installSet.MarkEdge(prepare, LastBeforeLocalModificationsEdge)
-	}
+	installSet.MarkEdge(finalBeforeLocalSystemModifications, LastBeforeLocalModificationsEdge)
 	if flags&noRestartBoundaries == 0 {
 		if err := SetEssentialSnapsRestartBoundaries(st, nil, []*state.TaskSet{installSet}); err != nil {
 			return nil, err
@@ -754,6 +882,35 @@ func requiresKmodSetup(snapst *SnapState, compsups []ComponentSetup) bool {
 	return false
 }
 
+// multiComponentInstallTaskSet contains the tasks that are needed to install
+// multiple components. The tasks are partitioned into groups so that they can
+// be easily spliced into the chain of tasks created to install a snap.
+type multiComponentInstallTaskSet struct {
+	compSetupTaskIDs                    []string
+	beforeLocalSystemModificationsTasks []*state.Task
+	beforeLinkTasks                     []*state.Task
+	linkTasks                           []*state.Task
+	postHookToDiscardTasks              []*state.Task
+	discardTasks                        []*state.Task
+}
+
+func newMultiComponentInstallTaskSet(ctss ...componentInstallTaskSet) multiComponentInstallTaskSet {
+	var mcts multiComponentInstallTaskSet
+	for _, cts := range ctss {
+		mcts.compSetupTaskIDs = append(mcts.compSetupTaskIDs, cts.compSetupTaskID)
+		mcts.beforeLocalSystemModificationsTasks = append(mcts.beforeLocalSystemModificationsTasks, cts.beforeLocalSystemModificationsTasks...)
+		mcts.beforeLinkTasks = append(mcts.beforeLinkTasks, cts.beforeLinkTasks...)
+		if cts.maybeLinkTask != nil {
+			mcts.linkTasks = append(mcts.linkTasks, cts.maybeLinkTask)
+		}
+		mcts.postHookToDiscardTasks = append(mcts.postHookToDiscardTasks, cts.postHookToDiscardTasks...)
+		if cts.maybeDiscardTask != nil {
+			mcts.discardTasks = append(mcts.discardTasks, cts.maybeDiscardTask)
+		}
+	}
+	return mcts
+}
+
 func splitComponentTasksForInstall(
 	compsups []ComponentSetup,
 	st *state.State,
@@ -761,45 +918,16 @@ func splitComponentTasksForInstall(
 	snapsup SnapSetup,
 	snapSetupTaskID string,
 	fromChange string,
-) (
-	tasksBeforePreRefreshHook, tasksAfterLinkSnap, tasksAfterPostOpHook, tasksBeforeDiscard []*state.Task,
-	compSetupIDs []string,
-	err error,
-) {
+) (multiComponentInstallTaskSet, error) {
+	componentTSS := make([]componentInstallTaskSet, 0, len(compsups))
 	for _, compsup := range compsups {
 		componentTS, err := doInstallComponent(st, snapst, compsup, snapsup, snapSetupTaskID, nil, nil, fromChange)
 		if err != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("cannot install component %q: %v", compsup.CompSideInfo.Component, err)
+			return multiComponentInstallTaskSet{}, fmt.Errorf("cannot install component %q: %v", compsup.CompSideInfo.Component, err)
 		}
-
-		compSetupIDs = append(compSetupIDs, componentTS.compSetupTaskID)
-
-		tasksBeforePreRefreshHook = append(tasksBeforePreRefreshHook, componentTS.beforeLink...)
-		tasksAfterLinkSnap = append(tasksAfterLinkSnap, componentTS.linkTask)
-		tasksAfterPostOpHook = append(tasksAfterPostOpHook, componentTS.postOpHookAndAfter...)
-		if componentTS.discardTask != nil {
-			tasksBeforeDiscard = append(tasksBeforeDiscard, componentTS.discardTask)
-		}
+		componentTSS = append(componentTSS, componentTS)
 	}
-	return tasksBeforePreRefreshHook, tasksAfterLinkSnap, tasksAfterPostOpHook, tasksBeforeDiscard, compSetupIDs, nil
-}
-
-func NeedsKernelSetup(model *asserts.Model) bool {
-	// Checkinf if it has modeenv - it must be UC20+ or hybrid
-	if model.Grade() == asserts.ModelGradeUnset {
-		return false
-	}
-
-	// We assume core24/hybrid 24.04 onwards have the generator, for older
-	// boot bases we return false.
-	// TODO this won't work for a UC2{0,2} -> UC24+ remodel as we need the
-	// new model here. Get to this ASAP after snapd 2.62 release.
-	switch model.Base() {
-	case "core20", "core22", "core22-desktop":
-		return false
-	default:
-		return true
-	}
+	return newMultiComponentInstallTaskSet(componentTSS...), nil
 }
 
 func findTasksMatchingKindAndSnap(st *state.State, kind string, snapName string, revision snap.Revision) ([]*state.Task, error) {
@@ -857,6 +985,10 @@ var SetupPostRefreshComponentHook = func(st *state.State, snap, component string
 	panic("internal error: snapstate.SetupPostRefreshComponentHook is unset")
 }
 
+var SetupRemoveComponentHook = func(st *state.State, snap, component string) *state.Task {
+	panic("internal error: snapstate.SetupRemoveComponentHook is unset")
+}
+
 var SetupPreRefreshHook = func(st *state.State, snapName string) *state.Task {
 	panic("internal error: snapstate.SetupPreRefreshHook is unset")
 }
@@ -893,16 +1025,36 @@ func isInvokedWithRevert() bool {
 	return os.Getenv("SNAPD_REVERT_TO_REV") != ""
 }
 
+// FinishRestartOptions are options for FinishRestart.
+type FinishRestartOptions struct {
+	// FinishRestartDefault sets the default behavior for FinishRestart in
+	// case the "finish-restart" task variable is not found, that is, this
+	// is the behavior for tasks created by older snapd. Tasks that call
+	// FinishRestart set this value to what would have been the expected
+	// behavior before the introduction of "finish-restart".
+	FinishRestartDefault bool
+}
+
 // FinishRestart will return a Retry error if there is a pending restart
 // and a real error if anything went wrong (like a rollback across
 // restarts).
 // For snapd snap updates this will also rerun wrappers generation to fully
 // catch up with any change.
-func FinishRestart(task *state.Task, snapsup *SnapSetup) (err error) {
+func FinishRestart(task *state.Task, snapsup *SnapSetup, opts FinishRestartOptions) (err error) {
 	if snapdenv.Preseeding() {
 		// nothing to do when preseeding
 		return nil
 	}
+	// Check if the task really needs to call this
+	needsFinishRestart := opts.FinishRestartDefault
+	if err := task.Get("finish-restart", &needsFinishRestart); err != nil &&
+		!errors.Is(err, state.ErrNoState) {
+		return err
+	}
+	if !needsFinishRestart {
+		return nil
+	}
+
 	if ok, _ := restart.Pending(task.State()); ok {
 		// don't continue until we are in the restarted snapd
 		task.Logf("Waiting for automatic snapd restart...")
@@ -1053,6 +1205,9 @@ func isChangeRequestingSnapdRestart(chg *state.Change) bool {
 	// have been set up in link-snap, daemon restart is requested, link-snap
 	// is marked as Done, and the auto-connect task is held off (in Do or
 	// Doing states) until the restart completes
+	// TODO: This may need additional handling for snapd restart along the
+	// Undo path. For instance, 'link-snap' can request a restart in the undo
+	// direction, making 'setup-profiles' wait for restart.
 	var haveSnapd, linkDone, autoConnectWaiting bool
 	for _, tsk := range chg.Tasks() {
 		kind := tsk.Kind()
@@ -1149,16 +1304,6 @@ func defaultProviderContentAttrs(st *state.State, info *snap.Info, prqt PrereqTr
 	}
 	repo := ifacerepo.Get(st)
 	return prqt.MissingProviderContentTags(info, repo)
-}
-
-func getKeys(kv map[string][]string) []string {
-	keys := make([]string, 0, len(kv))
-
-	for key := range kv {
-		keys = append(keys, key)
-	}
-
-	return keys
 }
 
 // validateFeatureFlags validates the given snap only uses experimental
@@ -1260,7 +1405,12 @@ func ensureInstallPreconditions(st *state.State, info *snap.Info, flags Flags, s
 	if err := validateFeatureFlags(st, info); err != nil {
 		return flags, err
 	}
+	// TODO: if we implement a --disabled flag for install we should skip the
+	// dbus and desktop-file-ids checks below.
 	if err := checkDBusServiceConflicts(st, info); err != nil {
+		return flags, err
+	}
+	if err := checkDesktopFileIDsConflicts(st, info); err != nil {
 		return flags, err
 	}
 	return flags, nil
@@ -1297,9 +1447,13 @@ type PrereqTracker interface {
 // local revision and sideloading, or full metadata in which case it
 // the snap will appear as installed from the store.
 func InstallPath(st *state.State, si *snap.SideInfo, path, instanceName, channel string, flags Flags, prqt PrereqTracker) (*state.TaskSet, *snap.Info, error) {
-	target := PathInstallGoal(instanceName, path, si, nil, RevisionOptions{
-		Channel: channel,
+	target := PathInstallGoal(PathSnap{
+		InstanceName: instanceName,
+		Path:         path,
+		SideInfo:     si,
+		RevOpts:      RevisionOptions{Channel: channel},
 	})
+
 	// TODO have caller pass a context
 	info, ts, err := InstallOne(context.Background(), st, target, Options{
 		Flags:         flags,
@@ -1377,7 +1531,13 @@ func InstallPathWithDeviceContext(st *state.State, si *snap.SideInfo, path, name
 		opts = &RevisionOptions{}
 	}
 
-	target := PathInstallGoal(name, path, si, nil, *opts)
+	target := PathInstallGoal(PathSnap{
+		InstanceName: name,
+		Path:         path,
+		SideInfo:     si,
+		RevOpts:      *opts,
+	})
+
 	_, ts, err := InstallOne(context.Background(), st, target, Options{
 		Flags:         flags,
 		UserID:        userID,
@@ -1391,90 +1551,191 @@ func InstallPathWithDeviceContext(st *state.State, si *snap.SideInfo, path, name
 	return ts, nil
 }
 
-// Download returns a set of tasks for downloading a snap into the given
-// blobDirectory. If blobDirectory is empty, then dirs.SnapBlobDir is used. The
-// snap.Info for the snap that is downloaded is also returned. The tasks that
-// are returned will also download and validate the snap's assertion.
-// Prerequisites for the snap are not downloaded.
-func Download(ctx context.Context, st *state.State, name string, blobDirectory string, opts *RevisionOptions, userID int, flags Flags, deviceCtx DeviceContext) (*state.TaskSet, *snap.Info, error) {
-	if opts == nil {
-		opts = &RevisionOptions{}
+// Download returns a set of tasks for downloading a snap and components into
+// the given directory. The snap.Info for the snap that is downloaded is also
+// returned. The tasks that are returned also download and validate the snap's
+// and components' assertions. Prerequisites for the snap are not downloaded.
+//
+// TODO: this function will soon return an error if downloadDir ==
+// dirs.SnapBlobDir.
+func Download(
+	ctx context.Context,
+	st *state.State,
+	name string,
+	components []string,
+	downloadDir string,
+	revOpts RevisionOptions,
+	opts Options,
+) (*state.TaskSet, *snap.Info, error) {
+	const skipSnapDownload = false
+	return downloadTasks(ctx, st, name, components, downloadDir, skipSnapDownload, revOpts, opts)
+}
+
+// DownloadComponents returns a set of tasks for downloading the given snap
+// components into the given directory. The tasks that are returned will also
+// download and validate the components' assertions.
+//
+// TODO: this function will soon return an error if downloadDir ==
+// dirs.SnapBlobDir.
+func DownloadComponents(
+	ctx context.Context,
+	st *state.State,
+	name string,
+	components []string,
+	downloadDir string,
+	revOpts RevisionOptions,
+	opts Options,
+) (*state.TaskSet, error) {
+	const skipSnapDownload = true
+	ts, _, err := downloadTasks(ctx, st, name, components, downloadDir, skipSnapDownload, revOpts, opts)
+	if err != nil {
+		return nil, err
+	}
+	return ts, nil
+}
+
+func downloadTasks(
+	ctx context.Context,
+	st *state.State,
+	name string,
+	components []string,
+	downloadDir string,
+	skipSnapDownload bool,
+	revOpts RevisionOptions,
+	opts Options,
+) (*state.TaskSet, *snap.Info, error) {
+	if downloadDir == "" {
+		return nil, nil, errors.New("internal error: must specify directory to download to")
 	}
 
-	if opts.CohortKey != "" && !opts.Revision.Unset() {
-		return nil, nil, errors.New("cannot specify revision and cohort")
+	if revOpts.CohortKey != "" && !revOpts.Revision.Unset() {
+		return nil, nil, errors.New("internal error: cannot specify revision and cohort")
 	}
 
-	if opts.Channel == "" {
-		opts.Channel = "stable"
+	if revOpts.Channel == "" {
+		revOpts.Channel = "stable"
 	}
 
-	var snapst SnapState
-	err := Get(st, name, &snapst)
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return nil, nil, err
+	if revOpts.ValidationSets == nil {
+		revOpts.ValidationSets = snapasserts.NewValidationSets()
 	}
 
 	if err := snap.ValidateInstanceName(name); err != nil {
 		return nil, nil, fmt.Errorf("invalid instance name: %v", err)
 	}
 
-	sar, err := downloadInfo(ctx, st, name, opts, userID, deviceCtx)
+	sar, err := sendOneDownloadAction(ctx, st, StoreSnap{
+		InstanceName: name,
+		Components:   components,
+		RevOpts:      revOpts,
+	}, opts)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	info := sar.Info
 
-	// if we are going to use the default download dir, and the same snap
-	// revision is already installed, then we should not overwrite the snap that
-	// is already in the dir.
-	if (blobDirectory == "" || blobDirectory == dirs.SnapBlobDir) && info.Revision == snapst.Current {
-		return nil, nil, &snap.AlreadyInstalledError{Snap: name}
+	if opts.PrereqTracker != nil {
+		opts.PrereqTracker.Add(info)
 	}
 
-	if flags.RequireTypeBase && info.Type() != snap.TypeBase && info.Type() != snap.TypeOS {
+	if opts.Flags.RequireTypeBase && info.Type() != snap.TypeBase && info.Type() != snap.TypeOS {
 		return nil, nil, fmt.Errorf("unexpected snap type %q, instead of 'base'", info.Type())
 	}
 
 	snapsup := &SnapSetup{
-		Channel:            opts.Channel,
-		Base:               info.Base,
-		UserID:             userID,
-		Flags:              flags.ForSnapSetup(),
-		DownloadInfo:       &info.DownloadInfo,
-		SideInfo:           &info.SideInfo,
-		Type:               info.Type(),
-		Version:            info.Version,
-		InstanceKey:        info.InstanceKey,
-		CohortKey:          opts.CohortKey,
-		ExpectedProvenance: info.SnapProvenance,
-		DownloadBlobDir:    blobDirectory,
+		Channel:                     revOpts.Channel,
+		Base:                        info.Base,
+		UserID:                      opts.UserID,
+		Flags:                       opts.Flags.ForSnapSetup(),
+		DownloadInfo:                &info.DownloadInfo,
+		SideInfo:                    &info.SideInfo,
+		Type:                        info.Type(),
+		Version:                     info.Version,
+		InstanceKey:                 info.InstanceKey,
+		CohortKey:                   revOpts.CohortKey,
+		ExpectedProvenance:          info.SnapProvenance,
+		DownloadBlobDir:             downloadDir,
+		ComponentExclusiveOperation: skipSnapDownload,
 	}
 
 	if sar.RedirectChannel != "" {
 		snapsup.Channel = sar.RedirectChannel
 	}
 
-	toDownloadTo := filepath.Dir(snapsup.MountFile())
-	if err := checkDiskSpaceDownload([]minimalInstallInfo{installSnapInfo{info}}, toDownloadTo); err != nil {
+	compsups, err := componentTargetsFromActionResult("download", sar, components)
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot extract components from snap resources: %w", err)
+	}
+
+	for i := range compsups {
+		compsups[i].DownloadBlobDir = downloadDir
+	}
+
+	if err := checkSnapAgainstValidationSets(sar.Info, compsups, "download", revOpts.ValidationSets); err != nil {
 		return nil, nil, err
 	}
 
-	revisionStr := fmt.Sprintf(" (%s)", snapsup.Revision())
+	ts := state.NewTaskSet()
+	var snapsupTask, prev *state.Task
+	addTask := func(t *state.Task) {
+		ts.AddTask(t)
+		if prev == nil {
+			t.Set("snap-setup", snapsup)
+			snapsupTask = t
+			ts.MarkEdge(t, BeginEdge)
+			ts.MarkEdge(t, SnapSetupEdge)
+		} else {
+			t.WaitFor(prev)
+			t.Set("snap-setup-task", snapsupTask.ID())
+		}
+		prev = t
+	}
 
-	download := st.NewTask("download-snap", fmt.Sprintf(i18n.G("Download snap %q%s from channel %q"), snapsup.InstanceName(), revisionStr, snapsup.Channel))
-	download.Set("snap-setup", snapsup)
+	if !skipSnapDownload {
+		// TODO:COMPS: support checking for available space for components
+		toDownloadTo := filepath.Dir(snapsup.BlobPath())
+		if err := checkDiskSpaceDownload([]minimalInstallInfo{installSnapInfo{info}}, toDownloadTo); err != nil {
+			return nil, nil, err
+		}
 
-	checkAsserts := st.NewTask("validate-snap", fmt.Sprintf(i18n.G("Fetch and check assertions for snap %q%s"), snapsup.InstanceName(), revisionStr))
-	checkAsserts.Set("snap-setup-task", download.ID())
-	checkAsserts.WaitFor(download)
+		revisionStr := fmt.Sprintf(" (%s)", snapsup.Revision())
 
-	installSet := state.NewTaskSet(download, checkAsserts)
-	installSet.MarkEdge(download, BeginEdge)
-	installSet.MarkEdge(checkAsserts, LastBeforeLocalModificationsEdge)
+		download := st.NewTask("download-snap", fmt.Sprintf(i18n.G("Download snap %q%s from channel %q"), snapsup.InstanceName(), revisionStr, snapsup.Channel))
+		addTask(download)
 
-	return installSet, info, nil
+		validate := st.NewTask("validate-snap", fmt.Sprintf(i18n.G("Fetch and check assertions for snap %q%s"), snapsup.InstanceName(), revisionStr))
+		addTask(validate)
+	}
+
+	compsupIDs := make([]string, 0, len(compsups))
+	for _, c := range compsups {
+		rev := fmt.Sprintf(" (%s)", c.CompSideInfo.Revision)
+
+		download := st.NewTask("download-component", fmt.Sprintf(i18n.G("Download component %q%s"), c.ComponentName(), rev))
+		download.Set("component-setup", c)
+		addTask(download)
+		compsupTaskID := download.ID()
+
+		// even if the component itself is already installed, it might not have
+		// been installed with the same snap revision. in that case,
+		// validate-component will fetch new assertions from the store.
+		validate := st.NewTask("validate-component", fmt.Sprintf(
+			i18n.G("Fetch and check assertions for component %q%s"), c.ComponentName(), rev),
+		)
+		validate.Set("component-setup-task", compsupTaskID)
+		addTask(validate)
+
+		compsupIDs = append(compsupIDs, compsupTaskID)
+	}
+
+	snapsupTask.Set("component-setup-tasks", compsupIDs)
+
+	// since nothing in this function does any "local" modifications, we just
+	// set this edge on the last task in the chain
+	ts.MarkEdge(prev, LastBeforeLocalModificationsEdge)
+
+	return ts, info, nil
 }
 
 func validatedInfoFromPathAndSideInfo(instanceName string, path string, si *snap.SideInfo) (*snap.Info, error) {
@@ -1635,63 +1896,124 @@ func ResolveValidationSetsEnforcementError(ctx context.Context, st *state.State,
 		return nil, nil, fmt.Errorf("cannot auto-resolve validation set constraints that require removing snaps: %s", strutil.Quoted(invSnaps))
 	}
 
+	var invComps []string
+	for snapName, cerr := range valErr.ComponentErrors {
+		for compName := range cerr.InvalidComponents {
+			invComps = append(invComps, naming.NewComponentRef(snapName, compName).String())
+		}
+	}
+	if len(invComps) != 0 {
+		return nil, nil, fmt.Errorf("cannot auto-resolve validation set constraints that require removing components: %s", strutil.Quoted(invComps))
+	}
+
+	vsets := snapasserts.NewValidationSets()
+	for _, vs := range valErr.Sets {
+		if err := vsets.Add(vs); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	affected := make([]string, 0, len(valErr.MissingSnaps)+len(valErr.WrongRevisionSnaps))
 	var tasksets []*state.TaskSet
 	// use the same lane for installing and refreshing so everything is reversed
 	lane := st.NewLane()
 
-	collectRevOpts := func(snapToRevToVss map[string]map[snap.Revision][]string) ([]string, []*RevisionOptions) {
-		var names []string
-		var revOpts []*RevisionOptions
+	// keep track of snaps that are being having their validation issues
+	// resolved. we won't need to resolve any of their component errors
+	// explicitly.
+	resolved := make(map[string]bool)
 
-		for snapName, revAndVs := range snapToRevToVss {
-			for rev, valsets := range revAndVs {
-				vsKeys := make([]snapasserts.ValidationSetKey, 0, len(valsets))
-				for _, vs := range valsets {
-					vsKey := snapasserts.NewValidationSetKey(valErr.Sets[vs])
-					vsKeys = append(vsKeys, vsKey)
-				}
+	var wrongRevs []StoreUpdate
+	for name := range valErr.WrongRevisionSnaps {
+		resolved[name] = true
 
-				revOpts = append(revOpts, &RevisionOptions{Revision: rev, ValidationSets: vsKeys})
-			}
-			names = append(names, snapName)
+		var additionalComps []string
+		if cerr, ok := valErr.ComponentErrors[name]; ok {
+			additionalComps = keys(cerr.MissingComponents)
 		}
 
-		return names, revOpts
+		wrongRevs = append(wrongRevs, StoreUpdate{
+			InstanceName: name,
+			RevOpts: RevisionOptions{
+				ValidationSets: vsets,
+			},
+			AdditionalComponents: additionalComps,
+		})
 	}
 
-	if len(valErr.WrongRevisionSnaps) > 0 {
-		names, revOpts := collectRevOpts(valErr.WrongRevisionSnaps)
-		// we're targeting precise revisions so re-refreshes don't make sense. Refreshes
-		// between epochs should managed by through  the validation sets
-		flags := &Flags{Transaction: client.TransactionAllSnaps, Lane: lane, NoReRefresh: true}
+	var missing []StoreSnap
+	for name := range valErr.MissingSnaps {
+		var comps []string
+		if cerr, ok := valErr.ComponentErrors[name]; ok {
+			comps = keys(cerr.MissingComponents)
+		}
 
-		updated, tss, err := UpdateMany(ctx, st, names, revOpts, userID, flags)
+		resolved[name] = true
+		missing = append(missing, StoreSnap{
+			InstanceName: name,
+			RevOpts: RevisionOptions{
+				ValidationSets: vsets,
+			},
+			Components: comps,
+		})
+	}
+
+	if len(wrongRevs) > 0 {
+		updated, uts, err := UpdateWithGoal(ctx, st, StoreUpdateGoal(wrongRevs...), nil, Options{
+			Flags: Flags{Transaction: client.TransactionAllSnaps, Lane: lane, NoReRefresh: true},
+		})
 		if err != nil {
 			return nil, nil, fmt.Errorf("cannot auto-resolve enforcement constraints: %w", err)
 		}
 
-		tasksets = append(tasksets, tss...)
+		tasksets = append(tasksets, uts.Refresh...)
 		affected = append(affected, updated...)
 	}
 
-	if len(valErr.MissingSnaps) > 0 {
-		names, revOpts := collectRevOpts(valErr.MissingSnaps)
-		flags := &Flags{Transaction: client.TransactionAllSnaps, Lane: lane}
-
-		installed, tss, err := InstallMany(st, names, revOpts, userID, flags)
+	var installed []*snap.Info
+	var tss []*state.TaskSet
+	if len(missing) > 0 {
+		var err error
+		installed, tss, err = InstallWithGoal(ctx, st, StoreInstallGoal(missing...), Options{
+			Flags: Flags{Transaction: client.TransactionAllSnaps, Lane: lane},
+		})
 		if err != nil {
 			return nil, nil, fmt.Errorf("cannot auto-resolve enforcement constraints: %w", err)
 		}
+	}
 
-		// updates should be done before the installs
-		for _, ts := range tss {
-			for _, prevTs := range tasksets {
-				ts.WaitAll(prevTs)
-			}
+	for snapName, cerr := range valErr.ComponentErrors {
+		if resolved[snapName] {
+			continue
 		}
-		tasksets = append(tasksets, tss...)
-		affected = append(affected, installed...)
+
+		comps := make([]string, 0, len(cerr.MissingComponents)+len(cerr.WrongRevisionComponents))
+		comps = append(comps, keys(cerr.MissingComponents)...)
+		comps = append(comps, keys(cerr.WrongRevisionComponents)...)
+
+		info, err := CurrentInfo(st, snapName)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		compTasks, err := InstallComponents(ctx, st, comps, info, vsets, Options{})
+		if err != nil {
+			return nil, nil, err
+		}
+
+		affected = append(affected, snapName)
+		tss = append(tss, compTasks...)
+	}
+
+	// updates should be done before the installs
+	for _, ts := range tss {
+		for _, prevTs := range tasksets {
+			ts.WaitAll(prevTs) // TODO: make this not a WaitAll
+		}
+	}
+	tasksets = append(tasksets, tss...)
+	for _, i := range installed {
+		affected = append(affected, i.InstanceName())
 	}
 
 	encodedAsserts := make(map[string][]byte, len(valErr.Sets))
@@ -1705,7 +2027,7 @@ func ResolveValidationSetsEnforcementError(ctx context.Context, st *state.State,
 	enforceTask.Set("userID", userID)
 
 	for _, ts := range tasksets {
-		enforceTask.WaitAll(ts)
+		enforceTask.WaitAll(ts) // TODO: make this not a WaitAll
 	}
 	ts := state.NewTaskSet(enforceTask)
 	ts.JoinLane(lane)
@@ -1714,13 +2036,21 @@ func ResolveValidationSetsEnforcementError(ctx context.Context, st *state.State,
 	return tasksets, affected, nil
 }
 
+func keys[K comparable, V any](m map[K]V) []K {
+	keys := make([]K, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // updateFilter is the type of function that can be passed to
 // updateManyFromChange so it filters the updates.
 //
 // If the filter returns true, the update for that snap proceeds. If
 // it returns false, the snap is removed from the list of updates to
 // consider.
-type updateFilter func(*snap.Info, *SnapState) bool
+type updateFilter = func(*snap.Info, *SnapState) bool
 
 func updateManyFiltered(ctx context.Context, st *state.State, names []string, revOpts []*RevisionOptions, userID int, filter updateFilter, flags *Flags, fromChange string) ([]string, *UpdateTaskSets, error) {
 	if flags == nil {
@@ -1876,17 +2206,35 @@ type update struct {
 	Components []ComponentSetup
 }
 
-// revisionSatisfied returns true if the state of the snap on the system matches the
-// state specified in the update. This method is primarily concerned with the
-// revision of the snap.
-//
-// TODO:COMPS: check if we need to change the state of components
-func (u *update) revisionSatisfied() bool {
+// revisionSatisfied returns true if the state of the snap on the system matches
+// the state specified in the update. This method checks if the currently
+// installed snap and components match what is specified in the update.
+func (u *update) revisionSatisfied() (bool, error) {
 	if u.Setup.AlwaysUpdate || !u.SnapState.IsInstalled() {
-		return false
+		return false, nil
 	}
 
-	return u.SnapState.Current == u.Setup.Revision()
+	if u.SnapState.Current != u.Setup.Revision() {
+		return false, nil
+	}
+
+	comps, err := u.SnapState.CurrentComponentInfos()
+	if err != nil {
+		return false, err
+	}
+
+	currentCompRevs := make(map[string]snap.Revision, len(comps))
+	for _, comp := range comps {
+		currentCompRevs[comp.Component.ComponentName] = comp.Revision
+	}
+
+	for _, comp := range u.Components {
+		if currentCompRevs[comp.CompSideInfo.Component.ComponentName] != comp.Revision() {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
 
 func doPotentiallySplitUpdate(st *state.State, requested []string, updates []update, opts Options) ([]string, *UpdateTaskSets, error) {
@@ -1991,16 +2339,27 @@ func doUpdate(st *state.State, requested []string, updates []update, opts Option
 	// and bases and then other snaps
 	for _, up := range updates {
 		// if the update is already satisfied, then we can skip it
-		if up.revisionSatisfied() {
+		ok, err := up.revisionSatisfied()
+		if err != nil {
+			return nil, false, nil, err
+		}
+
+		if ok {
 			alreadySatisfied = append(alreadySatisfied, up)
 			continue
+		}
+
+		if err := checkSnapRefreshFailures(st, &up.SnapState, up.Setup.Revision(), opts); err != nil {
+			if errors.Is(err, errKnownBadRevision) {
+				// revision known to fail during refresh and backoff delay has not passed
+				continue
+			}
+			return nil, false, nil, err
 		}
 
 		// if any snaps actually get a revision change, we need to do a
 		// re-refresh check
 		needsRerefreshCheck = true
-
-		// TODO:COMPS: we need to handle components here too
 
 		// Do not set any default restart boundaries, we do it when we have access to all
 		// the task-sets in preparation for single-reboot.
@@ -2086,22 +2445,30 @@ func maybeSwitchSnapMetadataTaskSet(st *state.State, snapsup SnapSetup, snapst S
 		return nil, nil
 	}
 
-	var tasks []*state.Task
 	if err := checkChangeConflictIgnoringOneChange(st, snapst.InstanceName(), nil, opts.FromChange); err != nil {
 		return nil, err
 	}
 
+	var snapsupTask *state.Task
+
+	var tasks []*state.Task
 	if switchChannel || switchCohortKey {
 		summary := switchSummary(snapsup.InstanceName(), snapst.TrackingChannel, snapsup.Channel, snapst.CohortKey, snapsup.CohortKey)
 		switchSnap := st.NewTask("switch-snap-channel", summary)
 		switchSnap.Set("snap-setup", &snapsup)
+		snapsupTask = switchSnap
 
 		tasks = append(tasks, switchSnap)
 	}
 
 	if toggleIgnoreValidation {
 		toggle := st.NewTask("toggle-snap-flags", fmt.Sprintf(i18n.G("Toggle snap %q flags"), snapsup.InstanceName()))
-		toggle.Set("snap-setup", &snapsup)
+		if snapsupTask == nil {
+			toggle.Set("snap-setup", &snapsup)
+			snapsupTask = toggle
+		} else {
+			toggle.Set("snap-setup-task", snapsupTask.ID())
+		}
 
 		for _, tasks := range tasks {
 			toggle.WaitFor(tasks)
@@ -2110,7 +2477,12 @@ func maybeSwitchSnapMetadataTaskSet(st *state.State, snapsup SnapSetup, snapst S
 		tasks = append(tasks, toggle)
 	}
 
-	return state.NewTaskSet(tasks...), nil
+	ts := state.NewTaskSet(tasks...)
+	if snapsupTask != nil {
+		ts.MarkEdge(snapsupTask, SnapSetupEdge)
+	}
+
+	return ts, nil
 }
 
 func splitEssentialUpdates(deviceCtx DeviceContext, updates []update) (essential, nonEssential []update) {
@@ -2267,7 +2639,12 @@ func autoAliasesUpdate(st *state.State, requested []string, updates []update) (c
 	// snaps with updates
 	updating := make(map[string]bool, len(updates))
 	for _, up := range updates {
-		updating[up.Setup.InstanceName()] = !up.revisionSatisfied()
+		ok, err := up.revisionSatisfied()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		updating[up.Setup.InstanceName()] = !ok
 	}
 
 	// add explicitly auto-aliases only for snaps that are not updated
@@ -2452,14 +2829,17 @@ func Switch(st *state.State, name string, opts *RevisionOptions) (*state.TaskSet
 	switchSnap := st.NewTask("switch-snap", summary)
 	switchSnap.Set("snap-setup", &snapsup)
 
-	return state.NewTaskSet(switchSnap), nil
+	ts := state.NewTaskSet(switchSnap)
+	ts.MarkEdge(switchSnap, SnapSetupEdge)
+
+	return ts, nil
 }
 
 // RevisionOptions control the selection of a snap revision.
 type RevisionOptions struct {
 	Channel        string
 	Revision       snap.Revision
-	ValidationSets []snapasserts.ValidationSetKey
+	ValidationSets *snapasserts.ValidationSets
 	CohortKey      string
 	LeaveCohort    bool
 }
@@ -2490,6 +2870,27 @@ func (r *RevisionOptions) resolveChannel(instanceName string, fallback string, d
 	}
 	r.Channel = resolved
 
+	return nil
+}
+
+// initializeValidationSets ensures that r.ValidationSets is initialized with a
+// value. If the caller has provided a value, it is used. If validation sets are
+// explicitly ignored, we create a new empty validation set that has no rules.
+// Otherwise, we use the enforced validation sets.
+func (r *RevisionOptions) initializeValidationSets(vsets cachedValidationSets, opts Options) error {
+	if r.ValidationSets != nil {
+		return nil
+	}
+
+	if opts.Flags.IgnoreValidation {
+		r.ValidationSets = snapasserts.NewValidationSets()
+	} else {
+		enforced, err := vsets()
+		if err != nil {
+			return err
+		}
+		r.ValidationSets = enforced
+	}
 	return nil
 }
 
@@ -3016,7 +3417,7 @@ func LinkNewBaseOrKernel(st *state.State, name string, fromChange string) (*stat
 		if err != nil {
 			return nil, err
 		}
-		if NeedsKernelSetup(deviceCtx.Model()) {
+		if kernel.NeedsKernelDriversTree(deviceCtx.Model()) {
 			setupKernel := st.NewTask("prepare-kernel-snap", fmt.Sprintf(i18n.G("Prepare kernel driver tree for %q (%s) for remodel"), snapsup.InstanceName(), snapst.Current))
 			ts.AddTask(setupKernel)
 			setupKernel.Set("snap-setup-task", prepareSnap.ID())
@@ -3035,8 +3436,10 @@ func LinkNewBaseOrKernel(st *state.State, name string, fromChange string) (*stat
 	linkSnap.Set("snap-setup-task", prepareSnap.ID())
 	linkSnap.WaitFor(prev)
 	ts.AddTask(linkSnap)
+	ts.MarkEdge(linkSnap, MaybeRebootEdge)
 	// prepare-snap is the last task that carries no system modifications
 	ts.MarkEdge(prepareSnap, LastBeforeLocalModificationsEdge)
+	ts.MarkEdge(prepareSnap, SnapSetupEdge)
 	return ts, nil
 }
 
@@ -3075,7 +3478,7 @@ func AddLinkNewBaseOrKernel(st *state.State, ts *state.TaskSet) (*state.TaskSet,
 		if err != nil {
 			return nil, err
 		}
-		if NeedsKernelSetup(deviceCtx.Model()) {
+		if kernel.NeedsKernelDriversTree(deviceCtx.Model()) {
 			setupKernel := st.NewTask("prepare-kernel-snap", fmt.Sprintf(i18n.G("Prepare kernel driver tree for %q (%s) for remodel"), snapsup.InstanceName(), snapsup.Revision()))
 			setupKernel.Set("snap-setup-task", snapSetupTask.ID())
 			setupKernel.WaitFor(prev)
@@ -3096,6 +3499,7 @@ func AddLinkNewBaseOrKernel(st *state.State, ts *state.TaskSet) (*state.TaskSet,
 	linkSnap.Set("snap-setup-task", snapSetupTask.ID())
 	linkSnap.WaitFor(prev)
 	ts.AddTask(linkSnap)
+	ts.MarkEdge(linkSnap, MaybeRebootEdge)
 	// make sure that remodel can identify which tasks introduce actual
 	// changes to the system and order them correctly
 	if edgeTask := ts.MaybeEdge(LastBeforeLocalModificationsEdge); edgeTask == nil {
@@ -3160,6 +3564,7 @@ func SwitchToNewGadget(st *state.State, name string, fromChange string) (*state.
 	ts := state.NewTaskSet(prepareSnap, gadgetUpdate, gadgetCmdline)
 	// prepare-snap is the last task that carries no system modifications
 	ts.MarkEdge(prepareSnap, LastBeforeLocalModificationsEdge)
+	ts.MarkEdge(prepareSnap, SnapSetupEdge)
 	return ts, nil
 }
 
@@ -3339,30 +3744,24 @@ func canRemove(st *state.State, si *snap.Info, snapst *SnapState, removeAll bool
 	if enforcedSets == nil {
 		return nil
 	}
-	requiredValsets, requiredRevision, err := enforcedSets.CheckPresenceRequired(si)
+	pres, err := enforcedSets.Presence(si)
 	if err != nil {
-		if _, ok := err.(*snapasserts.PresenceConstraintError); !ok {
-			return err
-		}
-		// else - presence is invalid, nothing to do (not really possible since
-		// it shouldn't be allowed to get installed in the first place).
-		return nil
+		return err
 	}
-	if len(requiredValsets) == 0 {
-		// not required by any validation set (or is optional)
+	if pres.Presence != asserts.PresenceRequired {
 		return nil
 	}
 	// removeAll is set if we're removing the snap completely
 	if removeAll {
-		if requiredRevision.Unset() {
-			return fmt.Errorf("snap %q is required by validation sets: %s", si.InstanceName(), snapasserts.ValidationSetKeySlice(requiredValsets).CommaSeparated())
+		if pres.Revision.Unset() {
+			return fmt.Errorf("snap %q is required by validation sets: %s", si.InstanceName(), pres.Sets.CommaSeparated())
 		}
-		return fmt.Errorf("snap %q at revision %s is required by validation sets: %s", si.InstanceName(), requiredRevision, snapasserts.ValidationSetKeySlice(requiredValsets).CommaSeparated())
+		return fmt.Errorf("snap %q at revision %s is required by validation sets: %s", si.InstanceName(), pres.Revision, pres.Sets.CommaSeparated())
 	}
 
 	// rev is set at this point (otherwise we would hit removeAll case)
-	if requiredRevision.N == rev.N {
-		return fmt.Errorf("snap %q at revision %s is required by validation sets: %s", si.InstanceName(), rev, snapasserts.ValidationSetKeySlice(requiredValsets).CommaSeparated())
+	if pres.Revision == rev {
+		return fmt.Errorf("snap %q at revision %s is required by validation sets: %s", si.InstanceName(), rev, pres.Sets.CommaSeparated())
 	} // else - it's ok to remove a revision different than the required
 	return nil
 }
@@ -3496,10 +3895,17 @@ func removeTasks(st *state.State, name string, revision snap.Revision, flags *Re
 
 	// only run remove hook if uninstalling the snap completely
 	if removeAll {
-		// TODO:COMPS: Run component remove hooks
+		for _, comp := range snapst.Sequence.ComponentsForRevision(snapst.Current) {
+			removeCompHook := SetupRemoveComponentHook(st, snapsup.InstanceName(), comp.SideInfo.Component.ComponentName)
+			addNext(state.NewTaskSet(removeCompHook))
+			prev = removeCompHook
+		}
 
 		removeHook := SetupRemoveHook(st, snapsup.InstanceName())
 		addNext(state.NewTaskSet(removeHook))
+		if prev != nil {
+			removeHook.WaitFor(prev)
+		}
 		prev = removeHook
 
 		// run disconnect hooks
@@ -3640,7 +4046,7 @@ func removeInactiveRevision(st *state.State, snapst *SnapState, name, snapID str
 		compsup := ComponentSetup{
 			CompSideInfo: &cinfo.ComponentSideInfo,
 			CompType:     cinfo.Type,
-			componentInstallFlags: componentInstallFlags{
+			ComponentInstallFlags: ComponentInstallFlags{
 				MultiComponentInstall: true,
 			},
 		}
@@ -3797,7 +4203,7 @@ func RevertToRevision(st *state.State, name string, rev snap.Revision, flags Fla
 		return nil, err
 	}
 
-	snapsup := &SnapSetup{
+	snapsup := SnapSetup{
 		Base:        info.Base,
 		SideInfo:    snapst.Sequence.SideInfos()[i],
 		Flags:       flags.ForSnapSetup(),
@@ -3807,8 +4213,19 @@ func RevertToRevision(st *state.State, name string, rev snap.Revision, flags Fla
 		InstanceKey: snapst.InstanceKey,
 	}
 
-	// TODO:COMPS: we need to handle components here too
-	return doInstall(st, &snapst, *snapsup, nil, 0, fromChange, nil)
+	components := snapst.Sequence.ComponentsForRevision(rev)
+	compsups := make([]ComponentSetup, 0, len(components))
+	for _, comp := range components {
+		compsups = append(compsups, ComponentSetup{
+			CompSideInfo: comp.SideInfo,
+			CompType:     comp.CompType,
+			ComponentInstallFlags: ComponentInstallFlags{
+				MultiComponentInstall: true,
+			},
+		})
+	}
+
+	return doInstall(st, &snapst, snapsup, compsups, 0, fromChange, nil)
 }
 
 // TransitionCore transitions from an old core snap name to a new core
@@ -3837,11 +4254,23 @@ func TransitionCore(st *state.State, oldName, newName string) ([]*state.TaskSet,
 		return nil, err
 	}
 	if !newSnapst.IsInstalled() {
-		var userID int
-		newInfo, err := installInfo(context.TODO(), st, newName, &RevisionOptions{Channel: oldSnapst.TrackingChannel}, userID, Flags{}, nil)
+		enforced, err := EnforcedValidationSets(st)
 		if err != nil {
 			return nil, err
 		}
+
+		result, err := sendOneInstallAction(context.TODO(), st, StoreSnap{
+			InstanceName: newName,
+			RevOpts: RevisionOptions{
+				Channel:        oldSnapst.TrackingChannel,
+				ValidationSets: enforced,
+			},
+		}, Options{})
+		if err != nil {
+			return nil, err
+		}
+
+		newInfo := result.Info
 
 		// start by installing the new snap
 		tsInst, err := doInstall(st, &newSnapst, SnapSetup{
@@ -3995,8 +4424,22 @@ func InstalledSnaps(st *state.State) (snaps []*snapasserts.InstalledSnap, ignore
 		if err != nil {
 			return nil, nil, err
 		}
-		snaps = append(snaps, snapasserts.NewInstalledSnap(snapState.InstanceName(),
-			snapState.CurrentSideInfo().SnapID, cur.Revision))
+
+		var comps []snapasserts.InstalledComponent
+		for _, comp := range snapState.Sequence.Revisions[snapState.LastIndex(cur.Revision)].Components {
+			comps = append(comps, snapasserts.InstalledComponent{
+				ComponentRef: comp.SideInfo.Component,
+				Revision:     comp.SideInfo.Revision,
+			})
+		}
+
+		snaps = append(snaps, snapasserts.NewInstalledSnap(
+			snapState.InstanceName(),
+			snapState.CurrentSideInfo().SnapID,
+			cur.Revision,
+			comps,
+		))
+
 		if snapState.IgnoreValidation {
 			ignoreValidation[snapState.InstanceName()] = true
 		}
@@ -4391,4 +4834,57 @@ func MockOsutilCheckFreeSpace(mock func(path string, minSize uint64) error) (res
 	old := osutilCheckFreeSpace
 	osutilCheckFreeSpace = mock
 	return func() { osutilCheckFreeSpace = old }
+}
+
+// UnmountAllSnaps unmounts all of the snaps and components in the system state.
+// The primary use case for this is to unmount all snaps that were installed in
+// the chroot environment that is used when creating a preseeded image.
+func UnmountAllSnaps(st *state.State) error {
+	all, err := All(st)
+	if err != nil {
+		return err
+	}
+
+	for _, snapst := range all {
+		if err := unmountSnap(snapst); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func unmountSnap(snapst *SnapState) error {
+	unmountedComps := make(map[string]bool)
+	for _, rev := range snapst.Sequence.Revisions {
+		for _, c := range rev.Components {
+			compName := c.SideInfo.Component.ComponentName
+			cpi := snap.MinimalComponentContainerPlaceInfo(
+				compName,
+				c.SideInfo.Revision,
+				snapst.InstanceName(),
+			)
+
+			mountDir := cpi.MountDir()
+
+			// components might be shared between snap revisions, so make sure
+			// we only unmount them once
+			if unmountedComps[mountDir] {
+				continue
+			}
+			unmountedComps[mountDir] = true
+
+			logger.Debugf("unmounting component %s at %s", compName, mountDir)
+			if _, err := exec.Command("umount", "-d", "-l", mountDir).CombinedOutput(); err != nil {
+				return err
+			}
+		}
+
+		mountDir := snap.MountDir(snapst.InstanceName(), rev.Snap.Revision)
+		logger.Debugf("unmounting snap %s at %s", snapst.InstanceName(), mountDir)
+		if _, err := exec.Command("umount", "-d", "-l", mountDir).CombinedOutput(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

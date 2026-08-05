@@ -74,8 +74,8 @@ func NewInterfaceManagerWithAppArmorPrompting(useAppArmorPrompting bool) *Interf
 	return m
 }
 
-func (m *InterfaceManager) BuildConfinementOptions(st *state.State, snapInfo *snap.Info, flags snapstate.Flags) (interfaces.ConfinementOptions, error) {
-	return m.buildConfinementOptions(st, snapInfo, flags)
+func (m *InterfaceManager) BuildConfinementOptions(st *state.State, task *state.Task, snapInfo *snap.Info, flags snapstate.Flags) (interfaces.ConfinementOptions, error) {
+	return m.buildConfinementOptions(st, task, snapInfo, flags)
 }
 
 type ConnectOpts = connectOpts
@@ -140,6 +140,17 @@ func MockAssessAppArmorPrompting(new func(m *InterfaceManager) bool) (restore fu
 	return testutil.Mock(&assessAppArmorPrompting, new)
 }
 
+func MockInterfacesRequestsControlHandlerServicePresent(new func(m *InterfaceManager) (bool, error)) (restore func()) {
+	return testutil.Mock(&interfacesRequestsControlHandlerServicePresent, new)
+}
+
+func CallInterfacesRequestsControlHandlerServicePresent(s *state.State) (bool, error) {
+	manager := &InterfaceManager{
+		state: s,
+	}
+	return interfacesRequestsControlHandlerServicePresent(manager)
+}
+
 func MockUDevInitRetryTimeout(t time.Duration) (restore func()) {
 	old := udevInitRetryTimeout
 	udevInitRetryTimeout = t
@@ -200,14 +211,6 @@ func MockWriteSystemKey(fn func(extraData interfaces.SystemKeyExtraData) error) 
 	old := writeSystemKey
 	writeSystemKey = fn
 	return func() { writeSystemKey = old }
-}
-
-func MockSnapstateFinishRestart(f func(task *state.Task, snapsup *snapstate.SnapSetup) error) (restore func()) {
-	old := snapstateFinishRestart
-	snapstateFinishRestart = f
-	return func() {
-		snapstateFinishRestart = old
-	}
 }
 
 func (m *InterfaceManager) TransitionConnectionsCoreMigration(st *state.State, oldName, newName string) error {

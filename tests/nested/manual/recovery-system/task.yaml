@@ -37,8 +37,9 @@ execute: |
     shift 2
 
     # shellcheck disable=SC2059
-    response=$(printf "${template}" "$@" | remote.exec "sudo test-snapd-curl.curl -X POST -H 'Content-Type: application/json' --unix-socket /run/snapd.socket -d @- http://localhost${route}")
-    if ! jq -e .change <<< "${response}"; then
+    response=$(printf "${template}" "$@" | \
+        remote.exec "sudo snap debug api -X POST -H 'Content-Type: application/json' ${route}")
+    if ! gojq -e .change <<< "${response}"; then
       echo "could not get change id from response: ${response}"
       false
     fi
@@ -49,12 +50,10 @@ execute: |
 
   wait_for_first_boot_change
 
-  remote.exec sudo snap install --edge --devmode test-snapd-curl
-
   boot_id="$(tests.nested boot-id)"
 
   # create the system
-  change_id=$(post_json_data /v2/systems '{"action": "create", "label": "new-system", "validation-sets": ["test-snapd/recovery-system-pinned=1"], "test-system": %s, "mark-default": %s}' "${TEST_SYSTEM}" "${MARK_DEFAULT}")
+  change_id=$(post_json_data /v2/systems '{"action": "create", "label": "new-system", "validation-sets": ["test-snapd/recovery-system-pinned=2"], "test-system": %s, "mark-default": %s}' "${TEST_SYSTEM}" "${MARK_DEFAULT}")
 
   if [ "${TEST_SYSTEM}" = 'true' ]; then
     remote.wait-for reboot "${boot_id}"

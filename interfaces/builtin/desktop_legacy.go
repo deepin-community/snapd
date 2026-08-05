@@ -20,8 +20,6 @@
 package builtin
 
 import (
-	"strings"
-
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/apparmor"
 )
@@ -158,6 +156,11 @@ unix (connect, receive, send)
      type=stream
      peer=(addr="@tmp/.mozc.*"),
 
+# gcin
+# allow communicating with gcin server
+unix (connect, receive, send)
+     type=stream
+     peer=(addr="@tmp/gcin-*/socket*"),
 
 # fcitx
 # allow communicating with fcitx dbus service
@@ -269,6 +272,42 @@ dbus (send)
     interface=org.gtk.GLib.PACRunner
     member=Lookup
     peer=(label=unconfined),
+
+# dbusmenu
+dbus (send)
+    bus=session
+    path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
+    interface=com.canonical.dbusmenu
+    member="{LayoutUpdated,ItemsPropertiesUpdated}"
+    peer=(label="{plasmashell,unconfined}"),
+
+dbus (receive)
+    bus=session
+    path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
+    interface="{com.canonical.dbusmenu,org.freedesktop.DBus.Properties}"
+    member=Get*
+    peer=(label="{plasmashell,unconfined}"),
+
+dbus (receive)
+    bus=session
+    path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
+    interface=com.canonical.dbusmenu
+    member="{AboutTo*,Event*}"
+    peer=(label="{plasmashell,unconfined}"),
+
+dbus (receive)
+    bus=session
+    path=/{MenuBar{,/[0-9A-F]*},com/canonical/{menu/[0-9A-F]*,dbusmenu}}
+    interface=org.freedesktop.DBus.Introspectable
+    member=Introspect
+    peer=(label="{plasmashell,unconfined}"),
+
+dbus (receive)
+    bus=session
+    path=/com/canonical/dbusmenu
+    interface=org.freedesktop.DBus.Properties
+    member=Get*
+    peer=(label="{plasmashell,unconfined}"),
 
 # app-indicators
 dbus (send)
@@ -390,7 +429,10 @@ func (iface *desktopLegacyInterface) AppArmorConnectedPlug(spec *apparmor.Specif
 	// interfaces (like desktop-launch), so they are added here with the minimum
 	// priority, while those other, more privileged, interfaces will add an empty
 	// string with a bigger privilege value.
-	desktopSnippet := strings.Join(getDesktopFileRules(plug.Snap().DesktopPrefix()), "\n")
+	desktopSnippet, err := getDesktopFileRules(plug.Snap())
+	if err != nil {
+		return err
+	}
 	spec.AddPrioritizedSnippet(desktopSnippet, prioritizedSnippetDesktopFileAccess, desktopLegacyAndUnity7Priority)
 
 	return nil

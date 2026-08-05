@@ -14,11 +14,11 @@ details: |
 # due to various bugs with other distros and snapcraft and/or LXD
 systems:
     # snapcraft is a classic snap, can't run on ubuntu-core
-    - -ubuntu-core*
-    # LXD doesn't work properly on amazon linux, fedora 31, opensuse, or debian
+    - -ubuntu-core-*
+    # LXD doesn't work properly on amazon linux, fedora, opensuse, or debian
     # 9 to build the snap, it complains about fuse.snapfuse getting EPERM when
     # snaps are installed inside the LXD container that snapcraft creates
-    - -amazon-linux*
+    - -amazon-linux-*
     - -debian-*
     - -fedora-*
     - -opensuse-*
@@ -30,10 +30,6 @@ systems:
     # locale, see https://bugs.launchpad.net/snapcraft/+bug/1922140
     # a separate error occurs on centos 8, see https://bugs.launchpad.net/snapcraft/+bug/1922981
     - -centos-*
-    # ubuntu-18.04-32: i386 is not supported by lxd
-    # TODO: enable i386 by using lxd 3.0, currently snapcraft is failing to get the
-    #       lxd image when it is trying to build snapd
-    - -ubuntu-18.04-32
     # Not very useful to build snapd snap from 14.04 given it has to use lxd.
     # The VMs for 14.04 do not have enough. So let's disable the test anyway.
     - -ubuntu-14.04-*
@@ -64,14 +60,6 @@ prepare: |
         # properly on a host using unified hierarchy
         echo "Skipping LXD build with unified cgroup hierarchy"
         exit 0
-    fi
-
-    if os.query is-fedora || os.query is-arch-linux || os.query is-centos; then
-        # in order to install classic snaps, we need to setup the /snap 
-        # symlink on these distros
-        SNAP_MOUNT_DIR="$(os.paths snap-mount-dir)"
-        ln -sf "$SNAP_MOUNT_DIR" /snap
-        tests.cleanup defer rm -f /snap
     fi
 
     echo "Install snapcraft from ${SNAPCRAFT_SNAP_CHANNEL}"
@@ -118,7 +106,7 @@ prepare: |
 
         # When the SRU validation tests are executed, the core snap is not repacked
         # and the var MODIFY_CORE_SNAP_FOR_REEXEC is 0
-        if [ "$MODIFY_CORE_SNAP_FOR_REEXEC" = 1 ]; then
+        if [ "$MODIFY_CORE_SNAP_FOR_REEXEC" = 1 ] && ! tests.info is-snapd-from-archive; then
             CORE_SNAP_REV=$(snap list core | grep -v Name | awk '{print $3}')
             CORE_SNAP="/var/lib/snapd/snaps/core_${CORE_SNAP_REV}.snap"
             ORIG_CORE_SNAP=${CORE_SNAP}.orig
@@ -172,6 +160,9 @@ execute: |
 
     rm -rf c-vendor/squashfuse
 
+    # Use test build to make sure the version is higher than the deb/rpm coming from the repo
+    touch test-build
+
     echo "Build the snap"
     snap run snapcraft snap --output=snapd_spread-test.snap
     popd
@@ -183,6 +174,7 @@ execute: |
     cat >> snapcraft-cleanup.sh <<EOF
     #!/bin/sh
     cd $PROJECT_PATH
+    rm -f test-build
     snap run snapcraft clean
     EOF
     chmod +x snapcraft-cleanup.sh
@@ -376,7 +368,8 @@ execute: |
     fi
 
     # reboot to ensure snapd.apparmor still works then too
-    if [ "$SPREAD_REBOOT" = "0" ]; then
+    
+    if [ "$SPREAD_REBOOT" = "0" ] && ! tests.info is-snapd-from-archive; then
         # downgrade the snapd deb from the distro package to test that we can
         # still handle the generated apparmor profiles etc from the snapd snap
         echo "Downgrading snapd to distro packaged version..."
@@ -385,7 +378,7 @@ execute: |
         # not have credentials for esm.ubuntu.com
         if ! os.query is-xenial; then
             apt install -y --allow-downgrades "snapd/$(lsb_release -sc)"
-            tests.cleanup defer apt install -y "$PROJECT_PATH/../"snapd_1337.*_"$(dpkg-architecture -qDEB_HOST_ARCH)".deb
+            tests.cleanup defer apt install -y "$GOHOME"/snapd_*.deb
 
             # check snapd.apparmor is still working after downgrade
             if ! os.query is-xenial; then

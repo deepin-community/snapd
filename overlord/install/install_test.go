@@ -38,6 +38,7 @@ import (
 	"github.com/snapcore/snapd/bootloader/bootloadertest"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/gadget/quantity"
 	"github.com/snapcore/snapd/kernel/fde"
 	"github.com/snapcore/snapd/logger"
@@ -45,11 +46,11 @@ import (
 	"github.com/snapcore/snapd/overlord/install"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/secboot"
-	"github.com/snapcore/snapd/secboot/keys"
 	"github.com/snapcore/snapd/seed"
 	"github.com/snapcore/snapd/seed/seedtest"
 	"github.com/snapcore/snapd/seed/seedwriter"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/sysconfig"
 	"github.com/snapcore/snapd/testutil"
@@ -209,118 +210,155 @@ func (s *installSuite) TestEncryptionSupportInfoWithTPM(c *C) {
 	gadgetInfo, _ := s.mountedGadget(c)
 
 	var testCases = []struct {
-		grade, storageSafety string
-		tpmErr               error
+		grade, storageSafety, snapdVersion, kernelSnapdVersion string
+		tpmErr                                                 error
 
 		expected install.EncryptionSupportInfo
 	}{
 		{
-			"dangerous", "", nil,
+			"dangerous", "", "", "", nil,
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyPreferEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		}, {
-			"dangerous", "", fmt.Errorf("no tpm"),
+			"dangerous", "", "", "", fmt.Errorf("no tpm"),
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:      asserts.StorageSafetyPreferEncrypted,
-				Type:               secboot.EncryptionTypeNone,
+				Type:               device.EncryptionTypeNone,
 				UnavailableWarning: "not encrypting device storage as checking TPM gave: no tpm",
 			},
 		}, {
-			"dangerous", "encrypted", nil,
+			"dangerous", "encrypted", "", "", nil,
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		}, {
-			"dangerous", "encrypted", fmt.Errorf("no tpm"),
+			"dangerous", "encrypted", "", "", fmt.Errorf("no tpm"),
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:  asserts.StorageSafetyEncrypted,
-				Type:           secboot.EncryptionTypeNone,
+				Type:           device.EncryptionTypeNone,
 				UnavailableErr: fmt.Errorf("cannot encrypt device storage as mandated by encrypted storage-safety model option: no tpm"),
 			},
 		},
 		{
-			"dangerous", "prefer-unencrypted", nil,
+			"dangerous", "prefer-unencrypted", "", "", nil,
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyPreferUnencrypted,
 				// Note that encryption type is set to what is available
-				Type: secboot.EncryptionTypeLUKS,
+				Type: device.EncryptionTypeLUKS,
 			},
 		},
 		{
-			"signed", "", nil,
+			"signed", "", "", "", nil,
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyPreferEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		}, {
-			"signed", "", fmt.Errorf("no tpm"),
+			"signed", "", "", "", fmt.Errorf("no tpm"),
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:      asserts.StorageSafetyPreferEncrypted,
-				Type:               secboot.EncryptionTypeNone,
+				Type:               device.EncryptionTypeNone,
 				UnavailableWarning: "not encrypting device storage as checking TPM gave: no tpm",
 			},
 		}, {
-			"signed", "encrypted", nil,
+			"signed", "encrypted", "", "", nil,
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		}, {
-			"signed", "prefer-unencrypted", nil,
+			"signed", "prefer-unencrypted", "", "", nil,
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyPreferUnencrypted,
 				// Note that encryption type is set to what is available
-				Type: secboot.EncryptionTypeLUKS,
+				Type: device.EncryptionTypeLUKS,
 			},
 		}, {
-			"signed", "encrypted", fmt.Errorf("no tpm"),
+			"signed", "encrypted", "", "", fmt.Errorf("no tpm"),
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:  asserts.StorageSafetyEncrypted,
-				Type:           secboot.EncryptionTypeNone,
+				Type:           device.EncryptionTypeNone,
 				UnavailableErr: fmt.Errorf("cannot encrypt device storage as mandated by encrypted storage-safety model option: no tpm"),
 			},
 		}, {
-			"secured", "encrypted", nil,
+			"secured", "encrypted", "", "", nil,
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		}, {
-			"secured", "encrypted", fmt.Errorf("no tpm"),
+			"secured", "encrypted", "", "", fmt.Errorf("no tpm"),
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:  asserts.StorageSafetyEncrypted,
-				Type:           secboot.EncryptionTypeNone,
+				Type:           device.EncryptionTypeNone,
 				UnavailableErr: fmt.Errorf("cannot encrypt device storage as mandated by model grade secured: no tpm"),
 			},
 		}, {
-			"secured", "", nil,
+			"secured", "", "", "", nil,
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		}, {
-			"secured", "", fmt.Errorf("no tpm"),
+			"secured", "", "", "", fmt.Errorf("no tpm"),
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:  asserts.StorageSafetyEncrypted,
-				Type:           secboot.EncryptionTypeNone,
+				Type:           device.EncryptionTypeNone,
 				UnavailableErr: fmt.Errorf("cannot encrypt device storage as mandated by model grade secured: no tpm"),
+			},
+		},
+		// Passphrase support requires snapd 2.68+
+		{
+			"secured", "encrypted", "2.68", "2.68", nil,
+			install.EncryptionSupportInfo{
+				Available: true, Disabled: false,
+				StorageSafety:           asserts.StorageSafetyEncrypted,
+				Type:                    device.EncryptionTypeLUKS,
+				PassphraseAuthAvailable: true,
+			},
+		},
+		{
+			"secured", "encrypted", "2.69", "2.69", nil,
+			install.EncryptionSupportInfo{
+				Available: true, Disabled: false,
+				StorageSafety:           asserts.StorageSafetyEncrypted,
+				Type:                    device.EncryptionTypeLUKS,
+				PassphraseAuthAvailable: true,
+			},
+		},
+		{
+			"secured", "encrypted", "2.67", "2.68", nil,
+			install.EncryptionSupportInfo{
+				Available: true, Disabled: false,
+				StorageSafety:           asserts.StorageSafetyEncrypted,
+				Type:                    device.EncryptionTypeLUKS,
+				PassphraseAuthAvailable: false,
+			},
+		},
+		{
+			"secured", "encrypted", "2.68", "2.67", nil,
+			install.EncryptionSupportInfo{
+				Available: true, Disabled: false,
+				StorageSafety:           asserts.StorageSafetyEncrypted,
+				Type:                    device.EncryptionTypeLUKS,
+				PassphraseAuthAvailable: false,
 			},
 		},
 	}
@@ -332,8 +370,12 @@ func (s *installSuite) TestEncryptionSupportInfoWithTPM(c *C) {
 			"grade":          tc.grade,
 			"storage-safety": tc.storageSafety,
 		})
+		mockSystemSnapdVersions := &install.SystemSnapdVersions{
+			SnapdVersion:          tc.snapdVersion,
+			SnapdInitramfsVersion: tc.kernelSnapdVersion,
+		}
 
-		res, err := install.GetEncryptionSupportInfo(mockModel, secboot.TPMProvisionFull, kernelInfo, gadgetInfo, nil)
+		res, err := install.GetEncryptionSupportInfo(mockModel, secboot.TPMProvisionFull, kernelInfo, gadgetInfo, mockSystemSnapdVersions, nil)
 		c.Assert(err, IsNil)
 		c.Check(res, DeepEquals, tc.expected, Commentf("%v", tc))
 	}
@@ -355,7 +397,7 @@ func (s *installSuite) TestEncryptionSupportInfoForceUnencrypted(c *C) {
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyPreferEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		},
 		{
@@ -367,7 +409,7 @@ func (s *installSuite) TestEncryptionSupportInfoForceUnencrypted(c *C) {
 				// performed.
 				Available: false, Disabled: true,
 				StorageSafety: asserts.StorageSafetyPreferEncrypted,
-				Type:          secboot.EncryptionTypeNone,
+				Type:          device.EncryptionTypeNone,
 			},
 		},
 		{
@@ -377,7 +419,7 @@ func (s *installSuite) TestEncryptionSupportInfoForceUnencrypted(c *C) {
 				// here so the "no tpm" error is never visible
 				Available: false, Disabled: true,
 				StorageSafety: asserts.StorageSafetyPreferEncrypted,
-				Type:          secboot.EncryptionTypeNone,
+				Type:          device.EncryptionTypeNone,
 			},
 		},
 		// not possible to disable encryption on non-dangerous devices
@@ -386,7 +428,7 @@ func (s *installSuite) TestEncryptionSupportInfoForceUnencrypted(c *C) {
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyPreferEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		},
 		{
@@ -394,7 +436,7 @@ func (s *installSuite) TestEncryptionSupportInfoForceUnencrypted(c *C) {
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyPreferEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		},
 		{
@@ -402,7 +444,7 @@ func (s *installSuite) TestEncryptionSupportInfoForceUnencrypted(c *C) {
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:      asserts.StorageSafetyPreferEncrypted,
-				Type:               secboot.EncryptionTypeNone,
+				Type:               device.EncryptionTypeNone,
 				UnavailableWarning: "not encrypting device storage as checking TPM gave: no tpm",
 			},
 		},
@@ -411,7 +453,7 @@ func (s *installSuite) TestEncryptionSupportInfoForceUnencrypted(c *C) {
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		},
 		{
@@ -419,7 +461,7 @@ func (s *installSuite) TestEncryptionSupportInfoForceUnencrypted(c *C) {
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		},
 		{
@@ -427,7 +469,7 @@ func (s *installSuite) TestEncryptionSupportInfoForceUnencrypted(c *C) {
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:  asserts.StorageSafetyEncrypted,
-				Type:           secboot.EncryptionTypeNone,
+				Type:           device.EncryptionTypeNone,
 				UnavailableErr: fmt.Errorf("cannot encrypt device storage as mandated by model grade secured: no tpm"),
 			},
 		},
@@ -451,7 +493,7 @@ func (s *installSuite) TestEncryptionSupportInfoForceUnencrypted(c *C) {
 			c.Assert(err, IsNil)
 		}
 
-		res, err := install.GetEncryptionSupportInfo(mockModel, secboot.TPMProvisionFull, kernelInfo, gadgetInfo, nil)
+		res, err := install.GetEncryptionSupportInfo(mockModel, secboot.TPMProvisionFull, kernelInfo, gadgetInfo, nil, nil)
 		c.Assert(err, IsNil)
 		c.Check(res, DeepEquals, tc.expected, Commentf("%v", tc))
 	}
@@ -503,14 +545,14 @@ func (s *installSuite) TestEncryptionSupportInfoGadgetIncompatibleWithEncryption
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyPreferEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		}, {
 			"dangerous", "", gadgetWithoutUbuntuSave,
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:      asserts.StorageSafetyPreferEncrypted,
-				Type:               secboot.EncryptionTypeNone,
+				Type:               device.EncryptionTypeNone,
 				UnavailableWarning: "cannot use encryption with the gadget, disabling encryption: gadget does not support encrypted data: required partition with system-save role is missing",
 			},
 		}, {
@@ -518,7 +560,7 @@ func (s *installSuite) TestEncryptionSupportInfoGadgetIncompatibleWithEncryption
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:  asserts.StorageSafetyEncrypted,
-				Type:           secboot.EncryptionTypeNone,
+				Type:           device.EncryptionTypeNone,
 				UnavailableErr: fmt.Errorf("cannot use encryption with the gadget: gadget does not support encrypted data: required partition with system-save role is missing"),
 			},
 		}, {
@@ -526,14 +568,14 @@ func (s *installSuite) TestEncryptionSupportInfoGadgetIncompatibleWithEncryption
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyPreferEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		}, {
 			"signed", "", gadgetWithoutUbuntuSave,
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:      asserts.StorageSafetyPreferEncrypted,
-				Type:               secboot.EncryptionTypeNone,
+				Type:               device.EncryptionTypeNone,
 				UnavailableWarning: "cannot use encryption with the gadget, disabling encryption: gadget does not support encrypted data: required partition with system-save role is missing",
 			},
 		}, {
@@ -541,7 +583,7 @@ func (s *installSuite) TestEncryptionSupportInfoGadgetIncompatibleWithEncryption
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:  asserts.StorageSafetyEncrypted,
-				Type:           secboot.EncryptionTypeNone,
+				Type:           device.EncryptionTypeNone,
 				UnavailableErr: fmt.Errorf("cannot use encryption with the gadget: gadget does not support encrypted data: required partition with system-save role is missing"),
 			},
 		}, {
@@ -549,14 +591,14 @@ func (s *installSuite) TestEncryptionSupportInfoGadgetIncompatibleWithEncryption
 			install.EncryptionSupportInfo{
 				Available: true, Disabled: false,
 				StorageSafety: asserts.StorageSafetyEncrypted,
-				Type:          secboot.EncryptionTypeLUKS,
+				Type:          device.EncryptionTypeLUKS,
 			},
 		}, {
 			"secured", "", gadgetWithoutUbuntuSave,
 			install.EncryptionSupportInfo{
 				Available: false, Disabled: false,
 				StorageSafety:  asserts.StorageSafetyEncrypted,
-				Type:           secboot.EncryptionTypeNone,
+				Type:           device.EncryptionTypeNone,
 				UnavailableErr: fmt.Errorf("cannot use encryption with the gadget: gadget does not support encrypted data: required partition with system-save role is missing"),
 			},
 		},
@@ -567,7 +609,8 @@ func (s *installSuite) TestEncryptionSupportInfoGadgetIncompatibleWithEncryption
 			"storage-safety": tc.storageSafety,
 		})
 
-		res, err := install.GetEncryptionSupportInfo(mockModel, secboot.TPMProvisionFull, kernelInfo, tc.gadgetInfo, nil)
+		gadget.SetEnclosingVolumeInStructs(tc.gadgetInfo.Volumes)
+		res, err := install.GetEncryptionSupportInfo(mockModel, secboot.TPMProvisionFull, kernelInfo, tc.gadgetInfo, nil, nil)
 		c.Assert(err, IsNil)
 		c.Check(res, DeepEquals, tc.expected, Commentf("%v", tc))
 	}
@@ -578,25 +621,25 @@ func (s *installSuite) TestInstallCheckEncryptedFDEHook(c *C) {
 		hookOutput  string
 		expectedErr string
 
-		encryptionType secboot.EncryptionType
+		encryptionType device.EncryptionType
 	}{
 		// invalid json
-		{"xxx", `cannot parse hook output "xxx": invalid character 'x' looking for beginning of value`, secboot.EncryptionTypeNone},
+		{"xxx", `cannot parse hook output "xxx": invalid character 'x' looking for beginning of value`, device.EncryptionTypeNone},
 		// no output is invalid
-		{"", `cannot parse hook output "": unexpected end of JSON input`, secboot.EncryptionTypeNone},
+		{"", `cannot parse hook output "": unexpected end of JSON input`, device.EncryptionTypeNone},
 		// specific error
-		{`{"error":"failed"}`, `cannot use hook: it returned error: failed`, secboot.EncryptionTypeNone},
-		{`{}`, `cannot use hook: neither "features" nor "error" returned`, secboot.EncryptionTypeNone},
+		{`{"error":"failed"}`, `cannot use hook: it returned error: failed`, device.EncryptionTypeNone},
+		{`{}`, `cannot use hook: neither "features" nor "error" returned`, device.EncryptionTypeNone},
 		// valid
-		{`{"features":[]}`, "", secboot.EncryptionTypeLUKS},
-		{`{"features":["a"]}`, "", secboot.EncryptionTypeLUKS},
-		{`{"features":["a","b"]}`, "", secboot.EncryptionTypeLUKS},
+		{`{"features":[]}`, "", device.EncryptionTypeLUKS},
+		{`{"features":["a"]}`, "", device.EncryptionTypeLUKS},
+		{`{"features":["a","b"]}`, "", device.EncryptionTypeLUKS},
 		// features must be list of strings
-		{`{"features":[1]}`, `cannot parse hook output ".*": json: cannot unmarshal number into Go struct.*`, secboot.EncryptionTypeNone},
-		{`{"features":1}`, `cannot parse hook output ".*": json: cannot unmarshal number into Go struct.*`, secboot.EncryptionTypeNone},
-		{`{"features":"1"}`, `cannot parse hook output ".*": json: cannot unmarshal string into Go struct.*`, secboot.EncryptionTypeNone},
+		{`{"features":[1]}`, `cannot parse hook output ".*": json: cannot unmarshal number into Go struct.*`, device.EncryptionTypeNone},
+		{`{"features":1}`, `cannot parse hook output ".*": json: cannot unmarshal number into Go struct.*`, device.EncryptionTypeNone},
+		{`{"features":"1"}`, `cannot parse hook output ".*": json: cannot unmarshal string into Go struct.*`, device.EncryptionTypeNone},
 		// valid and uses ice
-		{`{"features":["a","inline-crypto-engine","b"]}`, "", secboot.EncryptionTypeLUKSWithICE},
+		{`{"features":["a","inline-crypto-engine","b"]}`, "", device.EncryptionTypeLUKSWithICE},
 	} {
 		runFDESetup := func(_ *fde.SetupRequest) ([]byte, error) {
 			return []byte(tc.hookOutput), nil
@@ -624,12 +667,12 @@ func (s *installSuite) TestInstallCheckEncryptionSupportTPM(c *C) {
 
 	for _, tc := range []struct {
 		hasTPM         bool
-		encryptionType secboot.EncryptionType
+		encryptionType device.EncryptionType
 	}{
 		// unhappy: no tpm, no hook
-		{false, secboot.EncryptionTypeNone},
+		{false, device.EncryptionTypeNone},
 		// happy: tpm
-		{true, secboot.EncryptionTypeLUKS},
+		{true, device.EncryptionTypeLUKS},
 	} {
 		restore := install.MockSecbootCheckTPMKeySealingSupported(func(secboot.TPMProvisionMode) error {
 			if tc.hasTPM {
@@ -663,10 +706,10 @@ func (s *installSuite) TestInstallCheckEncryptionSupportHook(c *C) {
 		fdeSetupHookFeatures string
 
 		hasTPM         bool
-		encryptionType secboot.EncryptionType
+		encryptionType device.EncryptionType
 	}{
-		{"[]", false, secboot.EncryptionTypeLUKS},
-		{"[]", true, secboot.EncryptionTypeLUKS},
+		{"[]", false, device.EncryptionTypeLUKS},
+		{"[]", true, device.EncryptionTypeLUKS},
 	} {
 		runFDESetup := func(_ *fde.SetupRequest) ([]byte, error) {
 			return []byte(fmt.Sprintf(`{"features":%s}`, tc.fdeSetupHookFeatures)), nil
@@ -723,7 +766,7 @@ func (s *installSuite) TestInstallCheckEncryptionSupportStorageSafety(c *C) {
 
 		encryptionType, err := install.CheckEncryptionSupport(mockModel, secboot.TPMProvisionFull, kernelInfo, gadgetInfo, nil)
 		c.Assert(err, IsNil)
-		encrypt := (encryptionType != secboot.EncryptionTypeNone)
+		encrypt := (encryptionType != device.EncryptionTypeNone)
 		c.Check(encrypt, Equals, tc.expectedEncryption, Commentf("%v", tc))
 	}
 }
@@ -872,11 +915,6 @@ func (s *installSuite) TestBuildInstallObserver(c *C) {
 	}
 }
 
-var (
-	dataEncryptionKey = keys.EncryptionKey{'d', 'a', 't', 'a', 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	saveKey           = keys.EncryptionKey{'s', 'a', 'v', 'e', 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-)
-
 func (s *installSuite) TestPrepareEncryptedSystemData(c *C) {
 	_, gadgetDir := s.mountedGadget(c)
 	mockModel := s.mockModel(nil)
@@ -889,27 +927,87 @@ func (s *installSuite) TestPrepareEncryptedSystemData(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(to, NotNil)
 
+	restore := install.MockBootUseTokens(func(model *asserts.Model) bool {
+		return true
+	})
+	defer restore()
+
 	// We are required to call ObserveExistingTrustedRecoveryAssets on trusted observers
 	err = to.ObserveExistingTrustedRecoveryAssets(boot.InitramfsUbuntuSeedDir)
 	c.Assert(err, IsNil)
 
-	keyForRole := map[string]keys.EncryptionKey{
-		gadget.SystemData: dataEncryptionKey,
-		gadget.SystemSave: saveKey,
+	saveDisk := secboot.CreateMockBootstrappedContainer()
+
+	installKeyForRole := map[string]secboot.BootstrappedContainer{
+		gadget.SystemData: secboot.CreateMockBootstrappedContainer(),
+		gadget.SystemSave: saveDisk,
 	}
-	err = install.PrepareEncryptedSystemData(mockModel, keyForRole, to)
+	err = install.PrepareEncryptedSystemData(mockModel, installKeyForRole, nil, to)
 	c.Assert(err, IsNil)
 
-	c.Check(filepath.Join(filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-data/system-data/var/lib/snapd/device/fde"), "ubuntu-save.key"), testutil.FileEquals, []byte(saveKey))
 	marker, err := os.ReadFile(filepath.Join(filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-data/system-data/var/lib/snapd/device/fde"), "marker"))
 	c.Assert(err, IsNil)
 	c.Check(marker, HasLen, 32)
 	c.Check(filepath.Join(boot.InstallHostFDESaveDir, "marker"), testutil.FileEquals, marker)
 
-	// the assets cache was written to
+	// Check that the assets cache was written to
 	l, err := os.ReadDir(filepath.Join(dirs.SnapBootAssetsDir, "trusted"))
 	c.Assert(err, IsNil)
 	c.Assert(l, HasLen, 1)
+
+	_, err = os.ReadFile(filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-data/system-data/var/lib/snapd/device/fde", "ubuntu-save.key"))
+	c.Assert(err, IsNil)
+
+	_, hasToken := saveDisk.Tokens["default"]
+	c.Assert(hasToken, Equals, true)
+}
+
+func (s *installSuite) TestPrepareEncryptedSystemDataLegacyKeys(c *C) {
+	_, gadgetDir := s.mountedGadget(c)
+	mockModel := s.mockModel(nil)
+
+	trustedAssets := true
+	s.mockBootloader(c, trustedAssets, false)
+
+	useEncryption := true
+	_, to, err := install.BuildInstallObserver(mockModel, gadgetDir, useEncryption)
+	c.Assert(err, IsNil)
+	c.Assert(to, NotNil)
+
+	restore := install.MockBootUseTokens(func(model *asserts.Model) bool {
+		return false
+	})
+	defer restore()
+
+	// We are required to call ObserveExistingTrustedRecoveryAssets on trusted observers
+	err = to.ObserveExistingTrustedRecoveryAssets(boot.InitramfsUbuntuSeedDir)
+	c.Assert(err, IsNil)
+
+	saveDisk := secboot.CreateMockBootstrappedContainer()
+
+	installKeyForRole := map[string]secboot.BootstrappedContainer{
+		gadget.SystemData: secboot.CreateMockBootstrappedContainer(),
+		gadget.SystemSave: saveDisk,
+	}
+	err = install.PrepareEncryptedSystemData(mockModel, installKeyForRole, nil, to)
+	c.Assert(err, IsNil)
+
+	marker, err := os.ReadFile(filepath.Join(filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-data/system-data/var/lib/snapd/device/fde"), "marker"))
+	c.Assert(err, IsNil)
+	c.Check(marker, HasLen, 32)
+	c.Check(filepath.Join(boot.InstallHostFDESaveDir, "marker"), testutil.FileEquals, marker)
+
+	// Check that the assets cache was written to
+	l, err := os.ReadDir(filepath.Join(dirs.SnapBootAssetsDir, "trusted"))
+	c.Assert(err, IsNil)
+	c.Assert(l, HasLen, 1)
+
+	saveKey, err := os.ReadFile(filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-data/system-data/var/lib/snapd/device/fde", "ubuntu-save.key"))
+	c.Assert(err, IsNil)
+
+	slotKey, hasSlot := saveDisk.Slots["default"]
+	c.Assert(hasSlot, Equals, true)
+	c.Check(slotKey, DeepEquals, saveKey)
 }
 
 func (s *installSuite) TestPrepareRunSystemDataWritesModel(c *C) {
@@ -1188,6 +1286,15 @@ func (s *installSuite) setupCore20Seed(c *C) *asserts.Model {
 	s.mountedGadget(c)
 	optSnapPath := snaptest.MakeTestSnapWithFiles(c, seedtest.SampleSnapYaml["optional20-a"], nil)
 
+	compRevs := map[string]snap.Revision{
+		"comp1": snap.R(2),
+		"comp2": snap.R(3),
+	}
+	s.MakeAssertedSnapWithComps(
+		c, seedtest.SampleSnapYaml["required20"], nil,
+		snap.R(1), compRevs, "canonical", s.StoreSigning.Database,
+	)
+
 	model := map[string]interface{}{
 		"display-name": "my model",
 		"architecture": "amd64",
@@ -1215,7 +1322,15 @@ func (s *installSuite) setupCore20Seed(c *C) *asserts.Model {
 				"name": "core20",
 				"id":   s.AssertedSnapID("core20"),
 				"type": "base",
-			}},
+			},
+			map[string]interface{}{
+				"name": "required20",
+				"id":   s.AssertedSnapID("required20"),
+				"components": map[string]interface{}{
+					"comp1": "required",
+				},
+			},
+		},
 	}
 
 	return s.MakeSeed(c, "20220401", "my-brand", "my-model", model, []*seedwriter.OptionsSnap{{Path: optSnapPath}})
@@ -1241,8 +1356,8 @@ func (s *installSuite) mockPreseedAssertion(c *C, brandID, modelName, series, pr
 	}
 
 	f, err := os.Create(preseedAsPath)
-	defer f.Close()
 	c.Assert(err, IsNil)
+	defer f.Close()
 	enc := asserts.NewEncoder(f)
 	c.Assert(enc.Encode(preseedAs), IsNil)
 }
@@ -1271,6 +1386,17 @@ func (s *installSuite) TestApplyPreseededData(c *C) {
 		map[string]interface{}{"name": "core20", "id": s.AssertedSnapID("core20"), "revision": "1"},
 		map[string]interface{}{"name": "pc-kernel", "id": s.AssertedSnapID("pc-kernel"), "revision": "1"},
 		map[string]interface{}{"name": "pc", "id": s.AssertedSnapID("pc"), "revision": "1"},
+		map[string]interface{}{
+			"name":     "required20",
+			"id":       s.AssertedSnapID("required20"),
+			"revision": "1",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp1",
+					"revision": "2",
+				},
+			},
+		},
 		map[string]interface{}{"name": "optional20-a"},
 	}
 	sha3_384, _, err := osutil.FileDigest(preseedArtifact, crypto.SHA3_384)
@@ -1311,6 +1437,8 @@ func (s *installSuite) TestApplyPreseededData(c *C) {
 		{"core20/1", "core20_1.snap"},
 		{"pc-kernel/1", "pc-kernel_1.snap"},
 		{"pc/1", "pc_1.snap"},
+		{"required20/1", "required20_1.snap"},
+		{"required20/components/mnt/comp1", "required20+comp1_2.comp"},
 		{"optional20-a/x1", "optional20-a_x1.snap"},
 	} {
 		c.Assert(osutil.FileExists(filepath.Join(writableDir, dirs.StripRootDir(dirs.SnapMountDir), seedSnap.name)), Equals, true, &dumpDirContents{c, writableDir})
@@ -1446,8 +1574,9 @@ func (s *installSuite) TestApplyPreseededDataSnapMismatch(c *C) {
 		c.Assert(err, ErrorMatches, tc.err)
 	}
 
-	// mode-snap is presend in the seed but missing in the preseed assertion; add other-snap to preseed assertion
-	// to satisfy the check for number of snaps.
+	// mode-snap is preseeded in the seed but missing in the preseed assertion;
+	// add other-snap to preseed assertion to satisfy the check for number of
+	// snaps.
 	preseedAsSnaps := []interface{}{
 		map[string]interface{}{"name": "essential-snap", "id": "id111111111111111111111111111111", "revision": "1"},
 		map[string]interface{}{"name": "other-snap", "id": "id333222222222222222222222222222", "revision": "2"},
@@ -1456,6 +1585,183 @@ func (s *installSuite) TestApplyPreseededDataSnapMismatch(c *C) {
 	s.mockPreseedAssertion(c, model.BrandID(), model.Model(), "16", preseedAsPath, sysLabel, digest, preseedAsSnaps)
 	err = install.ApplyPreseededData(sysSeed, writableDir)
 	c.Assert(err, ErrorMatches, `snap "mode-snap" not present in the preseed assertion`)
+}
+
+func (s *installSuite) TestApplyPreseededDataComponentMismatchWrongRevision(c *C) {
+	preseed := []interface{}{
+		map[string]interface{}{
+			"name":     "essential-snap",
+			"id":       snaptest.AssertedSnapID("essential-snap"),
+			"revision": "1",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp1",
+					"revision": "5",
+				},
+			},
+		},
+		map[string]interface{}{
+			"name":     "mode-snap",
+			"id":       snaptest.AssertedSnapID("mode-snap"),
+			"revision": "3",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp2",
+					"revision": "4",
+				},
+			},
+		},
+	}
+	const message = `component "essential-snap\+comp1" has wrong revision 2 \(expected: 5\)`
+	s.testApplyPreseededDataComponentMismatch(c, preseededDataComponentMismatchOpts{
+		preseed: preseed,
+		errMsg:  message,
+	})
+}
+
+func (s *installSuite) TestApplyPreseededDataComponentMismatchMissingComponent(c *C) {
+	preseed := []interface{}{
+		map[string]interface{}{
+			"name":     "essential-snap",
+			"id":       snaptest.AssertedSnapID("essential-snap"),
+			"revision": "1",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp1",
+					"revision": "2",
+				},
+				map[string]interface{}{
+					"name":     "comp3",
+					"revision": "5",
+				},
+			},
+		},
+		map[string]interface{}{
+			"name":     "mode-snap",
+			"id":       snaptest.AssertedSnapID("mode-snap"),
+			"revision": "3",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp2",
+					"revision": "4",
+				},
+			},
+		},
+	}
+	const message = `seed is missing components expected by preseed assertion: "essential-snap\+comp3"`
+	s.testApplyPreseededDataComponentMismatch(c, preseededDataComponentMismatchOpts{
+		preseed: preseed,
+		errMsg:  message,
+	})
+}
+
+func (s *installSuite) TestApplyPreseededDataComponentMismatchExtraComponent(c *C) {
+	preseed := []interface{}{
+		map[string]interface{}{
+			"name":     "essential-snap",
+			"id":       snaptest.AssertedSnapID("essential-snap"),
+			"revision": "1",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp1",
+					"revision": "2",
+				},
+			},
+		},
+		map[string]interface{}{
+			"name":     "mode-snap",
+			"id":       snaptest.AssertedSnapID("mode-snap"),
+			"revision": "3",
+			"components": []interface{}{
+				map[string]interface{}{
+					"name":     "comp2",
+					"revision": "4",
+				},
+			},
+		},
+	}
+	const message = `component "essential-snap\+comp3" not present in the preseed assertion`
+	s.testApplyPreseededDataComponentMismatch(c, preseededDataComponentMismatchOpts{
+		preseed: preseed,
+		errMsg:  message,
+		extraSeedComponents: []seed.Component{{
+			CompSideInfo: snap.ComponentSideInfo{
+				Revision:  snap.R(5),
+				Component: naming.NewComponentRef("essential-snap", "comp3"),
+			},
+		}},
+	})
+}
+
+type preseededDataComponentMismatchOpts struct {
+	preseed             []interface{}
+	errMsg              string
+	extraSeedComponents []seed.Component
+}
+
+func (s *installSuite) testApplyPreseededDataComponentMismatch(c *C, opts preseededDataComponentMismatchOpts) {
+	mockTarCmd := testutil.MockCommand(c, "tar", "")
+	defer mockTarCmd.Restore()
+
+	snapPath1 := filepath.Join(dirs.GlobalRootDir, "essential-snap_1.snap")
+	snapPath2 := filepath.Join(dirs.GlobalRootDir, "mode-snap_3.snap")
+	c.Assert(os.WriteFile(snapPath1, nil, 0644), IsNil)
+	c.Assert(os.WriteFile(snapPath2, nil, 0644), IsNil)
+
+	ubuntuSeedDir := filepath.Join(dirs.GlobalRootDir, "run/mnt/ubuntu-seed")
+	sysLabel := "20220105"
+	writableDir := filepath.Join(dirs.GlobalRootDir, "run/mnt/ubuntu-data/system-data")
+	preseedArtifact := filepath.Join(ubuntuSeedDir, "systems", sysLabel, "preseed.tgz")
+	c.Assert(os.MkdirAll(filepath.Join(ubuntuSeedDir, "systems", sysLabel), 0755), IsNil)
+	c.Assert(os.MkdirAll(writableDir, 0755), IsNil)
+	c.Assert(os.WriteFile(preseedArtifact, nil, 0644), IsNil)
+
+	model := s.mockModel(map[string]interface{}{
+		"grade": "dangerous",
+	})
+
+	sysSeed := &fakeSeed{
+		model:           model,
+		preseedArtifact: true,
+		sysDir:          filepath.Join(ubuntuSeedDir, "systems", sysLabel),
+		essentialSnaps: []*seed.Snap{{
+			Path: snapPath1,
+			SideInfo: &snap.SideInfo{RealName: "essential-snap",
+				Revision: snap.R(1),
+				SnapID:   snaptest.AssertedSnapID("essential-snap"),
+			},
+			Components: append([]seed.Component{{
+				CompSideInfo: snap.ComponentSideInfo{
+					Revision:  snap.R(2),
+					Component: naming.NewComponentRef("essential-snap", "comp1"),
+				},
+			}}, opts.extraSeedComponents...),
+		}},
+		modeSnaps: []*seed.Snap{{
+			Path: snapPath2,
+			SideInfo: &snap.SideInfo{RealName: "mode-snap",
+				Revision: snap.R(3),
+				SnapID:   snaptest.AssertedSnapID("mode-snap"),
+			},
+			Components: []seed.Component{{
+				CompSideInfo: snap.ComponentSideInfo{
+					Revision:  snap.R(4),
+					Component: naming.NewComponentRef("mode-snap", "comp2"),
+				},
+			}},
+		}},
+	}
+
+	sha3_384, _, err := osutil.FileDigest(preseedArtifact, crypto.SHA3_384)
+	c.Assert(err, IsNil)
+	digest, err := asserts.EncodeDigest(crypto.SHA3_384, sha3_384)
+	c.Assert(err, IsNil)
+
+	preseedAsPath := filepath.Join(ubuntuSeedDir, "systems", sysLabel, "preseed")
+
+	s.mockPreseedAssertion(c, model.BrandID(), model.Model(), "16", preseedAsPath, sysLabel, digest, opts.preseed)
+	err = install.ApplyPreseededData(sysSeed, writableDir)
+	c.Assert(err, ErrorMatches, opts.errMsg)
 }
 
 func (s *installSuite) TestApplyPreseededDataWrongDigest(c *C) {
@@ -1561,6 +1867,10 @@ func (fs *fakeSeed) EssentialSnaps() []*seed.Snap {
 
 func (fs *fakeSeed) ModeSnaps(mode string) ([]*seed.Snap, error) {
 	return fs.modeSnaps, nil
+}
+
+func (s *fakeSeed) ModeSnap(snapName, mode string) (*seed.Snap, error) {
+	return nil, nil
 }
 
 func (*fakeSeed) NumSnaps() int {

@@ -29,8 +29,7 @@ execute: |
     remote.exec "stat --printf='%u:%g %a' /var/lib/snapd/device/fde/recovery.key" | MATCH '^0:0 600$'
 
     echo "verify that recovery key can be removed"
-    remote.exec "sudo snap install --devmode --edge test-snapd-curl"
-    remote.exec "sudo test-snapd-curl.curl --unix-socket /run/snapd.socket -D- -d '{\"action\":\"remove\"}' http://localhost/v2/system-recovery-keys"
+    remote.exec "echo '{\"action\":\"remove\"}' | sudo snap debug api -X POST -H 'Content-Type: application/json'  /v2/system-recovery-keys"
     echo "and the key is no longer available"
     remote.exec "test ! -e /var/lib/snapd/device/fde/recovery.key"
 
@@ -66,7 +65,7 @@ execute: |
     remote.exec "test -f /var/lib/snapd/device/fde/sealed-keys"
 
     echo "Check that kernel command line is properly recorded"
-    cmdline_modeenv="$(grep current_kernel_command_lines= < modeenv  | sed -e 's/current_kernel_command_lines=//' | jq -r '.[0]')"
+    cmdline_modeenv="$(grep current_kernel_command_lines= < modeenv  | sed -e 's/current_kernel_command_lines=//' | gojq -r '.[0]')"
     cmdline="$(remote.exec "cat /proc/cmdline")"
     test "$cmdline" = "$cmdline_modeenv"
     echo "$cmdline" | MATCH "snapd_recovery_mode=run "
@@ -90,7 +89,7 @@ execute: |
     remote.exec "retry --wait 5 -n 10 sh -c 'MATCH current_kernel_command_lines=.*snapd_recovery_mode=run < /var/lib/snapd/modeenv'"
     remote.exec "cat /var/lib/snapd/modeenv" > modeenv.after-reboot
     echo "Check the kernel command line is restored"
-    cmdline_modeenv_restored="$(grep current_kernel_command_lines= < modeenv.after-reboot  | sed -e 's/current_kernel_command_lines=//' | jq -r '.[0]')"
+    cmdline_modeenv_restored="$(grep current_kernel_command_lines= < modeenv.after-reboot  | sed -e 's/current_kernel_command_lines=//' | gojq -r '.[0]')"
     test "$cmdline_modeenv_restored" = "$cmdline_modeenv"
     echo "Check the good recovery systems is populated"
     good_recovery_systems_restored="$(grep good_recovery_systems= < modeenv.after-reboot  | sed -e 's/good_recovery_systems=//')"

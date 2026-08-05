@@ -142,6 +142,39 @@ const (
 
 	// ErrorKindValidationSetNotFound: validation set cannot be found.
 	ErrorKindValidationSetNotFound ErrorKind = "validation-set-not-found"
+
+	// ErrorKindAppArmorPromptingNotRunning: AppArmor Prompting is not running.
+	ErrorKindAppArmorPromptingNotRunning ErrorKind = "apparmor-prompting-not-running"
+
+	// ErrorKindInterfacesRequestsPromptNotFound: interfaces requests prompt not found.
+	ErrorKindInterfacesRequestsPromptNotFound ErrorKind = "interfaces-requests-prompt-not-found"
+
+	// ErrorKindInterfacesRequestsRuleNotFound: interfaces requests rule not found.
+	ErrorKindInterfacesRequestsRuleNotFound ErrorKind = "interfaces-requests-rule-not-found"
+
+	// ErrorKindInterfacesRequestsInvalidFields: POST body to prompting API contains invalid fields.
+	ErrorKindInterfacesRequestsInvalidFields ErrorKind = "interfaces-requests-invalid-fields"
+
+	// ErrorKindInterfacesRequestsPatchedRuleHasNoPermissions: patched rule has no permission
+	ErrorKindInterfacesRequestsPatchedRuleHasNoPermissions ErrorKind = "interfaces-requests-patched-rule-has-no-permissions"
+
+	// ErrorKindInterfacesRequestsReplyNotMatchRequest: the prompt reply does not match the path and/or permissions which were requested.
+	ErrorKindInterfacesRequestsReplyNotMatchRequest ErrorKind = "interfaces-requests-reply-not-match-request"
+
+	// ErrorKindInterfacesRequestsRuleConflict: a rule with conflicting path pattern and permissions already exists.
+	ErrorKindInterfacesRequestsRuleConflict ErrorKind = "interfaces-requests-rule-conflict"
+
+	// ErrorKindMissingSnapResourcePair: cannot find a snap-resource-pair when attempting to sideload a component
+	ErrorKindMissingSnapResourcePair ErrorKind = "missing-snap-resource-pair"
+
+	// ErrorKindInvalidPassphrase: passphrase is invalid and/or does not pass quality checks.
+	ErrorKindInvalidPassphrase ErrorKind = "invalid-passphrase"
+
+	// ErrorKindInvalidPIN: PIN is invalid and/or does not pass quality checks.
+	ErrorKindInvalidPIN ErrorKind = "invalid-pin"
+
+	// ErrorKindUnsupported: target system does not support corresponding feature (e.g. client.StorageEncryptionFeaturePassphraseAuth)
+	ErrorKindUnsupportedByTargetSystem ErrorKind = "unsupported"
 )
 
 // Maintenance error kinds.

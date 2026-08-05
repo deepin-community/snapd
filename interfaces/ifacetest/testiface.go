@@ -22,9 +22,11 @@ package ifacetest
 import (
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/apparmor"
+	"github.com/snapcore/snapd/interfaces/configfiles"
 	"github.com/snapcore/snapd/interfaces/dbus"
 	"github.com/snapcore/snapd/interfaces/hotplug"
 	"github.com/snapcore/snapd/interfaces/kmod"
+	"github.com/snapcore/snapd/interfaces/ldconfig"
 	"github.com/snapcore/snapd/interfaces/mount"
 	"github.com/snapcore/snapd/interfaces/polkit"
 	"github.com/snapcore/snapd/interfaces/seccomp"
@@ -56,6 +58,13 @@ type TestInterface struct {
 	TestPermanentPlugCallback func(spec *Specification, plug *snap.PlugInfo) error
 	TestPermanentSlotCallback func(spec *Specification, slot *snap.SlotInfo) error
 
+	// Support for interacting with the configfiles backend.
+
+	ConfigfilesConnectedPlugCallback func(spec *configfiles.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error
+	ConfigfilesConnectedSlotCallback func(spec *configfiles.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error
+	ConfigfilesPermanentPlugCallback func(spec *configfiles.Specification, plug *snap.PlugInfo) error
+	ConfigfilesPermanentSlotCallback func(spec *configfiles.Specification, slot *snap.SlotInfo) error
+
 	// Support for interacting with the mount backend.
 
 	MountConnectedPlugCallback func(spec *mount.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error
@@ -83,6 +92,13 @@ type TestInterface struct {
 	KModConnectedSlotCallback func(spec *kmod.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error
 	KModPermanentPlugCallback func(spec *kmod.Specification, plug *snap.PlugInfo) error
 	KModPermanentSlotCallback func(spec *kmod.Specification, slot *snap.SlotInfo) error
+
+	// Support for interacting with the ldconfig backend.
+
+	LdconfigConnectedPlugCallback func(spec *ldconfig.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error
+	LdconfigConnectedSlotCallback func(spec *ldconfig.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error
+	LdconfigPermanentPlugCallback func(spec *ldconfig.Specification, plug *snap.PlugInfo) error
+	LdconfigPermanentSlotCallback func(spec *ldconfig.Specification, slot *snap.SlotInfo) error
 
 	// Support for interacting with the seccomp backend.
 
@@ -123,6 +139,15 @@ type TestHotplugInterface struct {
 	HotplugKeyCallback            func(deviceInfo *hotplug.HotplugDeviceInfo) (snap.HotplugKey, error)
 	HandledByGadgetCallback       func(deviceInfo *hotplug.HotplugDeviceInfo, slot *snap.SlotInfo) bool
 	HotplugDeviceDetectedCallback func(deviceInfo *hotplug.HotplugDeviceInfo) (*hotplug.ProposedSlot, error)
+}
+
+// TestConfigFilesInterface is used to test the configfiles backend,
+// which needs interfaces implementing ConfigfilesUser.
+type TestConfigFilesInterface struct {
+	TestInterface
+
+	// Support for interacting with configfiles backend.
+	PathPatternsCallback func() []string
 }
 
 // String() returns the same value as Name().
@@ -205,6 +230,36 @@ func (t *TestInterface) TestPermanentPlug(spec *Specification, plug *snap.PlugIn
 func (t *TestInterface) TestPermanentSlot(spec *Specification, slot *snap.SlotInfo) error {
 	if t.TestPermanentSlotCallback != nil {
 		return t.TestPermanentSlotCallback(spec, slot)
+	}
+	return nil
+}
+
+// Support for interacting with the configfiles backend.
+
+func (t *TestInterface) ConfigfilesConnectedPlug(spec *configfiles.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
+	if t.ConfigfilesConnectedPlugCallback != nil {
+		return t.ConfigfilesConnectedPlugCallback(spec, plug, slot)
+	}
+	return nil
+}
+
+func (t *TestInterface) ConfigfilesConnectedSlot(spec *configfiles.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
+	if t.ConfigfilesConnectedSlotCallback != nil {
+		return t.ConfigfilesConnectedSlotCallback(spec, plug, slot)
+	}
+	return nil
+}
+
+func (t *TestInterface) ConfigfilesPermanentPlug(spec *configfiles.Specification, plug *snap.PlugInfo) error {
+	if t.ConfigfilesPermanentPlugCallback != nil {
+		return t.ConfigfilesPermanentPlugCallback(spec, plug)
+	}
+	return nil
+}
+
+func (t *TestInterface) ConfigfilesPermanentSlot(spec *configfiles.Specification, slot *snap.SlotInfo) error {
+	if t.ConfigfilesPermanentSlotCallback != nil {
+		return t.ConfigfilesPermanentSlotCallback(spec, slot)
 	}
 	return nil
 }
@@ -360,6 +415,36 @@ func (t *TestInterface) KModPermanentSlot(spec *kmod.Specification, slot *snap.S
 	return nil
 }
 
+// Support for interacting with the ldconfig backend.
+
+func (t *TestInterface) LdconfigConnectedPlug(spec *ldconfig.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
+	if t.LdconfigConnectedPlugCallback != nil {
+		return t.LdconfigConnectedPlugCallback(spec, plug, slot)
+	}
+	return nil
+}
+
+func (t *TestInterface) LdconfigConnectedSlot(spec *ldconfig.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
+	if t.LdconfigConnectedSlotCallback != nil {
+		return t.LdconfigConnectedSlotCallback(spec, plug, slot)
+	}
+	return nil
+}
+
+func (t *TestInterface) LdconfigPermanentPlug(spec *ldconfig.Specification, plug *snap.PlugInfo) error {
+	if t.LdconfigPermanentPlugCallback != nil {
+		return t.LdconfigPermanentPlugCallback(spec, plug)
+	}
+	return nil
+}
+
+func (t *TestInterface) LdconfigPermanentSlot(spec *ldconfig.Specification, slot *snap.SlotInfo) error {
+	if t.LdconfigPermanentSlotCallback != nil {
+		return t.LdconfigPermanentSlotCallback(spec, slot)
+	}
+	return nil
+}
+
 // Support for interacting with the dbus backend.
 
 func (t *TestInterface) DBusConnectedPlug(spec *dbus.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
@@ -471,4 +556,13 @@ func (t *TestHotplugInterface) HandledByGadget(deviceInfo *hotplug.HotplugDevice
 		return t.HandledByGadgetCallback(deviceInfo, slot)
 	}
 	return false
+}
+
+// Support for interacting with configfiles backend.
+
+func (t *TestConfigFilesInterface) PathPatterns() []string {
+	if t.PathPatternsCallback != nil {
+		return t.PathPatternsCallback()
+	}
+	return nil
 }

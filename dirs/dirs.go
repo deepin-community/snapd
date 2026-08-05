@@ -48,6 +48,7 @@ var (
 	snapDataHomeGlob     []string
 	SnapDownloadCacheDir string
 	SnapAppArmorDir      string
+	SnapLdconfigDir      string
 	SnapSeccompBase      string
 	SnapSeccompDir       string
 	SnapMountPolicyDir   string
@@ -141,6 +142,11 @@ var (
 	SysfsDir string
 
 	FeaturesDir string
+
+	// WritableMountPath is a path where writable root data is
+	// mounted. For Classic it is /, but Ubuntu Core it is
+	// /writable.
+	WritableMountPath string
 )
 
 // User defined home directory variables
@@ -381,6 +387,10 @@ func SnapServicesDirUnder(rootdir string) string {
 	return filepath.Join(rootdir, "/etc/systemd/system")
 }
 
+func SnapRuntimeServicesDirUnder(rootdir string) string {
+	return filepath.Join(rootdir, "/run/systemd/system")
+}
+
 // SnapSystemdDirUnder returns the path to the systemd conf dir under
 // rootdir.
 func SnapSystemdDirUnder(rootdir string) string {
@@ -461,6 +471,7 @@ func SetRootDir(rootdir string) {
 
 	SnapDataDir = filepath.Join(rootdir, "/var/snap")
 	SnapAppArmorDir = filepath.Join(rootdir, snappyDir, "apparmor", "profiles")
+	SnapLdconfigDir = filepath.Join(rootdir, "/etc/ld.so.conf.d")
 	SnapDownloadCacheDir = filepath.Join(rootdir, snappyDir, "cache")
 	SnapSeccompBase = filepath.Join(rootdir, snappyDir, "seccomp")
 	SnapSeccompDir = filepath.Join(SnapSeccompBase, "bpf")
@@ -522,8 +533,8 @@ func SetRootDir(rootdir string) {
 	SnapRollbackDir = filepath.Join(rootdir, snappyDir, "rollback")
 
 	SnapBinariesDir = filepath.Join(SnapMountDir, "bin")
-	SnapServicesDir = filepath.Join(rootdir, "/etc/systemd/system")
-	SnapRuntimeServicesDir = filepath.Join(rootdir, "/run/systemd/system")
+	SnapServicesDir = SnapServicesDirUnder(rootdir)
+	SnapRuntimeServicesDir = SnapRuntimeServicesDirUnder(rootdir)
 	SnapUserServicesDir = filepath.Join(rootdir, "/etc/systemd/user")
 	SnapSystemdConfDir = SnapSystemdConfDirUnder(rootdir)
 	SnapSystemdDir = filepath.Join(rootdir, "/etc/systemd")
@@ -548,27 +559,40 @@ func SetRootDir(rootdir string) {
 	LocaleDir = filepath.Join(rootdir, "/usr/share/locale")
 	ClassicDir = filepath.Join(rootdir, "/writable/classic")
 
-	opensuseTWWithLibexec := func() bool {
+	opensuseFlavorWithLibexec := func() bool {
 		// XXX: this is pretty naive if openSUSE ever starts going back
 		// and forth about the change
+
+		if release.DistroLike("opensuse-slowroll") {
+			// Slowroll does not need further checks, it has used /usr/libexec
+			// since the start
+			return true
+		}
+
 		if !release.DistroLike("opensuse-tumbleweed") {
+			// Leap and the like, are there others?
 			return false
 		}
+
+		// TW snapshots are YYYYMMDD
 		v, err := strconv.Atoi(release.ReleaseInfo.VersionID)
 		if err != nil {
 			// nothing we can do here
 			return false
 		}
+
+		// TODO: drop? do we still care about such old snapshot?
 		// first seen on snapshot "20200826"
 		if v < 20200826 {
 			return false
 		}
+
 		return true
 	}
 
-	if release.DistroLike("fedora") || opensuseTWWithLibexec() {
+	if release.DistroLike("fedora") || opensuseFlavorWithLibexec() {
 		// RHEL, CentOS, Fedora and derivatives, some more recent
-		// snapshots of openSUSE Tumbleweed;
+		// snapshots of openSUSE Tumbleweed and Slowroll;
 		// both RHEL and CentOS list "fedora" in ID_LIKE
 		DistroLibExecDir = filepath.Join(rootdir, "/usr/libexec/snapd")
 	} else {
@@ -616,6 +640,14 @@ func SetRootDir(rootdir string) {
 	// global vars if they want, instead of using the new rootdir directly
 	for _, c := range callbacks {
 		c(rootdir)
+	}
+
+	if release.OnClassic {
+		// On Classic, the data disk is mounted as /
+		WritableMountPath = rootdir
+	} else {
+		// If on Core /writable is a bind mount from data dir
+		WritableMountPath = filepath.Join(rootdir, "writable")
 	}
 
 }

@@ -29,6 +29,7 @@ import (
 )
 
 type MkfsParams = mkfsParams
+type MntfsParams = mntfsParams
 
 var (
 	MakeFilesystem         = makeFilesystem
@@ -94,9 +95,6 @@ func CheckEncryptionSetupData(encryptSetup *EncryptionSetupData, labelToEncDevic
 		if part.encryptedDevice != labelToEncDevice[label] {
 			return fmt.Errorf("encrypted device in EncryptionSetupData (%q) different to expected (%q)",
 				encryptSetup.parts[label].encryptedDevice, labelToEncDevice[label])
-		}
-		if len(part.encryptionKey) == 0 {
-			return fmt.Errorf("encryption key for %q is empty", label)
 		}
 	}
 

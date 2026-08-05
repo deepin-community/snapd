@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,6 +45,7 @@ import (
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/devicestate/internal"
+	fdeBackend "github.com/snapcore/snapd/overlord/fdestate/backend"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/install"
 	"github.com/snapcore/snapd/overlord/restart"
@@ -144,13 +146,14 @@ func Manager(s *state.State, hookManager *hookstate.HookManager, runner *state.T
 	m.populateStateFromSeed = m.populateStateFromSeedImpl
 
 	if !m.preseed {
-		modeenv, err := maybeReadModeenv()
+		mode, explicit, err := boot.SystemMode("")
 		if err != nil {
 			return nil, err
 		}
-		if modeenv != nil {
-			logger.Debugf("modeenv for model %q found", modeenv.Model)
-			m.sysMode = modeenv.Mode
+
+		if explicit {
+			logger.Debugf("explicitly set system mode")
+			m.sysMode = mode
 		}
 	} else {
 		// cache system label for preseeding of core20; note, this will fail on
@@ -218,7 +221,7 @@ func Manager(s *state.State, hookManager *hookstate.HookManager, runner *state.T
 
 	// wire FDE kernel hook support into boot
 	boot.HasFDESetupHook = m.hasFDESetupHook
-	boot.RunFDESetupHook = m.runFDESetupHook
+	fdeBackend.RunFDESetupHook = m.runFDESetupHook
 	hookManager.Register(regexp.MustCompile("^fde-setup$"), newFdeSetupHandler)
 
 	return m, nil
@@ -248,24 +251,19 @@ func newBasicHookStateHandler(context *hookstate.Context) hookstate.Handler {
 	return genericHook{}
 }
 
-func maybeReadModeenv() (*boot.Modeenv, error) {
-	modeenv, err := boot.ReadModeenv("")
-	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("cannot read modeenv: %v", err)
-	}
-	return modeenv, nil
-}
-
 // ReloadModeenv is only useful for integration testing
 func (m *DeviceManager) ReloadModeenv() error {
 	osutil.MustBeTestBinary("ReloadModeenv can only be called from tests")
-	modeenv, err := maybeReadModeenv()
+
+	mode, explicit, err := boot.SystemMode("")
 	if err != nil {
 		return err
 	}
-	if modeenv != nil {
-		m.sysMode = modeenv.Mode
+
+	if explicit {
+		m.sysMode = mode
 	}
+
 	return nil
 }
 
@@ -846,7 +844,7 @@ func (m *DeviceManager) seedLabelAndMode() (seedLabel, seedMode string, err erro
 			seedLabel = m.systemForPreseeding()
 		}
 	} else {
-		modeenv, err := maybeReadModeenv()
+		modeenv, err := boot.MaybeReadModeenv()
 		if err != nil {
 			return "", "", err
 		}
@@ -1659,8 +1657,6 @@ func (m *DeviceManager) ensureTriedRecoverySystem() error {
 	return nil
 }
 
-var bootMarkFactoryResetComplete = boot.MarkFactoryResetComplete
-
 func (m *DeviceManager) ensurePostFactoryReset() error {
 	m.state.Lock()
 	defer m.state.Unlock()
@@ -1706,14 +1702,9 @@ func (m *DeviceManager) ensurePostFactoryReset() error {
 		return fmt.Errorf("cannot verify factory reset marker: %v", err)
 	}
 
-	// if encrypted, rotates the fallback keys on disk
-	if err := bootMarkFactoryResetComplete(encrypted); err != nil {
-		return fmt.Errorf("cannot complete factory reset: %v", err)
-	}
-
 	if encrypted {
-		if err := rotateEncryptionKeys(); err != nil {
-			return fmt.Errorf("cannot transition encryption keys: %v", err)
+		if err := rotateSaveKeyAndDeleteOldKeys(boot.InitramfsUbuntuSaveDir); err != nil {
+			return fmt.Errorf("cannot remove old encryption keys: %v", err)
 		}
 	}
 
@@ -1963,6 +1954,32 @@ func (m *DeviceManager) keyPair() (asserts.PrivateKey, error) {
 	return privKey, nil
 }
 
+// SignConfdbControl signs a confdb-control assertion using the device's key as it needs to be attested by the device.
+func (m *DeviceManager) SignConfdbControl(groups []interface{}, revision int) (*asserts.ConfdbControl, error) {
+	serial, err := m.Serial()
+	if err != nil {
+		return nil, fmt.Errorf("cannot sign confdb-control without a serial")
+	}
+
+	privKey, err := m.keyPair()
+	if err != nil {
+		return nil, fmt.Errorf("cannot sign confdb-control without device key")
+	}
+
+	a, err := asserts.SignWithoutAuthority(asserts.ConfdbControlType, map[string]interface{}{
+		"brand-id": serial.BrandID(),
+		"model":    serial.Model(),
+		"serial":   serial.Serial(),
+		"revision": strconv.Itoa(revision),
+		"groups":   groups,
+	}, nil, privKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return a.(*asserts.ConfdbControl), nil
+}
+
 // Registered returns a channel that is closed when the device is known to have been registered.
 func (m *DeviceManager) Registered() <-chan struct{} {
 	return m.reg
@@ -2104,6 +2121,10 @@ type System struct {
 	// DefaultRecoverySystem is true when the system is the default recovery
 	// system.
 	DefaultRecoverySystem bool
+	// OptionalContainers is a set of snaps and components that are optional in
+	// the system's model, but are available to be installed when installing this
+	// system.
+	OptionalContainers OptionalContainers
 }
 
 var defaultSystemActions = []SystemAction{
@@ -2181,7 +2202,7 @@ func (m *DeviceManager) SystemAndGadgetAndEncryptionInfo(wantedSystemLabel strin
 	// installer is not anymore.
 
 	// System information
-	systemAndSnaps, err := m.loadSystemAndEssentialSnaps(wantedSystemLabel, []snap.Type{snap.TypeKernel, snap.TypeGadget})
+	systemAndSnaps, err := m.loadSystemAndEssentialSnaps(wantedSystemLabel, []snap.Type{snap.TypeSnapd, snap.TypeKernel, snap.TypeGadget}, seed.AllModes)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -2197,7 +2218,7 @@ func (m *DeviceManager) SystemAndGadgetAndEncryptionInfo(wantedSystemLabel strin
 	}
 
 	// Encryption details
-	encInfo, err := m.encryptionSupportInfo(systemAndSnaps.Model, secboot.TPMProvisionFull, systemAndSnaps.InfosByType[snap.TypeKernel], gadgetInfo)
+	encInfo, err := m.encryptionSupportInfo(systemAndSnaps.Model, secboot.TPMProvisionFull, systemAndSnaps.InfosByType[snap.TypeKernel], gadgetInfo, &systemAndSnaps.SystemSnapdVersions)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -2215,9 +2236,11 @@ func (m *DeviceManager) SystemAndGadgetAndEncryptionInfo(wantedSystemLabel strin
 
 type systemAndEssentialSnaps struct {
 	*System
-	Seed            seed.Seed
-	InfosByType     map[snap.Type]*snap.Info
-	SeedSnapsByType map[snap.Type]*seed.Snap
+	Seed                seed.Seed
+	SystemSnapdVersions install.SystemSnapdVersions
+	InfosByType         map[snap.Type]*snap.Info
+	CompsByType         map[snap.Type][]install.ComponentSeedInfo
+	SeedSnapsByType     map[snap.Type]*seed.Snap
 }
 
 // DefaultRecoverySystem returns the default recovery system, if there is one.
@@ -2238,16 +2261,20 @@ func (m *DeviceManager) defaultRecoverySystem() (*DefaultRecoverySystem, error) 
 }
 
 // loadSystemAndEssentialSnaps loads information for the given label, which
-// includes system, gadget information, gadget and kernel snaps info,
-// and gadget and kernel seed snap info.
+// includes system, gadget information, gadget and kernel snaps info, and
+// gadget and kernel seed snap info. In some cases we only want the components
+// of the essential snaps for a given mode.
 // TODO: make this method optionally return the system seed, since it might not
 // always be needed, and it is quite large.
-func (m *DeviceManager) loadSystemAndEssentialSnaps(wantedSystemLabel string, types []snap.Type) (*systemAndEssentialSnaps, error) {
+func (m *DeviceManager) loadSystemAndEssentialSnaps(wantedSystemLabel string, types []snap.Type, modeForComps string) (*systemAndEssentialSnaps, error) {
 	// get current system as input for loadSeedAndSystem()
 	systemMode := m.SystemMode(SysAny)
-	m.state.Lock()
-	currentSys, _ := currentSystemForMode(m.state, systemMode)
-	m.state.Unlock()
+	var currentSys *currentSystem
+	func() {
+		m.state.Lock()
+		defer m.state.Unlock()
+		currentSys, _ = currentSystemForMode(m.state, systemMode)
+	}()
 
 	defaultRecoverySystem, err := m.DefaultRecoverySystem()
 	if err != nil && !errors.Is(err, state.ErrNoState) {
@@ -2269,7 +2296,9 @@ func (m *DeviceManager) loadSystemAndEssentialSnaps(wantedSystemLabel string, ty
 	// like "snapd" will be skipped and not part of the EssentialSnaps list
 	//
 	snapInfos := make(map[snap.Type]*snap.Info)
+	compInfos := make(map[snap.Type][]install.ComponentSeedInfo)
 	seedSnaps := make(map[snap.Type]*seed.Snap)
+	systemSnapdVersions := install.SystemSnapdVersions{}
 	for _, seedSnap := range s.EssentialSnaps() {
 		typ := seedSnap.EssentialType
 		if seedSnap.Path == "" {
@@ -2286,18 +2315,59 @@ func (m *DeviceManager) loadSystemAndEssentialSnaps(wantedSystemLabel string, ty
 		if snapInfo.SnapType != typ {
 			return nil, fmt.Errorf("cannot use snap info, expected %s but got %s", typ, snapInfo.SnapType)
 		}
-		seedSnaps[typ] = seedSnap
+		// Read components in the seed too, for the mode we are interested in
+		snapForMode, err := s.ModeSnap(seedSnap.SnapName(), modeForComps)
+		if err != nil {
+			return nil, fmt.Errorf("internal error while retrieving %s for %s mode: %v",
+				seedSnap.SnapName(), modeForComps, err)
+		}
+		var compInfosForType []install.ComponentSeedInfo
+		if len(snapForMode.Components) > 0 {
+			compInfosForType = make([]install.ComponentSeedInfo, 0, len(snapForMode.Components))
+			for _, sc := range snapForMode.Components {
+				seedComp := sc
+				compf, err := snapfile.Open(seedComp.Path)
+				if err != nil {
+					return nil, fmt.Errorf("cannot open snap from %q: %v", snapForMode.Path, err)
+				}
+				compInfo, err := snap.ReadComponentInfoFromContainer(
+					compf, snapInfo, &seedComp.CompSideInfo)
+				if err != nil {
+					return nil, err
+				}
+				compInfosForType = append(compInfosForType, install.ComponentSeedInfo{
+					Info: compInfo,
+					Seed: &seedComp,
+				})
+			}
+		}
+		if typ == snap.TypeSnapd || typ == snap.TypeKernel {
+			snapdVersion, _, err := snap.SnapdInfoFromSnapFile(snapf, typ)
+			if err != nil {
+				return nil, err
+			}
+			switch typ {
+			case snap.TypeSnapd:
+				systemSnapdVersions.SnapdVersion = snapdVersion
+			case snap.TypeKernel:
+				systemSnapdVersions.SnapdInitramfsVersion = snapdVersion
+			}
+		}
+		seedSnaps[typ] = snapForMode
 		snapInfos[typ] = snapInfo
+		compInfos[typ] = compInfosForType
 	}
 	if len(snapInfos) != len(types) {
 		return nil, fmt.Errorf("internal error: retrieved snap infos (%d) does not match number of types (%d)", len(snapInfos), len(types))
 	}
 
 	return &systemAndEssentialSnaps{
-		System:          sys,
-		Seed:            s,
-		InfosByType:     snapInfos,
-		SeedSnapsByType: seedSnaps,
+		System:              sys,
+		Seed:                s,
+		SystemSnapdVersions: systemSnapdVersions,
+		InfosByType:         snapInfos,
+		CompsByType:         compInfos,
+		SeedSnapsByType:     seedSnaps,
 	}, nil
 }
 
@@ -2782,7 +2852,7 @@ func (m *DeviceManager) RemoveRecoveryKeys() error {
 // checkEncryption verifies whether encryption should be used based on the
 // model grade and the availability of a TPM device or a fde-setup hook
 // in the kernel.
-func (m *DeviceManager) checkEncryption(st *state.State, deviceCtx snapstate.DeviceContext, tpmMode secboot.TPMProvisionMode) (secboot.EncryptionType, error) {
+func (m *DeviceManager) checkEncryption(st *state.State, deviceCtx snapstate.DeviceContext, tpmMode secboot.TPMProvisionMode) (device.EncryptionType, error) {
 	model := deviceCtx.Model()
 
 	kernelInfo, err := snapstate.KernelInfo(st, deviceCtx)
@@ -2801,6 +2871,6 @@ func (m *DeviceManager) checkEncryption(st *state.State, deviceCtx snapstate.Dev
 	return install.CheckEncryptionSupport(model, tpmMode, kernelInfo, gadgetInfo, m.runFDESetupHook)
 }
 
-func (m *DeviceManager) encryptionSupportInfo(model *asserts.Model, tpmMode secboot.TPMProvisionMode, kernelInfo *snap.Info, gadgetInfo *gadget.Info) (install.EncryptionSupportInfo, error) {
-	return install.GetEncryptionSupportInfo(model, tpmMode, kernelInfo, gadgetInfo, m.runFDESetupHook)
+func (m *DeviceManager) encryptionSupportInfo(model *asserts.Model, tpmMode secboot.TPMProvisionMode, kernelInfo *snap.Info, gadgetInfo *gadget.Info, systemSnapdVersions *install.SystemSnapdVersions) (install.EncryptionSupportInfo, error) {
+	return install.GetEncryptionSupportInfo(model, tpmMode, kernelInfo, gadgetInfo, systemSnapdVersions, m.runFDESetupHook)
 }

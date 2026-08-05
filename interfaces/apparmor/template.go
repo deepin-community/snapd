@@ -85,6 +85,7 @@ var templateCommon = `
   #include <abstractions/base>
   #include <abstractions/consoles>
   #include <abstractions/openssl>
+  ###KERNEL_MODULES_AND_FIRMWARE###
 
   # While in later versions of the base abstraction, include this explicitly
   # for series 16 and cross-distro
@@ -196,6 +197,9 @@ var templateCommon = `
   /etc/os-release rk,
   /usr/lib/os-release k,
 
+  # Debian version of the host OS which might be required in AppArmor-secured Debian
+  /etc/debian_version r,
+
   # systemd native journal API (see sd_journal_print(4)). This should be in
   # AppArmor's base abstraction, but until it is, include here. We include
   # the base journal path as well as the journal namespace pattern path. Each
@@ -203,6 +207,7 @@ var templateCommon = `
   /run/systemd/journal{,.snap-*}/socket w,
   /run/systemd/journal{,.snap-*}/stdout rw, # 'r' shouldn't be needed, but journald
                                             # doesn't leak anything so allow
+  /run/systemd/journal{,.snap-*}/dev-log w,
 
   # snapctl and its requirements
   /usr/bin/snapctl ixr,
@@ -261,8 +266,10 @@ var templateCommon = `
   owner @{PROC}/@{pid}/cgroup rk,
   @{PROC}/@{pid}/cpuset r,
   @{PROC}/@{pid}/io r,
+  owner @{PROC}/@{pid}/fdinfo/* r,
   owner @{PROC}/@{pid}/limits r,
   owner @{PROC}/@{pid}/loginuid r,
+  owner @{PROC}/@{pid}/sessionid r,
   @{PROC}/@{pid}/smaps r,
   @{PROC}/@{pid}/stat r,
   @{PROC}/@{pid}/statm r,
@@ -607,6 +614,7 @@ var defaultCoreRuntimeTemplateRules = `
   /{,usr/}bin/run-parts ixr,
   /{,usr/}bin/sed ixr,
   /{,usr/}bin/seq ixr,
+  /{,usr/}bin/setpriv ixr,
   /{,usr/}bin/sha{1,224,256,384,512}sum ixr,
   /{,usr/}bin/shuf ixr,
   /{,usr/}bin/sleep ixr,
@@ -635,6 +643,7 @@ var defaultCoreRuntimeTemplateRules = `
   /{,usr/}bin/unzip ixr,
   /{,usr/}bin/uptime ixr,
   /{,usr/}bin/vdir ixr,
+  /{,usr/}bin/vim.tiny ixr,
   /{,usr/}bin/wc ixr,
   /{,usr/}bin/which{,.debianutils} ixr,
   /{,usr/}bin/xargs ixr,

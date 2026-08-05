@@ -14,9 +14,9 @@ environment:
     SEED_DIR: /var/lib/snapd/seed
 
 prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
+    # In this scenario, the keys from the snapd pkg are used
+    if [ "$TRUST_TEST_KEYS" = "false" ] || tests.info is-snapd-from-archive; then
+        tests.exec skip-test "This test needs test keys to be trusted" && exit 0
     fi
 
     snap pack "$TESTSLIB/snaps/basic"
@@ -51,19 +51,13 @@ prepare: |
     cp ./test-snapd-service_1.0_all.snap "$SEED_DIR/snaps/test-snapd-service.snap"
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
+    tests.exec is-skipped && exit 0
 
     rm -rf "$SEED_DIR"
     systemctl start snapd.socket snapd.service
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
+    tests.exec is-skipped && exit 0
 
     echo "Start the daemon with an empty state, this will make it import "
     echo "assertions from the $SEED_DIR/assertions subdirectory and "
@@ -96,11 +90,10 @@ execute: |
     # precondition check
     snap change 1 | MATCH "Mark system seeded"
     snap change 1 | MATCH "restart of .*test-snapd-service.test-snapd-other-service"
-    snap install --edge jq
     # extract task ids from state
     # XXX: snap change output cannot be used for that; ideally we would have some sort of 'snap debug ..' command.
-    MARKSEEDED_WAIT=$(jq -r '.tasks[] | select (.kind == "mark-seeded") | ."wait-tasks"' < /var/lib/snapd/state.json)
-    SERVICECMD_TASK=$(jq -r '.tasks[] | select (.kind == "exec-command") | .id' < /var/lib/snapd/state.json)
+    MARKSEEDED_WAIT=$(gojq -r '.tasks[] | select (.kind == "mark-seeded") | ."wait-tasks"' < /var/lib/snapd/state.json)
+    SERVICECMD_TASK=$(gojq -r '.tasks[] | select (.kind == "exec-command") | .id' < /var/lib/snapd/state.json)
     if test -z "$SERVICECMD_TASK" ; then
         echo "Could not find exec-command task"
         exit 1

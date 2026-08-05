@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2022 Canonical Ltd
+ * Copyright (C) 2022-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -51,8 +51,14 @@ var (
 	// A cryptic, uninformative error message that we use only on impossible code paths
 	customDeviceInternalError = errors.New(`custom-device interface internal error`)
 
-	// Validating regexp for filesystem paths
-	customDevicePathRegexp = regexp.MustCompile(`^/[^"@]*$`)
+	// Validating regexp for filesystem paths. @ can appear in paths under
+	// /sys/devices for devices that are defined in the device tree (of the
+	// form device@address), so we need to support @ characters in paths.
+	// However, @{foo} is the format for variables in AppArmor, so we must
+	// disallow `@{`. For completeness, we allow paths with a trailing @ as
+	// well. This is not the case for common-files-derived interfaces, since
+	// these append {,/,/**} pattern to the end of filepath.
+	customDevicePathRegexp = regexp.MustCompile(`^/([^"@]|@[^{])*@?$`)
 
 	// Validating regexp for udev device names.
 	// We forbid:
@@ -166,6 +172,9 @@ func (iface *customDeviceInterface) validateKernelMatchesOneDeviceBasename(kerne
 
 func (iface *customDeviceInterface) validateUDevTaggingRule(rule map[string]interface{}, devices []string) error {
 	hasKernelTag := false
+	kernelVal := ""
+	deviceOverrideVal := ""
+
 	for key, value := range rule {
 		var err error
 		switch key {
@@ -177,18 +186,15 @@ func (iface *customDeviceInterface) validateUDevTaggingRule(rule map[string]inte
 			if err != nil {
 				break
 			}
-			kernelVal := value.(string)
-			// The kernel device name must match the full path of
-			// one of the given devices, stripped of the leading
-			// /dev/, or it must be the basename of a device path.
-			if strutil.ListContains(devices, "/dev/"+kernelVal) {
-				break
-			}
-			// Not a full path, so check if it matches the basename
-			// of a device path, and not more than one.
-			err = iface.validateKernelMatchesOneDeviceBasename(kernelVal, devices)
+			kernelVal = value.(string)
 		case "attributes", "environment":
 			err = iface.validateUDevValueMap(value)
+		case "for-device":
+			// override of implicit device match
+			deviceOverrideVal = value.(string)
+			if !strutil.ListContains(devices, deviceOverrideVal) {
+				err = fmt.Errorf("cannot find matching device %q", deviceOverrideVal)
+			}
 		default:
 			err = errors.New(`unknown tag`)
 		}
@@ -200,6 +206,24 @@ func (iface *customDeviceInterface) validateUDevTaggingRule(rule map[string]inte
 
 	if !hasKernelTag {
 		return errors.New(`custom-device udev tagging rule missing mandatory "kernel" key`)
+	}
+
+	if deviceOverrideVal == "" {
+		// The udev-tagging snippet does not name an explicit device
+		// pattern it describes, so apply the implicit rules.
+
+		// The kernel device name must match the full path of
+		// one of the given devices, stripped of the leading
+		// /dev/, or it must be the basename of a device path.
+		if strutil.ListContains(devices, "/dev/"+kernelVal) {
+			return nil
+		}
+
+		// Not a full path, so check if it matches the basename
+		// of a device path, and not more than one.
+		if err := iface.validateKernelMatchesOneDeviceBasename(kernelVal, devices); err != nil {
+			return fmt.Errorf(`custom-device "udev-tagging" invalid "kernel" tag: %v`, err)
+		}
 	}
 
 	return nil
@@ -415,6 +439,15 @@ func (iface *customDeviceInterface) UDevConnectedPlug(spec *udev.Specification, 
 			return customDeviceInternalError
 		}
 
+		deviceKey := deviceName
+		if overrideDeviceName, ok := udevTaggingRule["for-device"].(string); ok && overrideDeviceName != "" {
+			// an override of the implicit kernel device match rule
+			if strings.HasPrefix(overrideDeviceName, "/dev/") {
+				overrideDeviceName = overrideDeviceName[len("/dev/"):]
+			}
+			deviceKey = overrideDeviceName
+		}
+
 		fmt.Fprintf(rule, `KERNEL=="%s"`, deviceName)
 
 		if subsystem, ok := udevTaggingRule["subsystem"].(string); ok {
@@ -431,12 +464,13 @@ func (iface *customDeviceInterface) UDevConnectedPlug(spec *udev.Specification, 
 			fmt.Fprintf(rule, `, ATTR{%s}=="%s"`, variable, value)
 		}
 
-		deviceRules[deviceName] = rule.String()
+		deviceRules[deviceKey] = rule.String()
 	}
 
 	// Now write all the rules
 	for deviceName, rule := range deviceRules {
 		if rule != placeholderRule {
+			// we have a specific rule based on udev-tagging
 			spec.TagDevice(rule)
 			continue
 		}

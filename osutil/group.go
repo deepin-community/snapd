@@ -22,8 +22,9 @@ package osutil
 import (
 	"bytes"
 	"fmt"
-	"os/user"
 	"strconv"
+
+	"github.com/snapcore/snapd/osutil/user"
 )
 
 // FindUid returns the identifier of the given UNIX user name. It will
@@ -52,6 +53,7 @@ func MockFindGid(f func(string) (uint64, error)) (restore func()) {
 
 // getent returns the identifier of the given UNIX user or group name as
 // determined by the specified database
+// TODO use a single implementation provided by osutil/user
 func getent(database, name string) (uint64, error) {
 	if database != "passwd" && database != "group" {
 		return 0, fmt.Errorf(`unsupported getent database "%q"`, database)

@@ -103,6 +103,8 @@ const openglConnectedPlugAppArmor = `
 # nvidia
 /etc/vdpau_wrapper.cfg r,
 @{PROC}/driver/nvidia/params r,
+@{PROC}/driver/nvidia/gpus/*/information r,
+@{PROC}/driver/nvidia/capabilities/mig/monitor r,
 @{PROC}/modules r,
 /dev/nvidia* rw,
 unix (send, receive) type=dgram peer=(addr="@nvidia[0-9a-f]*"),
@@ -188,6 +190,19 @@ unix (bind,listen) type=seqpacket addr="@cuda-uvmfd-[0-9a-f]*",
 # From https://bugs.launchpad.net/snapd/+bug/1862832
 /run/nvidia-xdriver-* rw,
 unix (send, receive) type=dgram peer=(addr="@var/run/nvidia-xdriver-*"),
+
+/dev/nvgpu/igpu[0-9]*/power rw,
+/dev/nvgpu/igpu[0-9]*/ctrl rw,
+/dev/nvgpu/igpu[0-9]*/prof rw,
+/dev/host1x-fence rw,
+
+# Kernel Fusion Driver for AMD GPUs
+/dev/kfd rw,
+/sys/module/amdgpu/initstate r,
+/sys/devices/virtual/kfd/kfd/dev r,
+/sys/devices/virtual/kfd/kfd/uevent r,
+/sys/devices/virtual/kfd/kfd/topology/{,generation_id,system_properties} r,
+/sys/devices/virtual/kfd/kfd/topology/nodes/[0-9]*/{,gpu_id,properties,io_links/[0-9]*/properties,caches/[0-9]*/properties,mem_banks/[0-9]*/properties} r,
 `
 
 type openglInterface struct {
@@ -211,6 +226,17 @@ var openglConnectedPlugUDev = []string{
 	`KERNEL=="mali[0-9]*"`,
 	`KERNEL=="dma_buf_te"`,
 	`KERNEL=="galcore"`,
+
+	//iGPU device nodes
+	`SUBSYSTEM=="nvidia-gpu-v2-power" KERNEL=="power"`,
+	`SUBSYSTEM=="nvidia-gpu-v2" KERNEL=="ctrl"`,
+	`SUBSYSTEM=="nvidia-gpu-v2" KERNEL=="prof"`,
+
+	// Nvidia dma barrier
+	`SUBSYSTEM=="host1x-fence"`,
+
+	// Kernel Fusion Driver
+	`SUBSYSTEM=="kfd", KERNEL=="kfd"`,
 }
 
 // Those two are the same, but in theory they are separate and can move (or

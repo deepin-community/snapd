@@ -35,6 +35,7 @@ import (
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/hotplug"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/ifacestate/schema"
 	"github.com/snapcore/snapd/overlord/servicestate"
@@ -81,10 +82,16 @@ func getExtraLayouts(st *state.State, snapInfo *snap.Info) ([]snap.Layout, error
 	return extraLayouts, nil
 }
 
-func (m *InterfaceManager) buildConfinementOptions(st *state.State, snapInfo *snap.Info, flags snapstate.Flags) (interfaces.ConfinementOptions, error) {
+func (m *InterfaceManager) buildConfinementOptions(st *state.State, task *state.Task, snapInfo *snap.Info, flags snapstate.Flags) (interfaces.ConfinementOptions, error) {
 	extraLayouts, err := getExtraLayouts(st, snapInfo)
 	if err != nil {
 		return interfaces.ConfinementOptions{}, fmt.Errorf("cannot get extra mount layouts of snap %q: %s", snapInfo.InstanceName(), err)
+	}
+
+	kernelSnap := ""
+	deviceCtx, err := snapstate.DeviceCtx(st, task, nil)
+	if err == nil {
+		kernelSnap = deviceCtx.Kernel()
 	}
 
 	return interfaces.ConfinementOptions{
@@ -93,6 +100,7 @@ func (m *InterfaceManager) buildConfinementOptions(st *state.State, snapInfo *sn
 		Classic:           flags.Classic,
 		ExtraLayouts:      extraLayouts,
 		AppArmorPrompting: m.useAppArmorPrompting,
+		KernelSnap:        kernelSnap,
 	}, nil
 }
 
@@ -123,7 +131,7 @@ func (m *InterfaceManager) setupAffectedSnaps(task *state.Task, affectingSnap st
 			return fmt.Errorf("building app set for snap %q: %v", affectingSnap, err)
 		}
 
-		opts, err := m.buildConfinementOptions(st, affectedSnapInfo, snapst.Flags)
+		opts, err := m.buildConfinementOptions(st, task, affectedSnapInfo, snapst.Flags)
 		if err != nil {
 			return err
 		}
@@ -169,7 +177,7 @@ func (m *InterfaceManager) doSetupProfiles(task *state.Task, tomb *tomb.Tomb) er
 		return nil
 	}
 
-	opts, err := m.buildConfinementOptions(task.State(), snapInfo, snapsup.Flags)
+	opts, err := m.buildConfinementOptions(task.State(), task, snapInfo, snapsup.Flags)
 	if err != nil {
 		return err
 	}
@@ -313,12 +321,33 @@ func (m *InterfaceManager) setupProfilesForAppSet(task *state.Task, appSet *inte
 			return err
 		}
 
-		appSet, err := appSetForSnapRevision(st, snapInfo)
+		var appSet *interfaces.SnapAppSet
+		if snapst.PendingSecurity != nil {
+			// a content plug/slot may have already updated in this change, so the appSet
+			// should reflect in the revision (otherwise, we may regenerate the
+			// profile for the wrong revision)
+			snapInfo.SideInfo = *snapst.PendingSecurity.SideInfo
+
+			var comps []*snap.ComponentInfo
+			for _, csi := range snapst.PendingSecurity.Components {
+				ci, err := snapstate.ReadComponentInfo(snapInfo, csi)
+				if err != nil {
+					return fmt.Errorf("cannot read component info when building app set %q: %v", name, err)
+				}
+
+				comps = append(comps, ci)
+			}
+
+			appSet, err = interfaces.NewSnapAppSet(snapInfo, comps)
+		} else {
+			appSet, err = appSetForSnapRevision(st, snapInfo)
+		}
+
 		if err != nil {
 			return fmt.Errorf("building app set for snap %q: %v", name, err)
 		}
 
-		opts, err := m.buildConfinementOptions(st, snapInfo, snapst.Flags)
+		opts, err := m.buildConfinementOptions(st, task, snapInfo, snapst.Flags)
 		if err != nil {
 			return err
 		}
@@ -403,6 +432,20 @@ func (m *InterfaceManager) undoSetupProfiles(task *state.Task, tomb *tomb.Tomb) 
 	}
 	snapName := snapsup.InstanceName()
 
+	// The previous task's undo (link-snap) may have triggered a restart, if this
+	// is the case we can only proceed once the restart has happened or we
+	// may be invoking tools (like apparmor) from the wrong snapd. We set
+	// the default to true as we cannot set it otherwise since the change will
+	// always have been created by the old snapd (that may not have "finish-restart")
+	logger.Debugf("finish restart from undoLinkSnap")
+	finishOpts := snapstate.FinishRestartOptions{
+		// Only default to true for snapd snap
+		FinishRestartDefault: snapsup.Type == snap.TypeSnapd,
+	}
+	if err := snapstateFinishRestart(task, snapsup, finishOpts); err != nil {
+		return err
+	}
+
 	// Get the name from SnapSetup and use it to find the current SideInfo
 	// about the snap, if there is one.
 	var snapst snapstate.SnapState
@@ -420,7 +463,7 @@ func (m *InterfaceManager) undoSetupProfiles(task *state.Task, tomb *tomb.Tomb) 
 		if err != nil {
 			return err
 		}
-		opts, err := m.buildConfinementOptions(task.State(), snapInfo, snapst.Flags)
+		opts, err := m.buildConfinementOptions(task.State(), task, snapInfo, snapst.Flags)
 		if err != nil {
 			return err
 		}
@@ -655,7 +698,7 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 		if err != nil {
 			return err
 		}
-		slotOpts, err := m.buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
+		slotOpts, err := m.buildConfinementOptions(st, task, slotSnapInfo, slotSnapst.Flags)
 		if err != nil {
 			return err
 		}
@@ -667,7 +710,7 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 		if err != nil {
 			return err
 		}
-		plugOpts, err := m.buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
+		plugOpts, err := m.buildConfinementOptions(st, task, plugSnapInfo, plugSnapst.Flags)
 		if err != nil {
 			return err
 		}
@@ -777,7 +820,7 @@ func (m *InterfaceManager) doDisconnect(task *state.Task, _ *tomb.Tomb) error {
 			return fmt.Errorf("building app set for snap %q: %v", snapInfo.InstanceName(), err)
 		}
 
-		opts, err := m.buildConfinementOptions(st, snapInfo, snapst.Flags)
+		opts, err := m.buildConfinementOptions(st, task, snapInfo, snapst.Flags)
 		if err != nil {
 			return err
 		}
@@ -901,7 +944,7 @@ func (m *InterfaceManager) undoDisconnect(task *state.Task, _ *tomb.Tomb) error 
 	if err != nil {
 		return err
 	}
-	slotOpts, err := m.buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
+	slotOpts, err := m.buildConfinementOptions(st, task, slotSnapInfo, slotSnapst.Flags)
 	if err != nil {
 		return err
 	}
@@ -913,7 +956,7 @@ func (m *InterfaceManager) undoDisconnect(task *state.Task, _ *tomb.Tomb) error 
 	if err != nil {
 		return err
 	}
-	plugOpts, err := m.buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
+	plugOpts, err := m.buildConfinementOptions(st, task, plugSnapInfo, plugSnapst.Flags)
 	if err != nil {
 		return err
 	}
@@ -1011,7 +1054,7 @@ func (m *InterfaceManager) undoConnect(task *state.Task, _ *tomb.Tomb) error {
 	if err != nil {
 		return err
 	}
-	slotOpts, err := m.buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
+	slotOpts, err := m.buildConfinementOptions(st, task, slotSnapInfo, slotSnapst.Flags)
 	if err != nil {
 		return err
 	}
@@ -1023,7 +1066,7 @@ func (m *InterfaceManager) undoConnect(task *state.Task, _ *tomb.Tomb) error {
 	if err != nil {
 		return err
 	}
-	plugOpts, err := m.buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
+	plugOpts, err := m.buildConfinementOptions(st, task, plugSnapInfo, plugSnapst.Flags)
 	if err != nil {
 		return err
 	}
@@ -1360,11 +1403,14 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 		return err
 	}
 
-	// The previous task (link-snap) may have triggered a restart,
-	// if this is the case we can only proceed once the restart
-	// has happened or we may not have all the interfaces of the
-	// new core/base snap.
-	if err := snapstateFinishRestart(task, snapsup); err != nil {
+	// The previous task (link-snap) may have triggered a restart, if this
+	// is the case we can only proceed once the restart has happened or we
+	// may not have all the interfaces of the new core/base snap. We set
+	// the default to true as we always called FinishRestart in older
+	// snapd.
+	logger.Debugf("finish restart from doAutoConnect")
+	if err := snapstateFinishRestart(task, snapsup,
+		snapstate.FinishRestartOptions{FinishRestartDefault: true}); err != nil {
 		return err
 	}
 
@@ -1508,6 +1554,10 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 	}
 
 	task.SetStatus(state.DoneStatus)
+
+	// Inject fault after the state is set to done
+	osutil.MaybeInjectFault("after-auto-connect")
+
 	return nil
 }
 

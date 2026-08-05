@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2022 Canonical Ltd
+ * Copyright (C) 2022-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -68,12 +68,15 @@ slots:
   devices:
     - /dev/input/event[0-9]
     - /dev/input/mice
+    - /dev/cpu/[0-9]*/msr
   read-devices:
     - /dev/js*
   files:
-    write: [ /bar ]
+    write: [ /bar, /baz@qux, /trailing@ ]
     read:
       - /dev/input/by-id/*
+      - /dev/dma_heap/qcom,qseecom
+      - /sys/devices/platform/soc@0/soc@0:bus@30000000/30350000.ocotp-ctrl/imx-ocotp0/nvmem
   udev-tagging:
     - kernel: input/mice
       subsystem: input
@@ -83,6 +86,9 @@ slots:
       environment:
         env1: first
         env2: second|other
+    - kernel: msr[0-9]*
+      subsystem: msr
+      for-device: /dev/cpu/[0-9]*/msr
 apps:
  app:
   slots: [hwdev]
@@ -205,8 +211,12 @@ apps:
 			`custom-device "devices" path contains invalid glob pattern "\*\*"`,
 		},
 		{
-			"devices: [/dev/@foo]",
-			`custom-device "devices" path must start with / and cannot contain special characters.*`,
+			`devices: ["/dev/@{foo}"]`,
+			`custom-device "devices" path must start with /dev/ and cannot contain special characters.*`,
+		},
+		{
+			`devices: ["/dev/@{foo"]`,
+			`custom-device "devices" path must start with /dev/ and cannot contain special characters.*`,
 		},
 		{
 			"devices: [/dev/foo|bar]",
@@ -328,6 +338,10 @@ apps:
 			"devices: [/dev/null]\n  udev-tagging:\n    - environment: {key: \"va{ue}\"}",
 			`custom-device "udev-tagging" invalid "environment" tag: value "va{ue}" contains invalid characters`,
 		},
+		{
+			"devices: [/dev/null]\n  udev-tagging:\n    - kernel: foo\n      for-device: /dev/bar",
+			`custom-device "udev-tagging" invalid "for-device" tag: cannot find matching device "/dev/bar"`,
+		},
 	}
 
 	for _, testData := range data {
@@ -397,7 +411,11 @@ func (s *CustomDeviceInterfaceSuite) TestAppArmorSpec(c *C) {
 	c.Check(plugSnippet, testutil.Contains, `"/dev/input/mice" rwk,`)
 	c.Check(plugSnippet, testutil.Contains, `"/dev/js*" r,`)
 	c.Check(plugSnippet, testutil.Contains, `"/bar" rw,`)
+	c.Check(plugSnippet, testutil.Contains, `"/baz@qux" rw,`)
+	c.Check(plugSnippet, testutil.Contains, `"/trailing@" rw,`)
 	c.Check(plugSnippet, testutil.Contains, `"/dev/input/by-id/*" r,`)
+	c.Check(plugSnippet, testutil.Contains, `"/dev/dma_heap/qcom,qseecom" r,`)
+	c.Check(plugSnippet, testutil.Contains, `"/sys/devices/platform/soc@0/soc@0:bus@30000000/30350000.ocotp-ctrl/imx-ocotp0/nvmem" r,`)
 	c.Check(slotSnippet, HasLen, 0)
 }
 
@@ -671,6 +689,40 @@ apps:
 			fmt.Sprintf(`^TAG=="snap_consumer_app", SUBSYSTEM!="module", SUBSYSTEM!="subsystem", RUN\+="%s/snap-device-helper .*`, dirs.DistroLibExecDir),
 			testLabel)
 	}
+}
+
+func (s *CustomDeviceInterfaceSuite) TestOverrideKernelExplicitDeviceName(c *C) {
+	const slotYaml = `name: provider
+version: 0
+slots:
+ hwdev:
+  interface: custom-device
+  custom-device: msr
+  devices:
+    - /dev/cpu/[0-9]*/msr
+  udev-tagging:
+    - kernel: msr[0-9]*
+      subsystem: msr
+      for-device: /dev/cpu/[0-9]*/msr
+apps:
+ app:
+  slots: [hwdev]
+`
+
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := udev.NewSpecification(appSet)
+	slot, _ := MockConnectedSlot(c, slotYaml, nil, "hwdev")
+	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, slot), IsNil)
+	snippets := spec.Snippets()
+
+	all := strings.Join(snippets, "\n")
+	c.Logf("---all:\n%s", all)
+
+	c.Check(all, Equals, fmt.Sprintf(`
+# custom-device
+KERNEL=="msr[0-9]*", SUBSYSTEM=="msr", TAG+="snap_consumer_app"
+TAG=="snap_consumer_app", SUBSYSTEM!="module", SUBSYSTEM!="subsystem", RUN+="%s/snap-device-helper $env{ACTION} snap_consumer_app $devpath $major:$minor"`[1:], dirs.DistroLibExecDir))
 }
 
 func (s *CustomDeviceInterfaceSuite) TestAutoConnect(c *C) {

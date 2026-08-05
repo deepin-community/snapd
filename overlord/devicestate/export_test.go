@@ -23,16 +23,18 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os/user"
 	"time"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/snapasserts"
 	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/gadget/install"
 	"github.com/snapcore/snapd/httputil"
 	"github.com/snapcore/snapd/kernel/fde"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/overlord/storecontext"
@@ -161,33 +163,47 @@ func MockRepeatRequestSerial(label string) (restore func()) {
 	}
 }
 
-func MockSnapstateInstallWithDeviceContext(f func(ctx context.Context, st *state.State, name string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags, prqt snapstate.PrereqTracker, deviceCtx snapstate.DeviceContext, fromChange string) (*state.TaskSet, error)) (restore func()) {
-	r := testutil.Backup(&snapstateInstallWithDeviceContext)
-	snapstateInstallWithDeviceContext = f
-	return r
+func MockSnapstateUpdateOne(mock func(ctx context.Context, st *state.State, goal snapstate.UpdateGoal, filter func(*snap.Info, *snapstate.SnapState) bool, opts snapstate.Options) (*state.TaskSet, error)) (restore func()) {
+	return testutil.Mock(&snapstateUpdateOne, mock)
 }
 
-func MockSnapstateInstallPathWithDeviceContext(f func(st *state.State, si *snap.SideInfo, path, name string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags, prqt snapstate.PrereqTracker, deviceCtx snapstate.DeviceContext, fromChange string) (*state.TaskSet, error)) (restore func()) {
-	r := testutil.Backup(&snapstateInstallPathWithDeviceContext)
-	snapstateInstallPathWithDeviceContext = f
-	return r
+func MockSnapstateInstallOne(mock func(ctx context.Context, st *state.State, goal snapstate.InstallGoal, opts snapstate.Options) (*snap.Info, *state.TaskSet, error)) (restore func()) {
+	return testutil.Mock(&snapstateInstallOne, mock)
 }
 
-func MockSnapstateUpdateWithDeviceContext(f func(st *state.State, name string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags, prqt snapstate.PrereqTracker, deviceCtx snapstate.DeviceContext, fromChange string) (*state.TaskSet, error)) (restore func()) {
-	r := testutil.Backup(&snapstateUpdateWithDeviceContext)
-	snapstateUpdateWithDeviceContext = f
-	return r
+func MockSnapstatePathUpdateGoal(mock func(snaps ...snapstate.PathSnap) snapstate.UpdateGoal) (restore func()) {
+	return testutil.Mock(&snapstatePathUpdateGoal, mock)
 }
 
-func MockSnapstateUpdatePathWithDeviceContext(f func(st *state.State, si *snap.SideInfo, path, name string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags, prqt snapstate.PrereqTracker, deviceCtx snapstate.DeviceContext, fromChange string) (*state.TaskSet, error)) (restore func()) {
-	r := testutil.Backup(&snapstateUpdatePathWithDeviceContext)
-	snapstateUpdatePathWithDeviceContext = f
-	return r
+func MockSnapstateStoreInstallGoal(mock func(snaps ...snapstate.StoreSnap) snapstate.InstallGoal) (restore func()) {
+	return testutil.Mock(&snapstateStoreInstallGoal, mock)
 }
 
-func MockSnapstateDownload(f func(ctx context.Context, st *state.State, name string, blobDirectory string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags, deviceCtx snapstate.DeviceContext) (*state.TaskSet, *snap.Info, error)) (restore func()) {
+func MockSnapstateStoreUpdateGoal(mock func(snaps ...snapstate.StoreUpdate) snapstate.UpdateGoal) (restore func()) {
+	return testutil.Mock(&snapstateStoreUpdateGoal, mock)
+}
+
+func MockSnapstatePathInstallGoal(mock func(snapstate.PathSnap) snapstate.InstallGoal) (restore func()) {
+	return testutil.Mock(&snapstatePathInstallGoal, mock)
+}
+
+func MockSnapstateInstallComponents(mock func(ctx context.Context, st *state.State, names []string, info *snap.Info, vsets *snapasserts.ValidationSets, opts snapstate.Options) ([]*state.TaskSet, error)) (restore func()) {
+	return testutil.Mock(&snapstateInstallComponents, mock)
+}
+
+func MockSnapstateInstallComponentPath(mock func(st *state.State, csi *snap.ComponentSideInfo, info *snap.Info, path string, opts snapstate.Options) (*state.TaskSet, error)) (restore func()) {
+	return testutil.Mock(&snapstateInstallComponentPath, mock)
+}
+
+func MockSnapstateDownload(f func(ctx context.Context, st *state.State, name string, components []string, blobDirectory string, revOpts snapstate.RevisionOptions, opts snapstate.Options) (*state.TaskSet, *snap.Info, error)) (restore func()) {
 	r := testutil.Backup(&snapstateDownload)
 	snapstateDownload = f
+	return r
+}
+
+func MockSnapstateDownloadComponents(f func(ctx context.Context, st *state.State, name string, components []string, blobDirectory string, revOpts snapstate.RevisionOptions, opts snapstate.Options) (*state.TaskSet, error)) (restore func()) {
+	r := testutil.Backup(&snapstateDownloadComponents)
+	snapstateDownloadComponents = f
 	return r
 }
 
@@ -203,8 +219,8 @@ func EnsureSerialBoundSystemUserAssertionsProcessed(m *DeviceManager) error {
 	return m.ensureSerialBoundSystemUserAssertionsProcessed()
 }
 
-func ImportAssertionsFromSeed(m *DeviceManager, isCoreBoot bool) (seed.Seed, error) {
-	return m.importAssertionsFromSeed(isCoreBoot)
+func ImportAssertionsFromSeed(m *DeviceManager, mode string, isCoreBoot bool) (seed.Seed, error) {
+	return m.importAssertionsFromSeed(mode, isCoreBoot)
 }
 
 func PopulateStateFromSeedImpl(m *DeviceManager, tm timings.Measurer) ([]*state.TaskSet, error) {
@@ -363,6 +379,12 @@ func MockBootMakeSystemRunnableAfterDataReset(f func(model *asserts.Model, bootW
 	return restore
 }
 
+func MockBootMakeRecoverySystemBootable(f func(model *asserts.Model, rootdir string, relativeRecoverySystemDir string, bootWith *boot.RecoverySystemBootableSet) error) (restore func()) {
+	restore = testutil.Backup(&bootMakeRecoverySystemBootable)
+	bootMakeRecoverySystemBootable = f
+	return restore
+}
+
 func MockBootEnsureNextBootToRunMode(f func(systemLabel string) error) (restore func()) {
 	old := bootEnsureNextBootToRunMode
 	bootEnsureNextBootToRunMode = f
@@ -415,7 +437,7 @@ func MockInstallMountVolumes(f func(onVolumes map[string]*gadget.Volume, encSetu
 	}
 }
 
-func MockInstallEncryptPartitions(f func(onVolumes map[string]*gadget.Volume, encryptionType secboot.EncryptionType, model *asserts.Model, gadgetRoot, kernelRoot string, perfTimings timings.Measurer) (*install.EncryptionSetupData, error)) (restore func()) {
+func MockInstallEncryptPartitions(f func(onVolumes map[string]*gadget.Volume, volumesAuth *device.VolumesAuthOptions, encryptionType device.EncryptionType, model *asserts.Model, gadgetRoot, kernelRoot string, perfTimings timings.Measurer) (*install.EncryptionSetupData, error)) (restore func()) {
 	old := installEncryptPartitions
 	installEncryptPartitions = f
 	return func() {
@@ -474,7 +496,7 @@ func DeviceManagerRunFDESetupHook(mgr *DeviceManager, req *fde.SetupRequest) ([]
 	return mgr.runFDESetupHook(req)
 }
 
-func DeviceManagerCheckEncryption(mgr *DeviceManager, st *state.State, deviceCtx snapstate.DeviceContext, mode secboot.TPMProvisionMode) (secboot.EncryptionType, error) {
+func DeviceManagerCheckEncryption(mgr *DeviceManager, st *state.State, deviceCtx snapstate.DeviceContext, mode secboot.TPMProvisionMode) (device.EncryptionType, error) {
 	return mgr.checkEncryption(st, deviceCtx, mode)
 }
 
@@ -507,12 +529,6 @@ func MockSecbootEnsureRecoveryKey(f func(recoveryKeyFile string, rkeyDevs []secb
 func MockSecbootRemoveRecoveryKeys(f func(rkeyDevToKey map[secboot.RecoveryKeyDevice]string) error) (restore func()) {
 	restore = testutil.Backup(&secbootRemoveRecoveryKeys)
 	secbootRemoveRecoveryKeys = f
-	return restore
-}
-
-func MockMarkFactoryResetComplete(f func(encrypted bool) error) (restore func()) {
-	restore = testutil.Backup(&bootMarkFactoryResetComplete)
-	bootMarkFactoryResetComplete = f
 	return restore
 }
 
@@ -556,7 +572,7 @@ func MockCreateAllKnownSystemUsers(createAllUsers func(state *state.State, asser
 	return restore
 }
 
-func MockEncryptionSetupDataInCache(st *state.State, label string) (restore func()) {
+func MockEncryptionSetupDataInCache(st *state.State, label string, volumesAuth *device.VolumesAuthOptions) (restore func()) {
 	st.Lock()
 	defer st.Unlock()
 	var esd *install.EncryptionSetupData
@@ -570,7 +586,7 @@ func MockEncryptionSetupDataInCache(st *state.State, label string) (restore func
 			EncryptedDevice: "/dev/mapper/ubuntu-data",
 		},
 	}
-	esd = install.MockEncryptionSetupData(labelToEncData)
+	esd = install.MockEncryptionSetupData(labelToEncData, volumesAuth)
 	st.Cache(encryptionSetupDataKey{label}, esd)
 	return func() { CleanUpEncryptionSetupDataInCache(st, label) }
 }
@@ -594,3 +610,71 @@ func CleanUpEncryptionSetupDataInCache(st *state.State, label string) {
 }
 
 type UniqueSnapsInRecoverySystem = uniqueSnapsInRecoverySystem
+
+func MockSecbootAddBootstrapKeyOnExistingDisk(f func(node string, newKey keys.EncryptionKey) error) (restore func()) {
+	old := secbootAddBootstrapKeyOnExistingDisk
+	secbootAddBootstrapKeyOnExistingDisk = f
+	return func() {
+		secbootAddBootstrapKeyOnExistingDisk = old
+	}
+}
+
+func MockSecbootRenameKeys(f func(node string, renames map[string]string) error) (restore func()) {
+	old := secbootRenameKeys
+	secbootRenameKeys = f
+	return func() {
+		secbootRenameKeys = old
+	}
+}
+
+func MockSecbootCreateBootstrappedContainer(f func(key secboot.DiskUnlockKey, devicePath string) secboot.BootstrappedContainer) (restore func()) {
+	old := secbootCreateBootstrappedContainer
+	secbootCreateBootstrappedContainer = f
+	return func() {
+		secbootCreateBootstrappedContainer = old
+	}
+}
+
+func MockSecbootDeleteKeys(f func(node string, matches map[string]bool) error) (restore func()) {
+	old := secbootDeleteKeys
+	secbootDeleteKeys = f
+	return func() {
+		secbootDeleteKeys = old
+	}
+}
+
+func MockSecbootDeleteOldKeys(f func(devicePath string) error) (restore func()) {
+	old := secbootDeleteOldKeys
+	secbootDeleteOldKeys = f
+	return func() {
+		secbootDeleteOldKeys = old
+	}
+}
+
+func MockSecbootTemporaryNameOldKeys(f func(devicePath string) error) (restore func()) {
+	old := secbootTemporaryNameOldKeys
+	secbootTemporaryNameOldKeys = f
+	return func() {
+		secbootTemporaryNameOldKeys = old
+	}
+}
+
+func MockDisksDMCryptUUIDFromMountPoint(f func(mountpoint string) (string, error)) (restore func()) {
+	old := disksDMCryptUUIDFromMountPoint
+	disksDMCryptUUIDFromMountPoint = f
+	return func() {
+		disksDMCryptUUIDFromMountPoint = old
+	}
+}
+
+func VolumesAuthOptionsKeyByLabel(label string) volumesAuthOptionsKey {
+	return volumesAuthOptionsKey{label}
+}
+
+func MockSecbootRemoveOldCounterHandles(f func(node string, possibleOldKeys map[string]bool, possibleKeyFiles []string, hintExpectFDEHook bool) error) (restore func()) {
+	old := secbootRemoveOldCounterHandles
+	secbootRemoveOldCounterHandles = f
+	return func() {
+		secbootRemoveOldCounterHandles = old
+	}
+}

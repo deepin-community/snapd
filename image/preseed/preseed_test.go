@@ -143,6 +143,10 @@ func (fs *FakeSeed) ModeSnaps(mode string) ([]*seed.Snap, error) {
 	return fs.SnapsForMode[mode], nil
 }
 
+func (s *FakeSeed) ModeSnap(snapName, mode string) (*seed.Snap, error) {
+	panic("ModeSnap not implemented")
+}
+
 func (fs *FakeSeed) NumSnaps() int {
 	return 0
 }
@@ -240,9 +244,9 @@ func (s *preseedSuite) TestChooseTargetSnapdVersion(c *C) {
 	}{
 		{
 			fromDeb:  "2.44.0",
-			fromSnap: "2.45.3+git123",
+			fromSnap: "2.45.3+g123",
 			// snap version wins
-			expectedVersion: "2.45.3+git123",
+			expectedVersion: "2.45.3+g123",
 			expectedPath:    filepath.Join(tmpDir, "target-core-mounted-here/usr/lib/snapd/snapd"),
 		},
 		{
