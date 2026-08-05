@@ -218,24 +218,24 @@ func checkUintWhat(headers map[string]interface{}, name string, bitSize int, wha
 	return value, nil
 }
 
-func checkDigest(headers map[string]interface{}, name string, h crypto.Hash) ([]byte, error) {
-	return checkDigestWhat(headers, name, h, "header")
+func checkDigest(headers map[string]interface{}, name string, h crypto.Hash) (string, error) {
+	return checkDigestDecWhat(headers, name, h, base64.RawURLEncoding.DecodeString, "header")
 }
 
-func checkDigestWhat(headers map[string]interface{}, name string, h crypto.Hash, what string) ([]byte, error) {
+func checkDigestDecWhat(headers map[string]interface{}, name string, h crypto.Hash, decode func(string) ([]byte, error), what string) (string, error) {
 	digestStr, err := checkNotEmptyStringWhat(headers, name, what)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	b, err := base64.RawURLEncoding.DecodeString(digestStr)
+	b, err := decode(digestStr)
 	if err != nil {
-		return nil, fmt.Errorf("%q %s cannot be decoded: %v", name, what, err)
+		return "", fmt.Errorf("%q %s cannot be decoded: %v", name, what, err)
 	}
 	if len(b) != h.Size() {
-		return nil, fmt.Errorf("%q %s does not have the expected bit length: %d", name, what, len(b)*8)
+		return "", fmt.Errorf("%q %s does not have the expected bit length: %d", name, what, len(b)*8)
 	}
 
-	return b, nil
+	return digestStr, nil
 }
 
 // checkStringListInMap returns the `name` entry in the `m` map as a (possibly nil) `[]string`
@@ -321,4 +321,21 @@ func checkMapWhat(m map[string]interface{}, name, what string) (map[string]inter
 		return nil, fmt.Errorf("%q %s must be a map", name, what)
 	}
 	return mv, nil
+}
+
+func checkList(headers map[string]interface{}, name string) ([]interface{}, error) {
+	return checkListWhat(headers, name, "header")
+}
+
+func checkListWhat(m map[string]interface{}, name, what string) ([]interface{}, error) {
+	value, ok := m[name]
+	if !ok {
+		return nil, nil
+	}
+
+	list, ok := value.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("%q %s must be a list", name, what)
+	}
+	return list, nil
 }

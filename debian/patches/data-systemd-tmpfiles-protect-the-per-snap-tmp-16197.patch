@@ -1,0 +1,25 @@
+From d3e2c3d85f9a0571fabfc079f89d0135a07afd67 Mon Sep 17 00:00:00 2001
+From: Philip Meulengracht <the_meulengracht@hotmail.com>
+Date: Wed, 12 Nov 2025 14:50:06 +0100
+Subject: [PATCH] data/systemd-tmpfiles: protect the per-snap tmp (#16197)
+
+Protect the per-snap tmp directory against being reaped by age
+---
+ data/systemd-tmpfiles/snapd.conf | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/data/systemd-tmpfiles/snapd.conf b/data/systemd-tmpfiles/snapd.conf
+index 03c9bb076f9b..da8f1c38b709 100644
+--- a/data/systemd-tmpfiles/snapd.conf
++++ b/data/systemd-tmpfiles/snapd.conf
+@@ -1 +1,7 @@
+ D! /tmp/snap-private-tmp 0700 root root -
++
++# make sure the snap's private tmp folders are 
++# not reaped by age if configured by the system (noble+)
++# this will still let the contents be reaped, just not the
++# folder itself
++X /tmp/snap-private-tmp/*/tmp
+-- 
+2.53.0
+

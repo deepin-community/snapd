@@ -42,7 +42,6 @@ environment:
     SUDO_UID: ""
     TRUST_TEST_KEYS: '$(HOST: echo "${SPREAD_TRUST_TEST_KEYS:-true}")'
     # a global setting for LXD channel to use in the tests
-    # TODO: Consider reverting to latest/candidate after Snapcraft compatibility with LXD 5.21 extended version string "5.21 LTS" is fixed
     LXD_SNAP_CHANNEL: "latest/candidate"
     OLD_UBUNTU_IMAGE_SNAP_CHANNEL: "2/stable"
     UBUNTU_IMAGE_SNAP_CHANNEL: "latest/beta"
@@ -72,7 +71,7 @@ environment:
     PPA_SOURCE_LINE: '$(HOST: echo "${SPREAD_PPA_SOURCE_LINE:-}")'
     PPA_GPG_KEY: '$(HOST: echo "${SPREAD_PPA_GPG_KEY:-}")'
     # List the snaps which are cached
-    PRE_CACHE_SNAPS: test-snapd-tools test-snapd-sh jq
+    PRE_CACHE_SNAPS: test-snapd-tools test-snapd-sh
     # always skip removing the rsync snap
     SKIP_REMOVE_SNAPS: '$(HOST: echo "${SPREAD_SKIP_REMOVE_SNAPS:-}") test-snapd-rsync test-snapd-rsync-core18 test-snapd-rsync-core20 test-snapd-rsync-core22 test-snapd-rsync-core24'
     # Use the installed snapd and reset the systems without removing snapd
@@ -81,12 +80,17 @@ environment:
     # set to 1 when the snapd memory limit has to be removed
     SNAPD_NO_MEMORY_LIMIT: '$(HOST: echo "${SPREAD_SNAPD_NO_MEMORY_LIMIT:-}")'
 
-    SNAPD_PUBLISHED_VERSION: '$(HOST: echo "$SPREAD_SNAPD_PUBLISHED_VERSION")'
-    # Build and use snapd from current branch
-    BUILD_SNAPD_FROM_CURRENT: '$(HOST: echo "${SPREAD_BUILD_SNAPD_FROM_CURRENT:-true}")'
+    # Use the snapd package from the repository when possible
+    SNAPD_DEB_FROM_REPO: '$(HOST: echo "${SPREAD_SNAPD_DEB_FROM_REPO:-true}")'
+    # Directory where the built snapd snaps and other assets are stored
+    SNAPD_WORK_DIR: '$(HOST: echo "${SPREAD_SNAPD_WORK_DIR:-/var/tmp/work-dir}")'
+    # Threshold used to determine which stake locks have to be collected during runtime
+    SNAPD_STATE_LOCK_TRACE_THRESHOLD_MS: '$(HOST: echo "${SPREAD_SNAPD_STATE_LOCK_TRACE_THRESHOLD_MS:-0}")'
+    # Allow mismatch in snapd/kernel versions
+    SNAPD_ALLOW_SNAPD_KERNEL_MISMATCH: '$(HOST: echo "${SNAPD_ALLOW_SNAPD_KERNEL_MISMATCH:-true}")'
 
     # Directory where the nested images and test assets are stored
-    NESTED_WORK_DIR: '$(HOST: echo "${NESTED_WORK_DIR:-/tmp/work-dir}")'
+    NESTED_WORK_DIR: '$(HOST: echo "${NESTED_WORK_DIR:-/var/tmp/work-dir}")'
     # Channel used to create the nested vm
     NESTED_CORE_CHANNEL: '$(HOST: echo "${NESTED_CORE_CHANNEL:-beta}")'
     # Kernel channel used to create the nested vm
@@ -107,7 +111,7 @@ environment:
     NESTED_REPACK_KERNEL_SNAP: '$(HOST: echo "${NESTED_REPACK_KERNEL_SNAP:-true}")'
     NESTED_REPACK_GADGET_SNAP: '$(HOST: echo "${NESTED_REPACK_GADGET_SNAP:-true}")'
     NESTED_REPACK_BASE_SNAP: '$(HOST: echo "${NESTED_REPACK_BASE_SNAP:-true}")'
-    NESTED_FORCE_MS_KEYS: '$(HOST: echo "${NESTED_FORCE_MS_KEYS:-false}")'
+    NESTED_KERNEL_MODULES_COMP: '$(HOST: echo "${NESTED_KERNEL_MODULES_COMP:-}")'
     
     # Whether we should use snapd snap ./built-snap/ directory
     USE_PREBUILT_SNAPD_SNAP: '$(HOST: echo "${SPREAD_USE_PREBUILT_SNAPD_SNAP:-false}")'
@@ -123,9 +127,7 @@ backends:
                   workers: 6
             - ubuntu-16.04-64:
                   workers: 8
-                  storage: 12G
-            - ubuntu-18.04-32:
-                  workers: 6
+                  storage: 15G
             - ubuntu-18.04-64:
                   storage: 15G
                   workers: 8
@@ -143,6 +145,10 @@ backends:
                   storage: 15G
                   workers: 8
             - ubuntu-24.10-64:
+                  storage: 15G
+                  workers: 8
+            - ubuntu-25.04-64:
+                  image: ubuntu-os-cloud-devel/ubuntu-2504-amd64
                   storage: 15G
                   workers: 8
 
@@ -182,12 +188,22 @@ backends:
         halt-timeout: 2h
         systems:
             - ubuntu-pro-20.04-64:
-                  image: ubuntu-os-pro-cloud/ubuntu-pro-2004-focal-v20240614
+                  image: ubuntu-os-pro-cloud/ubuntu-pro-2004-lts
                   workers: 1
                   attach-service-account: true
 
             - ubuntu-pro-22.04-64:
-                  image: ubuntu-os-pro-cloud/ubuntu-pro-2004-focal-v20240614
+                  image: ubuntu-os-pro-cloud/ubuntu-pro-2204-lts
+                  workers: 1
+                  attach-service-account: true
+
+            - ubuntu-fips-20.04-64:
+                  image: ubuntu-os-pro-cloud/ubuntu-pro-2004-lts
+                  workers: 1
+                  attach-service-account: true
+
+            - ubuntu-fips-22.04-64:
+                  image: ubuntu-os-pro-cloud/ubuntu-pro-2204-lts
                   workers: 1
                   attach-service-account: true
 
@@ -203,9 +219,6 @@ backends:
                   workers: 6
             - debian-sid-64:
                   storage: 12G
-                  workers: 6
-
-            - fedora-39-64:
                   workers: 6
 
             - amazon-linux-2-64:
@@ -230,12 +243,11 @@ backends:
                   storage: preserve-size
                   image: centos-9-64
 
-            - opensuse-15.5-64:
-                  workers: 6
             - opensuse-15.6-64:
                   workers: 6
             - opensuse-tumbleweed-64:
                   workers: 6
+                  storage: 12G
 
     google-arm:
         type: google
@@ -273,6 +285,9 @@ backends:
             - ubuntu-24.04-64:
                   storage: 12G
                   workers: 8
+            - ubuntu-24.10-64:
+                  storage: 12G
+                  workers: 8
 
     google-nested:
         type: google
@@ -281,7 +296,7 @@ backends:
         plan: n2-standard-2
         halt-timeout: 2h
         cpu-family: "Intel Cascade Lake"
-        systems:
+        systems: &google-nested-systems
             - ubuntu-16.04-64:
                   image: ubuntu-1604-64-virt-enabled
                   storage: 20G
@@ -293,15 +308,15 @@ backends:
             - ubuntu-20.04-64:
                   image: ubuntu-2004-64-virt-enabled
                   storage: 20G
-                  workers: 10
+                  workers: 12
             - ubuntu-22.04-64:
                   image: ubuntu-2204-64-virt-enabled
                   storage: 25G
-                  workers: 12
+                  workers: 14
             - ubuntu-24.04-64:
                   image: ubuntu-2404-64-virt-enabled
                   storage: 25G
-                  workers: 12
+                  workers: 14
 
     google-nested-arm:
         type: google
@@ -322,27 +337,7 @@ backends:
         plan: n2-standard-4
         halt-timeout: 6h
         cpu-family: "Intel Cascade Lake"
-        systems:
-            - ubuntu-16.04-64:
-                  image: ubuntu-1604-64-virt-enabled
-                  storage: 20G
-                  workers: 3
-            - ubuntu-18.04-64:
-                  image: ubuntu-1804-64-virt-enabled
-                  storage: 20G
-                  workers: 3
-            - ubuntu-20.04-64:
-                  image: ubuntu-2004-64-virt-enabled
-                  storage: 20G
-                  workers: 8
-            - ubuntu-22.04-64:
-                  image: ubuntu-2204-64-virt-enabled
-                  storage: 20G
-                  workers: 8
-            - ubuntu-24.04-64:
-                  image: ubuntu-2404-64-virt-enabled
-                  storage: 20G
-                  workers: 8
+        systems: *google-nested-systems
 
     qemu-nested:
         memory: 4G
@@ -367,13 +362,7 @@ backends:
     qemu:
         memory: 4G
         systems:
-            - ubuntu-14.04-32:
-                  username: ubuntu
-                  password: ubuntu
             - ubuntu-14.04-64:
-                  username: ubuntu
-                  password: ubuntu
-            - ubuntu-16.04-32:
                   username: ubuntu
                   password: ubuntu
             - ubuntu-16.04-64:
@@ -404,13 +393,7 @@ backends:
             - ubuntu-18.04-64:
                   username: ubuntu
                   password: ubuntu
-            - ubuntu-18.04-32:
-                  username: ubuntu
-                  password: ubuntu
             - ubuntu-20.04-64:
-                  username: ubuntu
-                  password: ubuntu
-            - ubuntu-20.04-32:
                   username: ubuntu
                   password: ubuntu
             - ubuntu-22.04-64:
@@ -442,7 +425,6 @@ backends:
                 FATAL "adhoc only works inside autopkgtest"
                 exit 1
             fi
-            echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/99-spread-users
             ADDRESS localhost:22
         discard: |
             echo "Discarding ad-hoc $SPREAD_SYSTEM"
@@ -451,14 +433,8 @@ backends:
             - ubuntu-14.04-amd64:
                   username: ubuntu
                   password: ubuntu
-            - ubuntu-14.04-i386:
-                  username: ubuntu
-                  password: ubuntu
             # Xenial
             - ubuntu-16.04-amd64:
-                  username: ubuntu
-                  password: ubuntu
-            - ubuntu-16.04-i386:
                   username: ubuntu
                   password: ubuntu
             - ubuntu-16.04-ppc64el:
@@ -472,9 +448,6 @@ backends:
                   password: ubuntu
             # Bionic
             - ubuntu-18.04-amd64:
-                  username: ubuntu
-                  password: ubuntu
-            - ubuntu-18.04-i386:
                   username: ubuntu
                   password: ubuntu
             - ubuntu-18.04-ppc64el:
@@ -493,9 +466,6 @@ backends:
             - ubuntu-20.04-amd64:
                   username: ubuntu
                   password: ubuntu
-            - ubuntu-20.04-i386:
-                  username: ubuntu
-                  password: ubuntu
             - ubuntu-20.04-ppc64el:
                   username: ubuntu
                   password: ubuntu
@@ -512,9 +482,6 @@ backends:
             - ubuntu-22.04-amd64:
                   username: ubuntu
                   password: ubuntu
-            - ubuntu-22.04-i386:
-                  username: ubuntu
-                  password: ubuntu
             - ubuntu-22.04-ppc64el:
                   username: ubuntu
                   password: ubuntu
@@ -527,6 +494,25 @@ backends:
             - ubuntu-22.04-arm64:
                   username: ubuntu
                   password: ubuntu
+            # Debian
+            - debian-sid-amd64:
+                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+            - debian-sid-i386:
+                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+            - debian-sid-armhf:
+                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+            - debian-sid-ppc64el:
+                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+            - debian-sid-s390x:
+                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+            - debian-sid-arm64:
+                  username: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
+                  password: '$(HOST: echo "$AUTOPKGTEST_NORMAL_USER")'
 
     external:
         type: adhoc
@@ -623,6 +609,10 @@ debug-each: |
     go version || true
 
     if tests.nested is-nested; then
+        echo '# free space on the host'
+        df -h || true
+        du -ch /var/tmp/work-dir || true
+
         echo '# nested VM status'
         tests.nested vm status
         # filter out ^[ to ensure that the debug output gets not messed up
@@ -768,14 +758,6 @@ prepare: |
 
     # Note that os.query or any other tool cannot be used here before the current.delta file is unpacked
     if [[ "$SPREAD_SYSTEM" == fedora-* ]]; then
-        # The Fedora archive mirror seems to be unreliable.
-        # Switch to the main archive by commenting out metalink and uncommenting
-        # baseurl with a tweak to go to dl.fedoraproject.org which doens't redirect
-        # to mirrors again.
-        #
-        # https://forum.snapcraft.io/t/issues-with-the-fedora-mirror-network/3489/
-        sed -i -s -E -e 's@^#?baseurl=http://download.fedoraproject.org/@baseurl=http://dl.fedoraproject.org/@g' -e 's@^metalink=@#metalink@g' /etc/yum.repos.d/fedora*.repo
-
         dnf --refresh -y makecache
 
         # enable audit daemon
@@ -809,10 +791,33 @@ prepare: |
         else
             exit 1
         fi
+        # workaround for https://warthogs.atlassian.net/browse/SNAPDENG-34591
+        awk '/\[community\]/ {print "#" $0; getline; print "#" $0; next} {print}' < /etc/pacman.conf > /etc/pacman.conf.spread
+        mv /etc/pacman.conf.spread /etc/pacman.conf
     fi
 
     if [[ "$SPREAD_SYSTEM" == debian-* ]]; then
         apt-get update && apt-get install -y eatmydata
+    fi
+
+    if [[ "$SPREAD_SYSTEM" == ubuntu-fips-* ]]; then
+        pro status
+
+        if [[ "$SPREAD_REBOOT" = 0 ]]; then
+            echo "--- enabling FIPS"
+            pro enable fips-updates --assume-yes
+            REBOOT
+        fi
+
+        if ! [ "$(cat /proc/sys/crypto/fips_enabled)" = "1" ]; then
+            echo "FIPS not enabled"
+            exit 1
+        fi
+
+        # enable GO FIPS PPA
+        add-apt-repository --yes ppa:ubuntu-toolchain-r/golang-fips
+        # XXX pin priority?
+        apt update
     fi
 
     # Enable EPEL see https://docs.fedoraproject.org/en-US/epel/
@@ -908,7 +913,34 @@ prepare: |
             exit 1
         fi
     fi
-    
+
+    # native jq replacement, but still with some incompatibilies, see
+    # https://github.com/itchyny/gojq
+    # major differences:
+    # - map keys are sorted by default
+    # - with --yaml-input, can parse YAML
+    if os.query is-arm64; then
+        "$TESTSTOOLS"/simpleget -o /tmp/gojq.tar.gz \
+            https://github.com/itchyny/gojq/releases/download/v0.12.16/gojq_v0.12.16_linux_arm64.tar.gz
+    elif os.query is-arm; then
+        # upstream does not provide prebuilt binaries for armhf
+        # built with: GOARCH=arm GOARM=7
+        "$TESTSTOOLS"/simpleget -o /tmp/gojq.tar.gz \
+            https://storage.googleapis.com/snapd-spread-tests/dependencies/gojq_v0.12.16_linux_armhf.tar.gz
+    else
+        # must be amd64
+        "$TESTSTOOLS"/simpleget -o /tmp/gojq.tar.gz \
+            https://github.com/itchyny/gojq/releases/download/v0.12.16/gojq_v0.12.16_linux_amd64.tar.gz
+    fi
+
+    (
+        cd "$PROJECT_PATH/tests/bin"
+        # only extract gojq, typically under a path:
+        # -rwxr-xr-x runner/docker 4165784 2024-06-01 16:43 gojq_v0.12.16_linux_amd64/gojq
+        tar -xvf /tmp/gojq.tar.gz --strip-components=1 --wildcards "*/gojq"
+        test -x gojq
+    )
+
     # NOTE: At this stage the source tree is available and no more special
     # considerations apply.
     "$TESTSLIB"/prepare-restore.sh --prepare-project
@@ -930,7 +962,7 @@ suites:
     # environment on each platform. On autopkgtest we cannot run all tests
     # as this is very slow and we run into timeouts.
     #
-    # These tests are executed on all other plattforms as they
+    # These tests are executed on all other platforms as they
     # are designed to run on pristine systems
     tests/smoke/:
         summary: Essential system level tests for snapd
@@ -945,7 +977,7 @@ suites:
     # All other tests run now and will heavily modify the system.
     tests/main/:
         summary: Full-system tests for snapd
-        systems: [-ubuntu-secboot-*]
+        systems: [-ubuntu-secboot-*, -ubuntu-fips-*]
         prepare: |
             "$TESTSLIB"/prepare-restore.sh --prepare-suite
         prepare-each: |
@@ -972,7 +1004,7 @@ suites:
     tests/completion/:
         summary: completion tests
         # ppc64el disabled because of https://bugs.launchpad.net/snappy/+bug/1655594
-        systems: [-ubuntu-core-*, -ubuntu-*-ppc64el, -ubuntu-secboot-*]
+        systems: [-ubuntu-core-*, -ubuntu-*-ppc64el, -ubuntu-secboot-*, -ubuntu-fips-*]
         prepare: |
             "$TESTSLIB"/prepare-restore.sh --prepare-suite
         prepare-each: |
@@ -999,7 +1031,7 @@ suites:
 
     tests/regression/:
         summary: Regression tests for snapd
-        systems: [-ubuntu-secboot-*]
+        systems: [-ubuntu-secboot-*, -ubuntu-fips-*]
         prepare: |
             "$TESTSLIB"/prepare-restore.sh --prepare-suite
         prepare-each: |
@@ -1056,6 +1088,7 @@ suites:
                 -amazon-*,
                 -centos-*,
                 -ubuntu-secboot-*,
+                -ubuntu-fips-*,
             ]
         # unittests are run as part of the autopkgtest build already
         backends: [-autopkgtest]
@@ -1159,12 +1192,14 @@ suites:
             NESTED_SNAPD_DEBUG_TO_SERIAL:  '$(HOST: echo "${NESTED_SNAPD_DEBUG_TO_SERIAL:-false}")'
             # Add any extra cmd line parameter to the nested vm
             NESTED_EXTRA_CMDLINE:  '$(HOST: echo "${NESTED_EXTRA_CMDLINE:-}")'
-            # Generic imane name which has to be overwritten in the test
+            # Generic image name which has to be overwritten in the test
             NESTED_IMAGE_ID: "unset"
             # Configuration file used for remote tools
             REMOTE_CFG_FILE: "$PROJECT_PATH/remote.setup.cfg"
             # Define which tests to run in the nested vm in run-spread test
             NESTED_SPREAD_TESTS:  '$(HOST: echo "${NESTED_SPREAD_TESTS:-}")'
+            # Indicates that by default snapd pkg is built from current
+            SNAPD_DEB_FROM_REPO: '$(HOST: echo "${SPREAD_SNAPD_DEB_FROM_REPO:-false}")'
         manual: true
         warn-timeout: 10m
         kill-timeout: 60m
@@ -1173,6 +1208,8 @@ suites:
             . "$TESTSLIB"/pkgdb.sh
             #shellcheck source=tests/lib/image.sh
             . "$TESTSLIB"/image.sh
+            #shellcheck source=tests/lib/core-initrd.sh
+            . "$TESTSLIB"/core-initrd.sh
             distro_update_package_db
             distro_install_package snapd qemu-kvm qemu-utils genisoimage sshpass cloud-image-utils ovmf kpartx xz-utils mtools ca-certificates xdelta3
             if os.query is-xenial; then
@@ -1193,10 +1230,15 @@ suites:
             fi
 
             # Install the snapd built
-            dpkg -i "$SPREAD_PATH"/../snapd_*.deb
+            dpkg -i "$GOHOME"/snapd_*.deb
 
             # Configure the ssh connection to the test vm
             remote.setup config --host localhost --port 8022 --user user1 --pass ubuntu
+
+            # Build and install initramfs package
+            if os.query is-ubuntu-ge 24.04; then
+                build_and_install_initramfs_deb
+            fi
         prepare-each: |
             "$TESTSLIB"/prepare-restore.sh --prepare-suite-each
             tests.nested prepare
@@ -1226,6 +1268,8 @@ suites:
             NESTED_ENABLE_SECURE_BOOT: '$(HOST: echo "${NESTED_ENABLE_SECURE_BOOT:-false}")'
             # Configuration file used for remote tools
             REMOTE_CFG_FILE: "$PROJECT_PATH/remote.setup.cfg"
+            # Indicates that by default snapd pkg is built from current
+            SNAPD_DEB_FROM_REPO: '$(HOST: echo "${SPREAD_SNAPD_DEB_FROM_REPO:-false}")'
         manual: true
         prepare: |
             #shellcheck source=tests/lib/pkgdb.sh
@@ -1252,7 +1296,7 @@ suites:
             fi
 
             # Install the snapd built
-            dpkg -i "$SPREAD_PATH"/../snapd_*.deb
+            dpkg -i "$GOHOME"/snapd_*.deb
 
             # Configure the ssh connection to the test vm
             remote.setup config --host localhost --port 8022 --user user1 --pass ubuntu
@@ -1289,12 +1333,16 @@ suites:
             NESTED_EXTRA_CMDLINE:  '$(HOST: echo "${NESTED_EXTRA_CMDLINE:-}")'
             # Configuration file used for remote tools
             REMOTE_CFG_FILE: "$PROJECT_PATH/remote.setup.cfg"
+            # Indicates that by default snapd pkg is built from current
+            SNAPD_DEB_FROM_REPO: '$(HOST: echo "${SPREAD_SNAPD_DEB_FROM_REPO:-false}")'
         manual: true
         prepare: |
             #shellcheck source=tests/lib/pkgdb.sh
             . "$TESTSLIB"/pkgdb.sh
             #shellcheck source=tests/lib/image.sh
             . "$TESTSLIB"/image.sh
+            #shellcheck source=tests/lib/core-initrd.sh
+            . "$TESTSLIB"/core-initrd.sh
             distro_update_package_db
             distro_install_package snapd qemu-kvm qemu-utils genisoimage sshpass cloud-image-utils ovmf kpartx xz-utils mtools ca-certificates xdelta3
             if os.query is-xenial; then
@@ -1309,10 +1357,15 @@ suites:
             fi
 
             # Install the snapd built
-            dpkg -i "$SPREAD_PATH"/../snapd_*.deb
+            dpkg -i "$GOHOME"/snapd_*.deb
 
             # Configure the ssh connection to the test vm
             remote.setup config --host localhost --port 8022 --user user1 --pass ubuntu
+
+            # Build and install initramfs package
+            if os.query is-ubuntu-ge 24.04; then
+                build_and_install_initramfs_deb
+            fi
 
             tests.nested prepare
             tests.nested build-image core
@@ -1351,7 +1404,8 @@ suites:
             # Indicates the amount of memory in MB to use in the nested vm
             NESTED_MEM: '$(HOST: echo "${NESTED_MEM:-4096}")'
             SPREAD_URL: https://storage.googleapis.com/snapd-spread-tests/spread/spread-amd64.tar.gz
-
+            # Indicates that by default snapd pkg is built from current
+            SNAPD_DEB_FROM_REPO: '$(HOST: echo "${SPREAD_SNAPD_DEB_FROM_REPO:-false}")'
         manual: true
         warn-timeout: 10m
         kill-timeout: 60m
@@ -1374,7 +1428,7 @@ suites:
             fi
   
             # Install the snapd built
-            dpkg -i "$SPREAD_PATH"/../snapd_*.deb
+            dpkg -i "$GOHOME"/snapd_*.deb
 
             # Configure the ssh connection to the test vm
             remote.setup config --host localhost --port 8022 --user user1 --pass ubuntu
@@ -1395,5 +1449,32 @@ suites:
             #shellcheck source=tests/lib/pkgdb.sh
             . "$TESTSLIB"/pkgdb.sh
             distro_purge_package qemu genisoimage sshpass qemu-kvm cloud-image-utils xz-utils
+
+    # FIPS test suite
+    tests/fips/:
+        summary: FIPS enabled test suite
+        systems:
+          - ubuntu-fips-*
+        environment:
+          # disable reexec so that the tests run with deb
+          SNAP_REEXEC/deb: "0"
+          # but keep it enabled when using the snap
+          SNAP_REEXEC/snap: "1"
+        prepare: |
+            "$TESTSLIB"/prepare-restore.sh --prepare-suite
+        prepare-each: |
+            "$TESTSLIB"/prepare-restore.sh --prepare-suite-each
+            # When snapd.deb is from the repo, we just need to test when re-exec is enabled
+            if [ "$SNAP_REEXEC" = "0" ] && tests.info is-snapd-from-archive; then
+                tests.exec skip-test "When snapd.deb is from the repo, we just need to test when re-exec is enabled" && exit 0
+            fi
+        restore-each: |
+            "$TESTSLIB"/prepare-restore.sh --restore-suite-each
+        restore: |
+            "$TESTSLIB"/prepare-restore.sh --restore-suite
+        debug: |
+            if [ "$SPREAD_DEBUG_EACH" = 1 ]; then
+                systemctl status snapd.socket || true
+            fi
 
 # vim:ts=4:sw=4:et

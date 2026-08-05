@@ -24,11 +24,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/user"
 	"syscall"
 	"time"
 
 	"github.com/snapcore/snapd/osutil/sys"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/testutil"
 )
@@ -72,13 +72,6 @@ func MockSyscallSettimeofday(f func(*syscall.Timeval) error) (restore func()) {
 	return func() {
 		syscallSettimeofday = old
 	}
-}
-
-func MockUserLookup(mock func(name string) (*user.User, error)) func() {
-	realUserLookup := userLookup
-	userLookup = mock
-
-	return func() { userLookup = realUserLookup }
 }
 
 func MockUserCurrent(mock func() (*user.User, error)) func() {
@@ -227,7 +220,7 @@ func MockFindGidNoFallback(mock func(name string) (uint64, error)) (restore func
 	return func() { findGidNoGetentFallback = old }
 }
 
-const MaxSymlinkTries = maxSymlinkTries
+const MaxLinkTries = maxLinkTries
 
 var ParseRawEnvironment = parseRawEnvironment
 
@@ -245,4 +238,8 @@ func ParseRawExpandableEnv(entries []string) (ExpandableEnv, error) {
 		om.Set(key, value)
 	}
 	return ExpandableEnv{OrderedMap: om}, nil
+}
+
+func ReadGoBuildID(fname string) (string, error) {
+	return readGenericBuildID(fname, goElfNote, goHdrType)
 }

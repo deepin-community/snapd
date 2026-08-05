@@ -113,6 +113,11 @@ var u2fDevices = []u2fDevice{
 		ProductIDPattern: "42b2",
 	},
 	{
+		Name:             "Nitrokey Passkey",
+		VendorIDPattern:  "20a0",
+		ProductIDPattern: "42f3",
+	},
+	{
 		Name:             "Google Titan U2F",
 		VendorIDPattern:  "18d1",
 		ProductIDPattern: "5026|9470",
@@ -188,9 +193,14 @@ var u2fDevices = []u2fDevice{
 		ProductIDPattern: "8055",
 	},
 	{
-		Name:             "TrustKey TrustKey G310H",
+		Name:             "TrustKeys FIDO2 U2F",
 		VendorIDPattern:  "311f",
-		ProductIDPattern: "4a2a",
+		ProductIDPattern: "4a2a|a6e9",
+	},
+	{
+		Name:             "OneSpan DIGIPASS FX Series",
+		VendorIDPattern:  "1a44",
+		ProductIDPattern: "1501|1502|1503|1506|1507|1508|1509|150A",
 	},
 }
 

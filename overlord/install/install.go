@@ -38,6 +38,7 @@ import (
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget"
 	"github.com/snapcore/snapd/gadget/device"
+	gadgetInstall "github.com/snapcore/snapd/gadget/install"
 	"github.com/snapcore/snapd/kernel/fde"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
@@ -46,6 +47,7 @@ import (
 	"github.com/snapcore/snapd/secboot/keys"
 	"github.com/snapcore/snapd/seed"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/squashfs"
 	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/sysconfig"
@@ -69,7 +71,7 @@ type EncryptionSupportInfo struct {
 
 	// Type is set to the EncryptionType that can be used if
 	// Available is true.
-	Type secboot.EncryptionType
+	Type device.EncryptionType
 
 	// UnvailableErr is set if the encryption support availability of
 	// the this device and used gadget do not match the
@@ -78,6 +80,35 @@ type EncryptionSupportInfo struct {
 	// UnavailbleWarning describes why encryption support is not
 	// available in case it is optional.
 	UnavailableWarning string
+
+	// PassphraseAuthAvailable is set if the passphrase authentication
+	// is supported.
+	PassphraseAuthAvailable bool
+
+	// PINAuthAvailable is set if the pin authentication is supported.
+	PINAuthAvailable bool
+}
+
+// ComponentSeedInfo contains information for a component from the seed and
+// from its metadata.
+type ComponentSeedInfo struct {
+	Info *snap.ComponentInfo
+	Seed *seed.Component
+}
+
+// KernelBootInfo contains information related to the kernel used on installation.
+type KernelBootInfo struct {
+	KSnapInfo     *gadgetInstall.KernelSnapInfo
+	BootableKMods []boot.BootableKModsComponents
+}
+
+// SystemSnapdVersions describes the snapd versions in a given systems.
+type SystemSnapdVersions struct {
+	// SnapdVersion is the version of snapd in a given system
+	SnapdVersion string
+	// SnapdInitramfsVersion is the version of snapd related component, which participates
+	// in the boot process and performs unlocking. Typically snap-bootstrap in the kernel snap.
+	SnapdInitramfsVersion string
 }
 
 var (
@@ -85,7 +116,53 @@ var (
 
 	secbootCheckTPMKeySealingSupported = secboot.CheckTPMKeySealingSupported
 	sysconfigConfigureTargetSystem     = sysconfig.ConfigureTargetSystem
+
+	bootUseTokens = boot.UseTokens
 )
+
+// BuildKernelBootInfoOpts contains options for BuildKernelBootInfo.
+type BuildKernelBootInfoOpts struct {
+	// IsCore is true for UC, and false for hybrid systems
+	IsCore bool
+	// NeedsDriversTree is true if we need a drivers tree (UC/hybrid 24+)
+	NeedsDriversTree bool
+}
+
+// BuildKernelBootInfo constructs a KernelBootInfo.
+func BuildKernelBootInfo(kernInfo *snap.Info, compSeedInfos []ComponentSeedInfo, kernMntPoint string, mntPtForComps map[string]string, opts BuildKernelBootInfoOpts) KernelBootInfo {
+	bootKMods := make([]boot.BootableKModsComponents, 0, len(compSeedInfos))
+	modulesComps := make([]gadgetInstall.KernelModulesComponentInfo, 0, len(compSeedInfos))
+	for _, compSeedInfo := range compSeedInfos {
+		ci := compSeedInfo.Info
+		if ci.Type == snap.KernelModulesComponent {
+			cpi := snap.MinimalComponentContainerPlaceInfo(ci.Component.ComponentName,
+				ci.Revision, kernInfo.SnapName())
+			modulesComps = append(modulesComps, gadgetInstall.KernelModulesComponentInfo{
+				Name:       ci.Component.ComponentName,
+				Revision:   ci.Revision,
+				MountPoint: mntPtForComps[ci.FullName()],
+			})
+			bootKMods = append(bootKMods, boot.BootableKModsComponents{
+				CompPlaceInfo: cpi,
+				CompPath:      compSeedInfo.Seed.Path,
+			})
+		}
+	}
+
+	kSnapInfo := &gadgetInstall.KernelSnapInfo{
+		Name:             kernInfo.SnapName(),
+		Revision:         kernInfo.Revision,
+		MountPoint:       kernMntPoint,
+		IsCore:           opts.IsCore,
+		ModulesComps:     modulesComps,
+		NeedsDriversTree: opts.NeedsDriversTree,
+	}
+
+	return KernelBootInfo{
+		KSnapInfo:     kSnapInfo,
+		BootableKMods: bootKMods,
+	}
+}
 
 // MockSecbootCheckTPMKeySealingSupported mocks secboot.CheckTPMKeySealingSupported usage by the package for testing.
 func MockSecbootCheckTPMKeySealingSupported(f func(tpmMode secboot.TPMProvisionMode) error) (restore func()) {
@@ -96,11 +173,40 @@ func MockSecbootCheckTPMKeySealingSupported(f func(tpmMode secboot.TPMProvisionM
 	}
 }
 
+func checkPassphraseSupportedByTargetSystem(sysVer *SystemSnapdVersions) (bool, error) {
+	const minSnapdVersion = "2.68"
+	if sysVer == nil {
+		return false, nil
+	}
+	if sysVer.SnapdVersion == "" || sysVer.SnapdInitramfsVersion == "" {
+		return false, nil
+	}
+
+	// snapd snap must support passphrases.
+	cmp, err := strutil.VersionCompare(sysVer.SnapdVersion, minSnapdVersion)
+	if err != nil {
+		return false, fmt.Errorf("invalid snapd version in info file from snapd snap: %v", err)
+	}
+	if cmp < 0 {
+		return false, nil
+	}
+	// snap-bootstrap inside the kernel must support passphrases.
+	cmp, err = strutil.VersionCompare(sysVer.SnapdInitramfsVersion, minSnapdVersion)
+	if err != nil {
+		return false, fmt.Errorf("invalid snapd version in info file from kernel snap: %v", err)
+	}
+	if cmp < 0 {
+		return false, nil
+	}
+
+	return true, nil
+}
+
 // GetEncryptionSupportInfo returns the encryption support information
 // for the given model, TPM provision mode, kernel and gadget information and
 // system hardware. It uses runSetupHook to invoke the kernel fde-setup hook if
 // any is available, leaving the caller to decide how, based on the environment.
-func GetEncryptionSupportInfo(model *asserts.Model, tpmMode secboot.TPMProvisionMode, kernelInfo *snap.Info, gadgetInfo *gadget.Info, runSetupHook fde.RunSetupHookFunc) (EncryptionSupportInfo, error) {
+func GetEncryptionSupportInfo(model *asserts.Model, tpmMode secboot.TPMProvisionMode, kernelInfo *snap.Info, gadgetInfo *gadget.Info, systemSnapdVersions *SystemSnapdVersions, runSetupHook fde.RunSetupHookFunc) (EncryptionSupportInfo, error) {
 	secured := model.Grade() == asserts.ModelSecured
 	dangerous := model.Grade() == asserts.ModelDangerous
 	encrypted := model.StorageSafety() == asserts.StorageSafetyEncrypted
@@ -129,7 +235,7 @@ func GetEncryptionSupportInfo(model *asserts.Model, tpmMode secboot.TPMProvision
 	case checkSecbootEncryption:
 		checkEncryptionErr = secbootCheckTPMKeySealingSupported(tpmMode)
 		if checkEncryptionErr == nil {
-			res.Type = secboot.EncryptionTypeLUKS
+			res.Type = device.EncryptionTypeLUKS
 		}
 	default:
 		return res, fmt.Errorf("internal error: no encryption checked in encryptionSupportInfo")
@@ -154,6 +260,17 @@ func GetEncryptionSupportInfo(model *asserts.Model, tpmMode secboot.TPMProvision
 	// If encryption is available check if the gadget is
 	// compatible with encryption.
 	if res.Available {
+		// Passphrase support is only available for TPM based encryption for now.
+		// Hook based setup support does not make sense (at least for now) because
+		// it is usually in the context of embedded systems where passphrase
+		// authentication is not practical.
+		if checkSecbootEncryption {
+			passphraseAuthAvailable, err := checkPassphraseSupportedByTargetSystem(systemSnapdVersions)
+			if err != nil {
+				return res, fmt.Errorf("cannot check passphrase support: %v", err)
+			}
+			res.PassphraseAuthAvailable = passphraseAuthAvailable
+		}
 		opts := &gadget.ValidationConstraints{
 			EncryptedData: true,
 		}
@@ -164,7 +281,7 @@ func GetEncryptionSupportInfo(model *asserts.Model, tpmMode secboot.TPMProvision
 				res.UnavailableWarning = fmt.Sprintf("cannot use encryption with the gadget, disabling encryption: %v", err)
 			}
 			res.Available = false
-			res.Type = secboot.EncryptionTypeNone
+			res.Type = device.EncryptionTypeNone
 		}
 	}
 
@@ -176,7 +293,7 @@ func hasFDESetupHookInKernel(kernelInfo *snap.Info) bool {
 	return ok
 }
 
-func checkFDEFeatures(runSetupHook fde.RunSetupHookFunc) (et secboot.EncryptionType, err error) {
+func checkFDEFeatures(runSetupHook fde.RunSetupHookFunc) (et device.EncryptionType, err error) {
 	// Run fde-setup hook with "op":"features". If the hook
 	// returns any {"features":[...]} reply we consider the
 	// hardware supported. If the hook errors or if it returns
@@ -187,19 +304,25 @@ func checkFDEFeatures(runSetupHook fde.RunSetupHookFunc) (et secboot.EncryptionT
 	}
 	switch {
 	case strutil.ListContains(features, "inline-crypto-engine"):
-		et = secboot.EncryptionTypeLUKSWithICE
+		et = device.EncryptionTypeLUKSWithICE
 	default:
-		et = secboot.EncryptionTypeLUKS
+		et = device.EncryptionTypeLUKS
 	}
 
 	return et, nil
 }
 
 // CheckEncryptionSupport checks the type of encryption support for disks
-// available if any and returns the corresponding secboot.EncryptionType,
+// available if any and returns the corresponding device.EncryptionType,
 // internally it uses GetEncryptionSupportInfo with the provided parameters.
-func CheckEncryptionSupport(model *asserts.Model, tpmMode secboot.TPMProvisionMode, kernelInfo *snap.Info, gadgetInfo *gadget.Info, runSetupHook fde.RunSetupHookFunc) (secboot.EncryptionType, error) {
-	res, err := GetEncryptionSupportInfo(model, tpmMode, kernelInfo, gadgetInfo, runSetupHook)
+func CheckEncryptionSupport(
+	model *asserts.Model,
+	tpmMode secboot.TPMProvisionMode,
+	kernelInfo *snap.Info,
+	gadgetInfo *gadget.Info,
+	runSetupHook fde.RunSetupHookFunc,
+) (device.EncryptionType, error) {
+	res, err := GetEncryptionSupportInfo(model, tpmMode, kernelInfo, gadgetInfo, nil, runSetupHook)
 	if err != nil {
 		return "", err
 	}
@@ -208,7 +331,7 @@ func CheckEncryptionSupport(model *asserts.Model, tpmMode secboot.TPMProvisionMo
 	}
 	// encryption disabled or preferred unencrypted: follow the model preferences here even if encryption would be available
 	if res.Disabled || res.StorageSafety == asserts.StorageSafetyPreferUnencrypted {
-		res.Type = secboot.EncryptionTypeNone
+		res.Type = device.EncryptionTypeNone
 	}
 
 	return res.Type, res.UnavailableErr
@@ -244,24 +367,70 @@ func BuildInstallObserver(model *asserts.Model, gadgetDir string, useEncryption 
 // * save keys and markers for ubuntu-data being able to safely open ubuntu-save
 // It is the responsibility of the caller to call
 // ObserveExistingTrustedRecoveryAssets on trustedInstallObserver.
-func PrepareEncryptedSystemData(model *asserts.Model, keyForRole map[string]keys.EncryptionKey, trustedInstallObserver boot.TrustedAssetsInstallObserver) error {
+func PrepareEncryptedSystemData(
+	model *asserts.Model, installKeyForRole map[string]secboot.BootstrappedContainer,
+	volumesAuth *device.VolumesAuthOptions, trustedInstallObserver boot.TrustedAssetsInstallObserver,
+) error {
 	// validity check
-	if len(keyForRole) == 0 || keyForRole[gadget.SystemData] == nil || keyForRole[gadget.SystemSave] == nil {
+	if len(installKeyForRole) == 0 || installKeyForRole[gadget.SystemData] == nil || installKeyForRole[gadget.SystemSave] == nil {
 		return fmt.Errorf("internal error: system encryption keys are unset")
 	}
-	dataEncryptionKey := keyForRole[gadget.SystemData]
-	saveEncryptionKey := keyForRole[gadget.SystemSave]
+	dataBootstrappedContainer := installKeyForRole[gadget.SystemData]
+	saveBootstrappedContainer := installKeyForRole[gadget.SystemSave]
 
-	// make note of the encryption keys
-	trustedInstallObserver.ChosenEncryptionKeys(dataEncryptionKey, saveEncryptionKey)
+	var primaryKey []byte
 
-	if err := saveKeys(model, keyForRole); err != nil {
-		return err
+	if saveBootstrappedContainer != nil {
+		if bootUseTokens(model) {
+			protectorKey, err := keys.NewProtectorKey()
+			if err != nil {
+				return err
+			}
+
+			plainKey, generatedPK, diskKey, err := protectorKey.CreateProtectedKey(nil)
+			if err != nil {
+				return err
+			}
+
+			if err := saveBootstrappedContainer.AddKey("default", diskKey); err != nil {
+				return err
+			}
+			tokenWriter, err := saveBootstrappedContainer.GetTokenWriter("default")
+			if err != nil {
+				return err
+			}
+			if err := plainKey.Write(tokenWriter); err != nil {
+				return err
+			}
+
+			if err := saveKeys(model, protectorKey); err != nil {
+				return err
+			}
+
+			primaryKey = generatedPK
+		} else {
+			saveKey, err := keys.NewEncryptionKey()
+			if err != nil {
+				return err
+			}
+
+			if err := saveBootstrappedContainer.AddKey("default", saveKey); err != nil {
+				return err
+			}
+
+			if err := saveLegacyKeys(model, saveKey); err != nil {
+				return err
+			}
+		}
 	}
 	// write markers containing a secret to pair data and save
 	if err := writeMarkers(model); err != nil {
 		return err
 	}
+
+	// make note of the encryption keys and auth options
+	trustedInstallObserver.SetEncryptionParams(dataBootstrappedContainer, saveBootstrappedContainer, primaryKey, volumesAuth)
+
 	return nil
 }
 
@@ -284,20 +453,24 @@ func writeMarkers(model *asserts.Model) error {
 	return device.WriteEncryptionMarkers(boot.InstallHostFDEDataDir(model), boot.InstallHostFDESaveDir, markerSecret)
 }
 
-func saveKeys(model *asserts.Model, keyForRole map[string]keys.EncryptionKey) error {
-	saveEncryptionKey := keyForRole[gadget.SystemSave]
-	if saveEncryptionKey == nil {
-		// no system-save support
-		return nil
-	}
-	// ensure directory for keys exists
-	if err := os.MkdirAll(boot.InstallHostFDEDataDir(model), 0755); err != nil {
+func saveKeys(model *asserts.Model, saveKey keys.ProtectorKey) error {
+	saveKeyPath := device.SaveKeyUnder(boot.InstallHostFDEDataDir(model))
+
+	if err := os.MkdirAll(filepath.Dir(saveKeyPath), 0755); err != nil {
 		return err
 	}
-	if err := saveEncryptionKey.Save(device.SaveKeyUnder(boot.InstallHostFDEDataDir(model))); err != nil {
-		return fmt.Errorf("cannot store system save key: %v", err)
+
+	return saveKey.SaveToFile(saveKeyPath)
+}
+
+func saveLegacyKeys(model *asserts.Model, saveKey keys.EncryptionKey) error {
+	saveKeyPath := device.SaveKeyUnder(boot.InstallHostFDEDataDir(model))
+
+	if err := os.MkdirAll(filepath.Dir(saveKeyPath), 0755); err != nil {
+		return err
 	}
-	return nil
+
+	return saveKey.Save(saveKeyPath)
 }
 
 // PrepareRunSystemData prepares the run system:
@@ -440,6 +613,47 @@ func writeTimesyncdClock(srcRootDir, dstRootDir string) error {
 	return nil
 }
 
+func comparePreseedAndSeedSnaps(seedSnap *seed.Snap, preseedSnap *asserts.PreseedSnap) error {
+	if preseedSnap.Revision != seedSnap.SideInfo.Revision.N {
+		rev := snap.Revision{N: preseedSnap.Revision}
+		return fmt.Errorf("snap %q has wrong revision %s (expected: %s)", seedSnap.SnapName(), seedSnap.SideInfo.Revision, rev)
+	}
+	if preseedSnap.SnapID != seedSnap.SideInfo.SnapID {
+		return fmt.Errorf("snap %q has wrong snap id %q (expected: %q)", seedSnap.SnapName(), seedSnap.SideInfo.SnapID, preseedSnap.SnapID)
+	}
+
+	expectedComps := make(map[string]asserts.PreseedComponent, len(preseedSnap.Components))
+	for _, c := range preseedSnap.Components {
+		expectedComps[c.Name] = c
+	}
+
+	for _, c := range seedSnap.Components {
+		preseedComp, ok := expectedComps[c.CompSideInfo.Component.ComponentName]
+		if !ok {
+			return fmt.Errorf("component %q not present in the preseed assertion", c.CompSideInfo.Component)
+		}
+
+		if preseedComp.Revision != c.CompSideInfo.Revision.N {
+			rev := snap.Revision{N: preseedComp.Revision}
+			return fmt.Errorf("component %q has wrong revision %s (expected: %s)", c.CompSideInfo.Component, c.CompSideInfo.Revision, rev)
+		}
+
+		// once we've seen the component, remove it from the expected
+		// components. anything left over is missing from the seed.
+		delete(expectedComps, c.CompSideInfo.Component.ComponentName)
+	}
+
+	if len(expectedComps) != 0 {
+		missing := make([]string, 0, len(expectedComps))
+		for name := range expectedComps {
+			missing = append(missing, naming.NewComponentRef(seedSnap.SnapName(), name).String())
+		}
+		return fmt.Errorf("seed is missing components expected by preseed assertion: %s", strutil.Quoted(missing))
+	}
+
+	return nil
+}
+
 // ApplyPreseededData applies the preseed payload from the given seed, including
 // installing snaps, to the given target system filesystem.
 func ApplyPreseededData(preseedSeed seed.PreseedCapable, writableDir string) error {
@@ -492,14 +706,7 @@ func ApplyPreseededData(preseedSeed seed.PreseedCapable, writableDir string) err
 		if !ok {
 			return fmt.Errorf("snap %q not present in the preseed assertion", ssnap.SnapName())
 		}
-		if ps.Revision != ssnap.SideInfo.Revision.N {
-			rev := snap.Revision{N: ps.Revision}
-			return fmt.Errorf("snap %q has wrong revision %s (expected: %s)", ssnap.SnapName(), ssnap.SideInfo.Revision, rev)
-		}
-		if ps.SnapID != ssnap.SideInfo.SnapID {
-			return fmt.Errorf("snap %q has wrong snap id %q (expected: %q)", ssnap.SnapName(), ssnap.SideInfo.SnapID, ps.SnapID)
-		}
-		return nil
+		return comparePreseedAndSeedSnaps(ssnap, ps)
 	}
 
 	esnaps := preseedSeed.EssentialSnaps()

@@ -91,12 +91,12 @@ base: core20
 version: 1.0
 components:
   comp1:
-    type: test
+    type: standard
   comp2:
-    type: test
+    type: standard
 `,
 	"required20+comp1": `component: required20+comp1
-type: test
+type: standard
 version: 1.0
 `,
 	"required20+comp1_kernel": `component: required20+comp1
@@ -104,12 +104,56 @@ type: kernel-modules
 version: 1.0
 `,
 	"required20+comp2": `component: required20+comp2
-type: test
+type: standard
 version: 2.0
 `,
 	"required20+unknown": `component: required20+unknown
-type: test
+type: standard
 version: 2.0
+`,
+	"aux-info-test": `name: aux-info-test
+type: app
+base: core20
+version: 1.0
+links:
+  contact:
+    - mailto:author@example.com
+`,
+	"component-test": `name: component-test
+type: app
+base: core20
+version: 1.0
+components:
+  comp1:
+    type: standard
+  comp2:
+    type: standard
+  comp3:
+    type: standard
+`,
+	"component-test+comp1": `component: component-test+comp1
+type: standard
+version: 1.0
+`,
+	"component-test+comp2": `component: component-test+comp2
+type: standard
+version: 2.0
+`,
+	"component-test+comp3": `component: component-test+comp3
+type: standard
+version: 2.0
+`,
+	"local-component-test": `name: local-component-test
+type: app
+base: core20
+version: 1.0
+components:
+  comp4:
+    type: standard
+`,
+	"local-component-test+comp4": `component: local-component-test+comp4
+type: standard
+version: 1.0
 `,
 	"optional20-a": `name: optional20-a
 type: app
@@ -139,13 +183,82 @@ confinement: devmode
 type: base
 version: 1.0
 `,
+	"core24": `name: core24
+type: base
+version: 1.0
+`,
 	"pc-kernel=22": `name: pc-kernel
 type: kernel
+version: 1.0
+`,
+	"pc-kernel=24": `name: pc-kernel
+type: kernel
+version: 1.0
+`,
+	"pc-kernel=22+kmods": `name: pc-kernel
+type: kernel
+version: 1.0
+components:
+  kcomp1:
+    type: kernel-modules
+  kcomp2:
+    type: kernel-modules
+`,
+	"pc-kernel=24+kmods": `name: pc-kernel
+type: kernel
+version: 1.0
+components:
+  kcomp1:
+    type: kernel-modules
+  kcomp2:
+    type: kernel-modules
+  kcomp3:
+    type: kernel-modules
+`,
+	"pc-kernel+kcomp1": `component: pc-kernel+kcomp1
+type: kernel-modules
+version: 1.0
+`,
+	"pc-kernel+kcomp2": `component: pc-kernel+kcomp2
+type: kernel-modules
+version: 1.0
+`,
+	"pc-kernel+kcomp3": `component: pc-kernel+kcomp3
+type: kernel-modules
 version: 1.0
 `,
 	"pc=22": `name: pc
 type: gadget
 base: core22
+version: 1.0
+`,
+	"pc=24": `name: pc
+type: gadget
+base: core24
+version: 1.0
+`,
+	"optional22": `name: optional22
+type: app
+base: core22
+version: 1.0
+components:
+  comp1:
+    type: standard
+`,
+	"optional22+comp1": `component: optional22+comp1
+type: standard
+version: 1.0
+`,
+	"optional24": `name: optional24
+type: app
+base: core24
+version: 1.0
+components:
+  comp1:
+    type: standard
+`,
+	"optional24+comp1": `component: optional24+comp1
+type: standard
 version: 1.0
 `,
 }

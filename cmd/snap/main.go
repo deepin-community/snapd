@@ -76,7 +76,7 @@ type argDesc struct {
 
 var optionsData options
 
-// ErrExtraArgs is returned  if extra arguments to a command are found
+// ErrExtraArgs is returned if extra arguments to a command are found
 var ErrExtraArgs = errors.New(i18n.G("too many arguments for command"))
 
 // cmdInfo holds information needed to call parser.AddCommand(...).
@@ -366,6 +366,7 @@ func Parser(cli *client.Client) *flags.Parser {
 }
 
 var isStdinTTY = terminal.IsTerminal(0)
+var isStdoutTTY = terminal.IsTerminal(1)
 
 // ClientConfig is the configuration of the Client used by all commands.
 var ClientConfig = client.Config{
@@ -444,7 +445,7 @@ func main() {
 	snapdtool.ExecInSnapdOrCoreSnap()
 
 	if err := snapdtool.MaybeSetupFIPS(); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot check or enable FIPS mode: %v", err)
+		fmt.Fprintf(os.Stderr, "cannot check or enable FIPS mode: %v\n", err)
 		os.Exit(1)
 	}
 

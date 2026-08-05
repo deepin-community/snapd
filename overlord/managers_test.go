@@ -24,6 +24,7 @@ package overlord_test
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,7 +33,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"os/user"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -67,6 +67,7 @@ import (
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/disks"
 	"github.com/snapcore/snapd/osutil/kcmdline"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/overlord"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/assertstate/assertstatetest"
@@ -74,6 +75,8 @@ import (
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/devicestate/devicestatetest"
+	"github.com/snapcore/snapd/overlord/fdestate"
+	fdeBackend "github.com/snapcore/snapd/overlord/fdestate/backend"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/hookstate/ctlcmd"
 	"github.com/snapcore/snapd/overlord/ifacestate"
@@ -465,9 +468,22 @@ func (s *baseMgrsSuite) SetUpTest(c *C) {
 		},
 	})
 
+	// add snapd itself
+	snapstate.Set(st, "snapd", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "snapd", SnapID: fakeSnapID("snapd"), Revision: snap.R(1)},
+		}),
+		Current:  snap.R(1),
+		SnapType: "snapd",
+		Flags: snapstate.Flags{
+			Required: true,
+		},
+	})
+
 	// commonly used core and snapd revisions in tests
 	defaultInfoFile := `
-VERSION=2.54.3+git1.g479e745-dirty
+VERSION=2.54.3+g1.479e745-dirty
 SNAPD_APPARMOR_REEXEC=1
 `
 	for _, snapName := range []string{"snapd", "core"} {
@@ -575,6 +591,13 @@ func (s *mgrsSuiteCore) SetUpTest(c *C) {
 	// it panicking.
 	restore := release.MockOnClassic(false)
 	s.baseMgrsSuite.SetUpTest(c)
+
+	// remove snapd snap added for baseMgrsSuite
+	st := s.o.State()
+	st.Lock()
+	snapstate.Set(st, "snapd", nil)
+	st.Unlock()
+
 	s.AddCleanup(restore)
 }
 
@@ -712,8 +735,10 @@ hooks:
 	// nothing in snaps
 	all, err := snapstate.All(st)
 	c.Assert(err, IsNil)
-	c.Check(all, HasLen, 1)
+	c.Check(all, HasLen, 2)
 	_, ok := all["core"]
+	c.Check(ok, Equals, true)
+	_, ok = all["snapd"]
 	c.Check(ok, Equals, true)
 
 	// nothing in config
@@ -5148,7 +5173,7 @@ func (s *mgrsSuiteCore) TestRemodelRequiredSnapsAdded(c *C) {
 		"revision":       "1",
 	})
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	c.Check(devicestate.RemodelingChange(st), NotNil)
@@ -5257,7 +5282,7 @@ func (s *mgrsSuiteCore) TestRemodelRequiredSnapsAddedUndo(c *C) {
 	devicestate.InjectSetModelError(fmt.Errorf("boom"))
 	defer devicestate.InjectSetModelError(nil)
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -5324,7 +5349,7 @@ type: base`
 		"revision": "1",
 	})
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, ErrorMatches, "cannot remodel from core to bases yet")
 	c.Assert(chg, IsNil)
 }
@@ -5431,7 +5456,7 @@ version: 20.04`
 		"required-snaps": []interface{}{"foo"},
 	})
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -5603,7 +5628,7 @@ version: 20.04`
 	devicestate.InjectSetModelError(fmt.Errorf("boom"))
 	defer devicestate.InjectSetModelError(nil)
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -5764,7 +5789,7 @@ version: 20.04`
 		"required-snaps": []interface{}{"foo"},
 	})
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -6061,6 +6086,9 @@ func (s *kernelSuite) SetUpTest(c *C) {
 	st.Lock()
 	defer st.Unlock()
 
+	// remove snapd snap added for baseMgrsSuite
+	snapstate.Set(st, "snapd", nil)
+
 	// create/set custom model assertion
 	model := s.brands.Model("can0nical", "my-model", modelDefaults)
 	devicestatetest.SetDevice(st, &auth.DeviceState{
@@ -6136,7 +6164,7 @@ func (s *kernelSuite) TestRemodelSwitchKernelTrack(c *C) {
 		"required-snaps": []interface{}{"foo"},
 	})
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -6190,7 +6218,7 @@ func (ms *kernelSuite) TestRemodelSwitchToDifferentKernel(c *C) {
 		"required-snaps": []interface{}{"foo"},
 	})
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -6282,7 +6310,7 @@ func (ms *kernelSuite) TestRemodelSwitchToDifferentKernelUndo(c *C) {
 	devicestate.InjectSetModelError(fmt.Errorf("boom"))
 	defer devicestate.InjectSetModelError(nil)
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -6340,7 +6368,7 @@ func (ms *kernelSuite) TestRemodelSwitchToDifferentKernelUndoOnRollback(c *C) {
 	devicestate.InjectSetModelError(fmt.Errorf("boom"))
 	defer devicestate.InjectSetModelError(nil)
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -6462,7 +6490,7 @@ func (s *mgrsSuiteCore) TestRemodelStoreSwitch(c *C) {
 	s.expectedStore = "switched-store"
 	s.sessionMacaroon = "switched-store-session"
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -6568,15 +6596,15 @@ volumes:
 		"revision": "1",
 	})
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{"volume-id": {0: {}}},
 			map[string]map[int]*gadget.OnDiskStructure{
-				"volume-id": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["volume-id"]),
+				"volume-id": gadget.OnDiskStructsFromGadget(oldVolumes["volume-id"]),
 			}, nil
 	})
 	defer r()
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -6699,7 +6727,7 @@ volumes:
 	})
 	s.serveSnap(snapPath, "2")
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
 				"volume-id": {
 					0: {
@@ -6709,7 +6737,7 @@ volumes:
 				},
 			},
 			map[string]map[int]*gadget.OnDiskStructure{
-				"volume-id": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["volume-id"]),
+				"volume-id": gadget.OnDiskStructsFromGadget(oldVolumes["volume-id"]),
 			},
 			nil
 	})
@@ -6744,7 +6772,7 @@ volumes:
 		"revision": "1",
 	})
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -6879,7 +6907,7 @@ volumes:
 		"revision": "1",
 	})
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -7120,7 +7148,7 @@ func (s *mgrsSuiteCore) TestRemodelReregistration(c *C) {
 	s.expectedStore = "my-brand-substore"
 	s.sessionMacaroon = "other-store-session"
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	st.Unlock()
@@ -7426,6 +7454,39 @@ func (s *mgrsSuiteCore) testRemodelUC20WithRecoverySystem(c *C, encrypted bool) 
 	mockServer := s.mockStore(c)
 	defer mockServer.Close()
 
+	restore = fdeBackend.MockSecbootBuildPCRProtectionProfile(func(modelParams []*secboot.SealKeyModelParams) (secboot.SerializedPCRProfile, error) {
+		return []byte(`"some-profile"`), nil
+	})
+	defer restore()
+
+	restore = fdestate.MockDMCryptUUIDFromMountPoint(func(mountpoint string) (string, error) {
+		switch mountpoint {
+		case filepath.Join(dirs.GlobalRootDir, "writable"):
+			return "root-uuid", nil
+		case dirs.GlobalRootDir:
+			return "root-uuid", nil
+		case dirs.SnapSaveDir:
+			return "save-uuid", nil
+		}
+		panic(fmt.Sprintf("unexpected mount point: %s", mountpoint))
+	})
+	defer restore()
+
+	restore = fdestate.MockGetPrimaryKeyDigest(func(devicePath string, alg crypto.Hash) ([]byte, []byte, error) {
+		return []byte("aaaa"), []byte("bbbb"), nil
+	})
+	defer restore()
+
+	restore = fdestate.MockVerifyPrimaryKeyDigest(func(devicePath string, alg crypto.Hash, salt []byte, digest []byte) (bool, error) {
+		return true, nil
+	})
+	defer restore()
+
+	restore = fdestate.MockSecbootGetPCRHandle(func(devicePath, keySlot, keyFile string) (uint32, error) {
+		return 0x1880005, nil
+	})
+	defer restore()
+
 	st := s.o.State()
 	st.Lock()
 	defer st.Unlock()
@@ -7483,7 +7544,7 @@ func (s *mgrsSuiteCore) testRemodelUC20WithRecoverySystem(c *C, encrypted bool) 
 		{Path: coreInfo.MountFile()},
 		{Path: snapdInfo.MountFile()},
 		{Path: bazInfo.MountFile()},
-	})
+	}, nil)
 
 	// create a new model
 	newModel := s.brands.Model("can0nical", "my-model", uc20ModelDefaults, map[string]interface{}{
@@ -7563,7 +7624,7 @@ func (s *mgrsSuiteCore) testRemodelUC20WithRecoverySystem(c *C, encrypted bool) 
 	c.Assert(err, IsNil)
 
 	secbootResealCalls := 0
-	restore = boot.MockSecbootResealKeys(func(params *secboot.ResealKeysParams) error {
+	restore = fdeBackend.MockSecbootResealKeys(func(params *secboot.ResealKeysParams) error {
 		secbootResealCalls++
 		if !encrypted {
 			return fmt.Errorf("unexpected call")
@@ -7572,7 +7633,25 @@ func (s *mgrsSuiteCore) testRemodelUC20WithRecoverySystem(c *C, encrypted bool) 
 	})
 	defer restore()
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	// make sure FDE is initialized
+	fdemgr := s.o.FDEManager()
+	c.Assert(fdemgr, NotNil)
+	c.Assert(fdemgr.ReloadModeenv(), IsNil)
+	func() {
+		st.Unlock()
+		defer st.Lock()
+		err = fdemgr.StartUp()
+	}()
+	c.Assert(err, IsNil)
+
+	if encrypted {
+		// FDE state should have been initialized when the system uses encryption
+		var fdeState map[string]any
+		c.Assert(st.Get("fde", &fdeState), IsNil)
+		c.Check(fdeState, NotNil)
+	}
+
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 
 	c.Check(devicestate.RemodelingChange(st), NotNil)
@@ -7582,7 +7661,7 @@ func (s *mgrsSuiteCore) testRemodelUC20WithRecoverySystem(c *C, encrypted bool) 
 	st.Lock()
 	c.Assert(err, IsNil, Commentf(s.logbuf.String()))
 
-	dumpTasks(c, "after setteling", chg.Tasks())
+	dumpTasks(c, "after settling", chg.Tasks())
 
 	c.Check(chg.Status(), Equals, state.WaitStatus, Commentf("remodel change failed: %v", chg.Err()))
 	c.Check(devicestate.RemodelingChange(st), NotNil)
@@ -7779,6 +7858,9 @@ func (s *mgrsSuiteCore) testRemodelUC20WithRecoverySystem(c *C, encrypted bool) 
 }
 
 func (s *mgrsSuiteCore) TestRemodelUC20WithRecoverySystemEncrypted(c *C) {
+	if !secboot.WithSecbootSupport {
+		c.Skip("secboot is not available")
+	}
 	const encrypted bool = true
 	s.testRemodelUC20WithRecoverySystem(c, encrypted)
 }
@@ -7876,7 +7958,7 @@ func (s *mgrsSuiteCore) testRemodelUC20WithRecoverySystemSimpleSetUp(c *C, model
 		{Path: pcKernelInfo.MountFile()},
 		{Path: coreInfo.MountFile()},
 		{Path: snapdInfo.MountFile()},
-	})
+	}, nil)
 
 	// mock the modeenv file
 	m := &boot.Modeenv{
@@ -7910,11 +7992,6 @@ func (s *mgrsSuiteCore) testRemodelUC20WithRecoverySystemSimpleSetUp(c *C, model
 		"snap_kernel": "pc-kernel_2.snap",
 	})
 	c.Assert(err, IsNil)
-
-	restore = boot.MockSecbootResealKeys(func(params *secboot.ResealKeysParams) error {
-		return fmt.Errorf("unexpected call")
-	})
-	s.AddCleanup(restore)
 }
 
 func (s *mgrsSuiteCore) TestRemodelUC20DifferentKernelChannel(c *C) {
@@ -7953,15 +8030,15 @@ func (s *mgrsSuiteCore) TestRemodelUC20DifferentKernelChannel(c *C) {
 	now := time.Now()
 	expectedLabel := now.Format("20060102")
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{"pc": {}},
 			map[string]map[int]*gadget.OnDiskStructure{
-				"pc": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"pc": gadget.OnDiskStructsFromGadget(oldVolumes["pc"]),
 			}, nil
 	})
 	defer r()
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 	st.Unlock()
 	err = s.o.Settle(settleTimeout)
@@ -8093,7 +8170,7 @@ func (s *mgrsSuiteCore) TestRemodelUC20DifferentGadgetChannel(c *C) {
 	now := time.Now()
 	expectedLabel := now.Format("20060102")
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
 				"pc": {
 					0: {
@@ -8108,7 +8185,7 @@ func (s *mgrsSuiteCore) TestRemodelUC20DifferentGadgetChannel(c *C) {
 				},
 			},
 			map[string]map[int]*gadget.OnDiskStructure{
-				"pc": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"pc": gadget.OnDiskStructsFromGadget(oldVolumes["pc"]),
 			}, nil
 	})
 	defer r()
@@ -8121,7 +8198,7 @@ func (s *mgrsSuiteCore) TestRemodelUC20DifferentGadgetChannel(c *C) {
 	})
 	defer restore()
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 	st.Unlock()
 	err = s.o.Settle(settleTimeout)
@@ -8245,7 +8322,7 @@ func (s *mgrsSuiteCore) TestRemodelUC20DifferentBaseChannel(c *C) {
 	now := time.Now()
 	expectedLabel := now.Format("20060102")
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 	st.Unlock()
 	err = s.o.Settle(settleTimeout)
@@ -8386,7 +8463,7 @@ func (s *mgrsSuiteCore) TestRemodelUC20BackToPreviousGadget(c *C) {
 	now := time.Now()
 	expectedLabel := now.Format("20060102")
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
 				"pc": {
 					0: {
@@ -8400,7 +8477,7 @@ func (s *mgrsSuiteCore) TestRemodelUC20BackToPreviousGadget(c *C) {
 					},
 				},
 			}, map[string]map[int]*gadget.OnDiskStructure{
-				"pc": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"pc": gadget.OnDiskStructsFromGadget(oldVolumes["pc"]),
 			}, nil
 	})
 	defer r()
@@ -8412,7 +8489,7 @@ func (s *mgrsSuiteCore) TestRemodelUC20BackToPreviousGadget(c *C) {
 	})
 	defer restore()
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 	st.Unlock()
 	err = s.o.Settle(settleTimeout)
@@ -8574,7 +8651,7 @@ func (s *mgrsSuiteCore) TestRemodelUC20ExistingGadgetSnapDifferentChannel(c *C) 
 	now := time.Now()
 	expectedLabel := now.Format("20060102")
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
 				"pc": {
 					0: {
@@ -8588,7 +8665,7 @@ func (s *mgrsSuiteCore) TestRemodelUC20ExistingGadgetSnapDifferentChannel(c *C) 
 					},
 				},
 			}, map[string]map[int]*gadget.OnDiskStructure{
-				"pc": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"pc": gadget.OnDiskStructsFromGadget(oldVolumes["pc"]),
 			}, nil
 	})
 	defer r()
@@ -8600,7 +8677,7 @@ func (s *mgrsSuiteCore) TestRemodelUC20ExistingGadgetSnapDifferentChannel(c *C) 
 	})
 	defer restore()
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 	st.Unlock()
 	err = s.o.Settle(settleTimeout)
@@ -8776,7 +8853,7 @@ func (s *mgrsSuiteCore) TestRemodelUC20SnapWithPrereqsMissingDeps(c *C) {
 		},
 	})
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 
 	msg := `cannot remodel to model that is not self contained:
   - cannot use snap "prereq": base "prereq-base" is missing
@@ -9054,7 +9131,7 @@ func (s *mgrsSuiteCore) TestRemodelRollbackValidationSets(c *C) {
 	bl, err := bootloader.Find(boot.InitramfsUbuntuSeedDir, &bootloader.Options{Role: bootloader.RoleRecovery})
 	c.Assert(err, IsNil)
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
 				"pc": {
 					0: {
@@ -9068,7 +9145,7 @@ func (s *mgrsSuiteCore) TestRemodelRollbackValidationSets(c *C) {
 					},
 				},
 			}, map[string]map[int]*gadget.OnDiskStructure{
-				"pc": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"pc": gadget.OnDiskStructsFromGadget(oldVolumes["pc"]),
 			}, nil
 	})
 	defer r()
@@ -9085,7 +9162,7 @@ func (s *mgrsSuiteCore) TestRemodelRollbackValidationSets(c *C) {
 	now := time.Now()
 	expectedLabel := now.Format("20060102")
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 	dumpTasks(c, "at the beginning", chg.Tasks())
 
@@ -9514,7 +9591,7 @@ func (s *mgrsSuiteCore) TestRemodelReplaceValidationSets(c *C) {
 	bl, err := bootloader.Find(boot.InitramfsUbuntuSeedDir, &bootloader.Options{Role: bootloader.RoleRecovery})
 	c.Assert(err, IsNil)
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
 				"pc": {
 					0: {
@@ -9528,7 +9605,7 @@ func (s *mgrsSuiteCore) TestRemodelReplaceValidationSets(c *C) {
 					},
 				},
 			}, map[string]map[int]*gadget.OnDiskStructure{
-				"pc": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"pc": gadget.OnDiskStructsFromGadget(oldVolumes["pc"]),
 			}, nil
 	})
 	defer r()
@@ -9545,7 +9622,7 @@ func (s *mgrsSuiteCore) TestRemodelReplaceValidationSets(c *C) {
 	now := time.Now()
 	expectedLabel := now.Format("20060102")
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 	dumpTasks(c, "at the beginning", chg.Tasks())
 
@@ -9822,7 +9899,7 @@ func (s *mgrsSuiteCore) testRemodelUC20ToUC22(c *C, mockSnapdRefresh bool) {
 	bl, err := bootloader.Find(boot.InitramfsUbuntuSeedDir, &bootloader.Options{Role: bootloader.RoleRecovery})
 	c.Assert(err, IsNil)
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
 				"pc": {
 					0: {
@@ -9836,7 +9913,7 @@ func (s *mgrsSuiteCore) testRemodelUC20ToUC22(c *C, mockSnapdRefresh bool) {
 					},
 				},
 			}, map[string]map[int]*gadget.OnDiskStructure{
-				"pc": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"pc": gadget.OnDiskStructsFromGadget(oldVolumes["pc"]),
 			}, nil
 	})
 	defer r()
@@ -9853,7 +9930,7 @@ func (s *mgrsSuiteCore) testRemodelUC20ToUC22(c *C, mockSnapdRefresh bool) {
 	now := time.Now()
 	expectedLabel := now.Format("20060102")
 
-	chg, err := devicestate.Remodel(st, newModel, nil, nil, devicestate.RemodelOptions{})
+	chg, err := devicestate.Remodel(st, newModel, devicestate.RemodelOptions{})
 	c.Assert(err, IsNil)
 	dumpTasks(c, "at the beginning", chg.Tasks())
 
@@ -11174,10 +11251,10 @@ func (s *mgrsSuiteCore) testGadgetKernelCommandLine(c *C, gadgetPath string, gad
 	err = assertstate.Add(st, model)
 	c.Assert(err, IsNil)
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{"pc": {}},
 			map[string]map[int]*gadget.OnDiskStructure{
-				"pc": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"pc": gadget.OnDiskStructsFromGadget(oldVolumes["pc"]),
 			},
 			nil
 	})
@@ -11762,7 +11839,7 @@ func (s *mgrsSuiteCore) testUpdateKernelBaseSingleRebootWithGadgetSetup(c *C, sn
 	})
 	s.serveSnap(p, "2")
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
 				"pc": {
 					0: {
@@ -11776,7 +11853,7 @@ func (s *mgrsSuiteCore) testUpdateKernelBaseSingleRebootWithGadgetSetup(c *C, sn
 					},
 				},
 			}, map[string]map[int]*gadget.OnDiskStructure{
-				"pc": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"pc": gadget.OnDiskStructsFromGadget(oldVolumes["pc"]),
 			}, nil
 	})
 	defer r()
@@ -12044,9 +12121,15 @@ func rearrangeBaseKernelForCyclicDependency(st *state.State, tss []*state.TaskSe
 	//                    remaining tasks of base and kernel
 	//
 	// where (r) denotes the task that can effectively request a reboot
+	maybeFirst := func(tasks []*state.Task) *state.Task {
+		if len(tasks) != 0 {
+			return tasks[0]
+		}
+		return nil
+	}
 
-	beforeLinkSnapKernel := kernelTs.MaybeEdge(snapstate.BeforeMaybeRebootEdge)
 	linkSnapKernel := kernelTs.MaybeEdge(snapstate.MaybeRebootEdge)
+	beforeLinkSnapKernel := maybeFirst(linkSnapKernel.WaitTasks())
 	autoConnectKernel := kernelTs.MaybeEdge(snapstate.MaybeRebootWaitEdge)
 
 	if linkSnapKernel == nil || autoConnectKernel == nil || beforeLinkSnapKernel == nil {
@@ -12056,7 +12139,7 @@ func rearrangeBaseKernelForCyclicDependency(st *state.State, tss []*state.TaskSe
 
 	linkSnapBase := baseTs.MaybeEdge(snapstate.MaybeRebootEdge)
 	autoConnectBase := baseTs.MaybeEdge(snapstate.MaybeRebootWaitEdge)
-	afterAutoConnectBase := baseTs.MaybeEdge(snapstate.AfterMaybeRebootWaitEdge)
+	afterAutoConnectBase := maybeFirst(autoConnectBase.HaltTasks())
 	if linkSnapBase == nil || autoConnectBase == nil || afterAutoConnectBase == nil {
 		return fmt.Errorf("internal error: cannot identify link-snap or auto-connect or the following task for the base snap")
 	}
@@ -13386,7 +13469,7 @@ func (ms *gadgetUpdatesSuite) TestGadgetWithKernelRefUpgradeFromOldErrorKernel(c
 	structureName := "ubuntu-seed"
 	structureMountDir := filepath.Join(dirs.GlobalRootDir, "/run/mnt/", structureName)
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
 				"volume-id": {
 					0: {
@@ -13397,7 +13480,7 @@ func (ms *gadgetUpdatesSuite) TestGadgetWithKernelRefUpgradeFromOldErrorKernel(c
 					},
 				},
 			}, map[string]map[int]*gadget.OnDiskStructure{
-				"volume-id": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["volume-id"]),
+				"volume-id": gadget.OnDiskStructsFromGadget(oldVolumes["volume-id"]),
 			}, nil
 	})
 	defer r()
@@ -13605,9 +13688,9 @@ volumes:
 		{"meta/gadget.yaml", gadgetYaml},
 	})
 
-	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.Model, oldVolumes, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{"volume-id": {0: {}}}, map[string]map[int]*gadget.OnDiskStructure{
-			"volume-id": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["volume-id"]),
+			"volume-id": gadget.OnDiskStructsFromGadget(oldVolumes["volume-id"]),
 		}, nil
 	})
 	defer r()
@@ -13642,18 +13725,7 @@ volumes:
 	c.Check(chg.Err(), ErrorMatches, "cannot perform the following tasks:\n.*Mount snap \"pi-kernel\" \\(2\\) \\(cannot refresh kernel with change created by old snapd that is missing gadget update task\\)")
 }
 
-func (s *mgrsSuite) TestDownloadToDefault(c *C) {
-	// should default to dirs.SnapBlobDir
-	const downloadDir = ""
-	s.testDownload(c, downloadDir)
-}
-
-func (s *mgrsSuite) TestDownloadToLocation(c *C) {
-	downloadDir := c.MkDir()
-	s.testDownload(c, downloadDir)
-}
-
-func (s *mgrsSuite) testDownload(c *C, downloadDir string) {
+func (s *mgrsSuite) TestDownload(c *C) {
 	s.prereqSnapAssertions(c)
 
 	const snapRev = "1"
@@ -13668,7 +13740,8 @@ func (s *mgrsSuite) testDownload(c *C, downloadDir string) {
 	st.Lock()
 	defer st.Unlock()
 
-	ts, info, err := snapstate.Download(context.TODO(), st, "foo", downloadDir, nil, 0, snapstate.Flags{}, nil)
+	downloadDir := c.MkDir()
+	ts, info, err := snapstate.Download(context.TODO(), st, "foo", nil, downloadDir, snapstate.RevisionOptions{}, snapstate.Options{})
 	c.Assert(err, IsNil)
 	chg := st.NewChange("download-snap", "...")
 	chg.AddAll(ts)
@@ -13728,9 +13801,10 @@ func (s *mgrsSuite) TestDownloadSpecificRevision(c *C) {
 	st.Lock()
 	defer st.Unlock()
 
-	ts, info, err := snapstate.Download(context.TODO(), st, "foo", "", &snapstate.RevisionOptions{
+	dir := c.MkDir()
+	ts, info, err := snapstate.Download(context.TODO(), st, "foo", nil, dir, snapstate.RevisionOptions{
 		Revision: snap.R(snapOldRev),
-	}, 0, snapstate.Flags{}, nil)
+	}, snapstate.Options{})
 	c.Assert(err, IsNil)
 	chg := st.NewChange("download-snap", "...")
 	chg.AddAll(ts)
@@ -13751,7 +13825,7 @@ func (s *mgrsSuite) TestDownloadSpecificRevision(c *C) {
 	// confirm it worked
 	c.Assert(chg.Status(), Equals, state.DoneStatus, Commentf("download-snap change failed with: %v", chg.Err()))
 
-	snapPath := filepath.Join(dirs.SnapBlobDir, fmt.Sprintf("%s_%s.snap", "foo", snapOldRev))
+	snapPath := filepath.Join(dir, fmt.Sprintf("%s_%s.snap", "foo", snapOldRev))
 	exists := osutil.FileExists(snapPath)
 	c.Check(exists, Equals, true)
 

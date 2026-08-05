@@ -33,6 +33,8 @@ import (
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil/mkfs"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/sysconfig"
+	"github.com/snapcore/snapd/systemd"
 )
 
 var (
@@ -60,16 +62,35 @@ func makeFilesystem(params mkfsParams) error {
 	return udevTrigger(params.Device)
 }
 
+type mntfsParams struct {
+	NoExec bool
+	NoDev  bool
+	NoSuid bool
+}
+
+func (p *mntfsParams) flags() uintptr {
+	var flags uintptr
+	if p.NoDev {
+		flags |= syscall.MS_NODEV
+	}
+	if p.NoExec {
+		flags |= syscall.MS_NOEXEC
+	}
+	if p.NoSuid {
+		flags |= syscall.MS_NOSUID
+	}
+	return flags
+}
+
 // mountFilesystem mounts the filesystem on a given device with
 // filesystem type fs under the provided mount point directory.
-func mountFilesystem(fsDevice, fs, mountpoint string) error {
+func mountFilesystem(fsDevice, fs, mountpoint string, params mntfsParams) error {
 	if err := os.MkdirAll(mountpoint, 0755); err != nil {
 		return fmt.Errorf("cannot create mountpoint: %v", err)
 	}
-	if err := sysMount(fsDevice, mountpoint, fs, 0, ""); err != nil {
+	if err := sysMount(fsDevice, mountpoint, fs, params.flags(), ""); err != nil {
 		return fmt.Errorf("cannot mount filesystem %q at %q: %v", fsDevice, mountpoint, err)
 	}
-
 	return nil
 }
 
@@ -115,25 +136,101 @@ func writeFilesystemContent(laidOut *gadget.LaidOutStructure, kSnapInfo *KernelS
 		return fmt.Errorf("cannot create filesystem image: %v", err)
 	}
 
-	// For data partition, build drivers tree if required, so kernel
-	// drivers are available on first boot of the installed system.
+	// For data partition, build drivers tree and kernel snap mount units if
+	// required, so kernel drivers are available on first boot of the installed
+	// system. In case we have a preseeding tarball files with the same content
+	// will be in there. handle-writable-paths will then overwite them, but will
+	// not have any effect as are expected to be equal.
+	// TODO detect if we have a preseeding tarball to avoid the extra unnecessary
+	// work.
 	if laidOut.Role() == gadget.SystemData && kSnapInfo != nil && kSnapInfo.NeedsDriversTree {
 		destRoot := mountpoint
 		if kSnapInfo.IsCore {
-			destRoot = filepath.Join(mountpoint, "system-data")
+			// For core we write the changes in _writable_defaults. The
+			// files are then copied from the initramfs by
+			// populate-writable.service on first boot as the directories
+			// they are in are marked as "transitional" in the
+			// writable-paths file. We cannot copy directly to
+			// "system-data" as that would prevent files already in
+			// _writable_defaults in the directories of interest to not
+			// be copied (because the files are not copied if the
+			// directory exists already).
+			destRoot = sysconfig.WritableDefaultsDir(filepath.Join(mountpoint, "system-data"))
 		}
 		destDir := kernel.DriversTreeDir(destRoot, kSnapInfo.Name, kSnapInfo.Revision)
 		logger.Noticef("building drivers tree in %s", destDir)
 
-		kTargetSysMntPt := snap.MinimalSnapContainerPlaceInfo(kSnapInfo.Name, kSnapInfo.Revision)
+		// kernel-modules components that are needed to build the drivers tree
+		compsMntPts := make([]kernel.ModulesCompMountPoints, 0, len(kSnapInfo.ModulesComps))
+		for _, c := range kSnapInfo.ModulesComps {
+			cpi := snap.MinimalComponentContainerPlaceInfo(c.Name,
+				c.Revision, kSnapInfo.Name)
+			compsMntPts = append(compsMntPts, kernel.ModulesCompMountPoints{
+				LinkName: c.Name,
+				MountPoints: kernel.MountPoints{
+					Current: c.MountPoint,
+					Target:  cpi.MountDir(),
+				}})
+			// Create mount unit to make the component content
+			// available from the drivers tree.
+			if err := writeContainerMountUnit(destRoot, cpi); err != nil {
+				return err
+			}
+		}
+
+		cpi := snap.MinimalSnapContainerPlaceInfo(kSnapInfo.Name, kSnapInfo.Revision)
+		// Create mount unit to make the kernel snap content available from
+		// the drivers tree.
+		if err := writeContainerMountUnit(destRoot, cpi); err != nil {
+			return err
+		}
+
 		if err := kernelEnsureKernelDriversTree(
 			kernel.MountPoints{
 				Current: kSnapInfo.MountPoint,
-				Target:  kTargetSysMntPt.MountDir(),
+				Target:  cpi.MountDir(),
 			},
-			nil,
+			compsMntPts,
 			destDir,
 			&kernel.KernelDriversTreeOptions{KernelInstall: true}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func writeContainerMountUnit(destRoot string, cpi snap.ContainerPlaceInfo) error {
+	// Create mount unit to make the kernel snap content available from
+	// the drivers tree.
+	squashfsPath := dirs.StripRootDir(cpi.MountFile())
+	whereDir := dirs.StripRootDir(cpi.MountDir())
+
+	hostFsType, options := systemd.HostFsTypeAndMountOptions("squashfs")
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              cpi.MountDescription(),
+		What:                     squashfsPath,
+		Where:                    whereDir,
+		Fstype:                   hostFsType,
+		Options:                  options,
+		MountUnitType:            systemd.BeforeDriversLoadMountUnit,
+		RootDir:                  destRoot,
+		PreventRestartIfModified: true,
+	}
+	unitFileName, _, err := systemd.EnsureMountUnitFileContent(mountOptions)
+	if err != nil {
+		return err
+	}
+	// Make sure the unit is activated
+	unitFilePath := filepath.Join(dirs.SnapServicesDir, unitFileName)
+	for _, target := range []string{"multi-user.target.wants", "snapd.mounts.target.wants"} {
+		linkDir := filepath.Join(dirs.SnapServicesDirUnder(destRoot), target)
+		if err := os.MkdirAll(linkDir, 0755); err != nil {
+			return err
+		}
+		linkPath := filepath.Join(linkDir, unitFileName)
+		if err := os.Symlink(unitFilePath, linkPath); err != nil {
 			return err
 		}
 	}

@@ -42,8 +42,16 @@ var (
 	MountNonDataPartitionMatchingKernelDisk = mountNonDataPartitionMatchingKernelDisk
 
 	GetNonUEFISystemDisk = getNonUEFISystemDisk
+
+	GenerateMountsFromManifest = generateMountsFromManifest
+
+	ParseImageManifest = parseImageManifest
+
+	CreateOverlayDirs = createOverlayDirs
 )
 
+type OverlayFsOptions = overlayFsOptions
+type DmVerityOptions = dmVerityOptions
 type SystemdMountOptions = systemdMountOptions
 
 type RecoverDegradedState = recoverDegradedState
@@ -129,11 +137,11 @@ func MockSecbootUnlockVolumeUsingSealedKeyIfEncrypted(f func(disk disks.Disk, na
 	}
 }
 
-func MockSecbootUnlockEncryptedVolumeUsingKey(f func(disk disks.Disk, name string, key []byte) (secboot.UnlockResult, error)) (restore func()) {
-	old := secbootUnlockEncryptedVolumeUsingKey
-	secbootUnlockEncryptedVolumeUsingKey = f
+func MockSecbootUnlockEncryptedVolumeUsingProtectorKey(f func(disk disks.Disk, name string, key []byte) (secboot.UnlockResult, error)) (restore func()) {
+	old := secbootUnlockEncryptedVolumeUsingProtectorKey
+	secbootUnlockEncryptedVolumeUsingProtectorKey = f
 	return func() {
-		secbootUnlockEncryptedVolumeUsingKey = old
+		secbootUnlockEncryptedVolumeUsingProtectorKey = old
 	}
 }
 
@@ -239,5 +247,13 @@ func MockBuildInstallObserver(f func(model *asserts.Model, gadgetDir string, use
 	installBuildInstallObserver = f
 	return func() {
 		installBuildInstallObserver = old
+	}
+}
+
+func MockOsGetenv(mock func(string) string) (restore func()) {
+	old := osGetenv
+	osGetenv = mock
+	return func() {
+		osGetenv = old
 	}
 }

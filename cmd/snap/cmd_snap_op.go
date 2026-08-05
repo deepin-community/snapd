@@ -134,6 +134,7 @@ type cmdRemove struct {
 
 	Revision   string `long:"revision"`
 	Purge      bool   `long:"purge"`
+	Terminate  bool   `long:"terminate"`
 	Positional struct {
 		Snaps []installedSnapName `positional-arg-name:"<snap>" required:"1"`
 	} `positional-args:"yes" required:"yes"`
@@ -309,7 +310,7 @@ func (x *cmdRemove) removeMany(opts *client.SnapOptions) error {
 }
 
 func (x *cmdRemove) Execute([]string) error {
-	opts := &client.SnapOptions{Revision: x.Revision, Purge: x.Purge}
+	opts := &client.SnapOptions{Revision: x.Revision, Purge: x.Purge, Terminate: x.Terminate}
 	if len(x.Positional.Snaps) == 1 {
 		return x.removeOne(opts)
 	}
@@ -439,7 +440,7 @@ func maybeWithSudoSecurePath() bool {
 		return false
 	}
 	// Known distros setting secure_path that does not include
-	// $SNAP_MOUNT_DIR/bin:
+	// $STATIC_SNAP_MOUNT_DIR/bin:
 	return release.DistroLike("fedora", "opensuse", "debian")
 }
 
@@ -928,7 +929,13 @@ type cmdRefresh struct {
 }
 
 func (x *cmdRefresh) refreshMany(snaps []string, opts *client.SnapOptions) error {
-	changeID, err := x.client.RefreshMany(snaps, opts)
+	const forInstall = true
+	names, compsBySnap, err := snapInstancesAndComponentsFromNames(snaps, forInstall)
+	if err != nil {
+		return err
+	}
+
+	changeID, err := x.client.RefreshMany(names, compsBySnap, opts)
 	if err != nil {
 		return err
 	}
@@ -957,9 +964,14 @@ func (x *cmdRefresh) refreshMany(snaps []string, opts *client.SnapOptions) error
 }
 
 func (x *cmdRefresh) refreshOne(name string, opts *client.SnapOptions) error {
-	changeID, err := x.client.Refresh(name, opts)
+	snapName, comps := snap.SplitSnapInstanceAndComponents(name)
+	if name == "" {
+		return errors.New(i18n.G("no snap for the component(s) was specified"))
+	}
+
+	changeID, err := x.client.Refresh(snapName, comps, opts)
 	if err != nil {
-		msg, err := errorToCmdMessage(name, "refresh", err, opts)
+		msg, err := errorToCmdMessage(snapName, "refresh", err, opts)
 		if err != nil {
 			return err
 		}
@@ -977,7 +989,7 @@ func (x *cmdRefresh) refreshOne(name string, opts *client.SnapOptions) error {
 
 	// TODO: this doesn't really tell about all the things you
 	// could set while refreshing (something switch does)
-	return showDone(x.client, chg, &changedSnapsData{names: []string{name}, comps: nil}, "refresh", opts, x.getEscapes())
+	return showDone(x.client, chg, &changedSnapsData{names: []string{snapName}, comps: nil}, "refresh", opts, x.getEscapes())
 }
 
 func parseSysinfoTime(s string) time.Time {
@@ -1493,6 +1505,8 @@ func init() {
 			"revision": i18n.G("Remove only the given revision"),
 			// TRANSLATORS: This should not start with a lowercase letter.
 			"purge": i18n.G("Remove the snap without saving a snapshot of its data"),
+			// TRANSLATORS: This should not start with a lowercase letter.
+			"terminate": i18n.G("Terminate running processes associated with a snap before removal"),
 		}), nil)
 	addCommand("install", shortInstallHelp, longInstallHelp, func() flags.Commander { return &cmdInstall{} },
 		colorDescs.also(waitDescs).also(channelDescs).also(modeDescs).also(map[string]string{

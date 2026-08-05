@@ -28,7 +28,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -49,6 +48,7 @@ import (
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/strace"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/sandbox/cgroup"
 	"github.com/snapcore/snapd/sandbox/selinux"
 	"github.com/snapcore/snapd/snap"
@@ -501,7 +501,7 @@ func (x *cmdRun) straceOpts() (opts []string, raw bool, err error) {
 func checkSnapRunInhibitionConflict(app *snap.AppInfo) error {
 	// Remove hint check takes precedence because we want to exit early
 	snapName := app.Snap.InstanceName()
-	hint, _, err := runinhibit.IsLocked(snapName)
+	hint, _, err := runinhibit.IsLocked(snapName, nil)
 	if err != nil {
 		return err
 	}

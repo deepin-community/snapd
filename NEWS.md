@@ -1,3 +1,209 @@
+# New in snapd 2.68.3
+* FDE: LP: #2101834 snapd 2.68+ and snap-bootstrap <2.68 fallback to old keyring path
+* Fix Plucky snapd deb build issue related to /var/lib/snapd/void permissions
+* Fix snapd deb build complaint about ifneq with extra bracket
+
+# New in snapd 2.68.2
+* FDE: use boot mode for FDE hooks
+* FDE: add snap-bootstrap compatibility check to prevent image creation with incompatible snapd and kernel snap
+* FDE: add argon2 out-of-process KDF support
+* FDE: have separate mutex for the sections writing a fresh modeenv
+* FDE: LP: #2099709 update secboot to e07f4ae48e98
+* Confdb: support pruning ephemeral data and process alternative types in order
+* core-initrd: look at env to mount directly to /sysroot
+* core-initrd: prepare for Plucky build and split out 24.10 (Oracular)
+* Fix missing primed packages in snapd snap manifest
+* Interfaces: posix-mq | fix incorrect clobbering of global variable and make interface more precise
+* Interfaces: opengl | add more kernel fusion driver files
+
+# New in snapd 2.68.1
+* Fix snap-confine type specifier type mismatch on armhf
+
+# New in snapd 2.68
+* FDE: add support for new and more extensible key format that is unified between TPM and FDE hook
+* FDE: add support for adding passphrases during installation
+* FDE: update secboot to 30317622bbbc
+* Snap components: make kernel components available on firstboot after either initramfs or ephemeral rootfs style install
+* Snap components: mount drivers tree from initramfs so kernel modules are available in early boot stages
+* Snap components: support remodeling to models that contain components
+* Snap components: support offline remodeling to models that contain components
+* Snap components: support creating new recovery systems with components
+* Snap components: support downloading components with 'snap download' command
+* Snap components: support sideloading asserted components
+* AppArmor Prompting(experimental): improve version checks and handling of listener notification protocol for communication with kernel AppArmor
+* AppArmor Prompting(experimental): make prompt replies idempotent, and have at most one rule for any given path pattern, with potentially mixed outcomes and lifespans
+* AppArmor Prompting(experimental): timeout unresolved prompts after a period of client inactivity
+* AppArmor Prompting(experimental): return an error if a patch request to the API would result in a rule without any permissions
+* AppArmor Prompting(experimental): warn if there is no prompting client present but prompting is enabled, or if a prompting-related error occurs during snapd startup
+* AppArmor Prompting(experimental): do not log error when converting empty permissions to AppArmor permissions
+* Confdb(experimental): rename registries to confdbs (including API /v2/registries => /v2/confdb)
+* Confdb(experimental): support marking confdb schemas as ephemeral
+* Confdb(experimental): add confdb-control assertion and feature flag
+* Refresh App Awareness(experimental): LP: #2089195 prevent possibility of incorrect notification that snap will quit and update
+* Confidential VMs: snap-bootstrap support for loading partition information from a manifest file for cloudimg-rootfs mode
+* Confidential VMs: snap-bootstrap support for setting up cloudimg-rootfs as an overlayfs with integrity protection
+* dm-verity for essential snaps: add support for snap-integrity assertion
+* Interfaces: modify AppArmor template to allow owner read on @{PROC}/@{pid}/fdinfo/*
+* Interfaces: LP: #2072987 modify AppArmor template to allow using setpriv to run daemon as non-root user
+* Interfaces: add configfiles backend that ensures the state of configuration files in the filesystem
+* Interfaces: add ldconfig backend that exposes libraries coming from snaps to either the rootfs or to other snaps
+* Interfaces: LP: #1712808 LP: 1865503 disable udev backend when inside a container
+* Interfaces: add auditd-support interface that grants audit_control capability and required paths for auditd to function
+* Interfaces: add checkbox-support interface that allows unrestricted access to all devices
+* Interfaces: fwupd | allow access to dell bios recovery
+* Interfaces: fwupd | allow access to shim and fallback shim
+* Interfaces: mount-control | add mount option validator to detect mount option conflicts early
+* Interfaces: cpu-control | add read access to /sys/kernel/irq/<IRQ>
+* Interfaces: locale-control | changed to be implicit on Ubuntu Core Desktop
+* Interfaces: microstack-support | support for utilizing of AMD SEV capabilities
+* Interfaces: u2f | added missing OneSpan device product IDs
+* Interfaces: auditd-support | grant seccomp setpriority
+* Interfaces: opengl interface | enable parsing of nvidia driver information files
+* Allow mksquashfs 'xattrs' when packing snap types os, core, base and snapd as part of work to support non-root snap-confine
+* Upstream/downstream packaging changes and build updates
+* Improve error logs for malformed desktop files to also show which desktop file is at fault
+* Provide more precise error message when overriding channels with grade during seed creation
+* Expose 'snap prepare-image' validation parameter
+* Add snap-seccomp 'dump' command that dumps the filter rules from a compiled profile
+* Add fallback release info location /etc/initrd-release
+* Added core-initrd to snapd repo and fixed issues with ubuntu-core-initramfs deb builds
+* Remove stale robust-mount-namespace-updates experimental feature flag
+* Remove snapd-snap experimental feature (rejected) and it's feature flag
+* Changed snap-bootstrap to mount base directly on /sysroot
+* Mount ubuntu-seed mounted as no-{suid,exec,dev}
+* Mapping volumes to disks: add support for volume-assignments in gadget
+* Fix silently broken binaries produced by distro patchelf 0.14.3 by using locally build patchelf 0.18
+* Fix mismatch between listed refresh candidates and actual refresh due to outdated validation sets
+* Fix 'snap get' to produce compact listing for tty
+* Fix missing store-url by keeping it as part of auxiliary store info
+* Fix snap-confine attempting to retrieve device cgroup setup inside container where it is not available
+* Fix 'snap set' and 'snap get' panic on empty strings with early error checking
+* Fix logger debug entries to show correct caller and file information
+* Fix issue preventing hybrid systems from being seeded on first boot
+* LP: #1966203 remove auto-import udev rules not required by deb package to avoid unwanted syslog errors
+* LP: #1886414 fix progress reporting when stdout is on a tty, but stdin is not
+
+# New in snapd 2.67.1
+* Fix apparmor permissions to allow snaps access to kernel modules and firmware on UC24, which also fixes the kernel-modules-control interface on UC24
+* AppArmor prompting (experimental): disallow /./ and /../ in path patterns
+* Fix 'snap run' getent based user lookup in case of bad PATH
+* Fix snapd using the incorrect AppArmor version during undo of an refresh for regenerating snap profiles
+* Add new syscalls to base templates
+* hardware-observe interface: allow riscv_hwprobe syscall
+* mount-observe interface: allow listmount and statmount syscalls
+
+# New in snapd 2.67
+* AppArmor prompting (experimental): allow overlapping rules
+* Registry view (experimental): Changes to registry data (from both users and snaps) can be validated and saved by custodian snaps
+* Registry view (experimental): Support 'snapctl get --pristine' to read the registry data excluding staged transaction changes
+* Registry view (experimental): Put registry commands behind experimental feature flag
+* Components: Make modules shipped/created by kernel-modules components available right after reboot
+* Components: Add tab completion for local component files
+* Components: Allow installing snaps and components from local files jointly on the CLI
+* Components: Allow 'snapctl model' command for gadget and kernel snaps
+* Components: Add 'snap components' command
+* Components: Bug fixes
+* eMMC gadget updates (WIP): add syntax support in gadget.yaml for eMMC schema
+* Support for ephemeral recovery mode on hybrid systems
+* Support for dm-verity options in snap-bootstrap
+* Support for overlayfs options and allow empty what argument for tmpfs
+* Enable ubuntu-image to determine the size of the disk image to create
+* Expose 'snap debug' commands 'validate-seed' and 'seeding'
+* Add debug API option to use dedicated snap socket /run/snapd-snap.socket
+* Hide experimental features that are no longer required (accepted/rejected)
+* Mount ubuntu-save partition with no{exec,dev,suid} at install, run and factory-reset
+* Improve memory controller support with cgroup v2
+* Support ssh socket activation configurations (used by ubuntu 22.10+)
+* Fix generation of AppArmor profile with incorrect revision during multi snap refresh
+* Fix refresh app awareness related deadlock edge case
+* Fix not caching delta updated snap download
+* Fix passing non root uid, guid to initial tmpfs mount
+* Fix ignoring snaps in try mode when amending
+* Fix reloading of service activation units to avoid systemd errors
+* Fix snapd snap FIPS build on Launchpad to use Advantage Pro FIPS updates PPA
+* Make killing of snap apps best effort to avoid possibility of malicious failure loop
+* Alleviate impact of auto-refresh failure loop with progressive delay
+* Dropped timedatex in selinux-policy to avoid runtime issue
+* Fix missing syscalls in seccomp profile
+* Modify AppArmor template to allow using SNAP_REEXEC on arch systems
+* Modify AppArmor template to allow using vim.tiny (available in base snaps)
+* Modify AppArmor template to add read-access to debian_version
+* Modify AppArmor template to allow owner to read @{PROC}/@{pid}/sessionid
+* {common,personal,system}-files interface: prohibit trailing @ in filepaths
+* {desktop,shutdown,system-observe,upower-observe} interface: improve for Ubuntu Core Desktop
+* custom-device interface: allow @ in custom-device filepaths
+* desktop interface: improve launch entry and systray integration with session
+* desktop-legacy interface: allow DBus access to com.canonical.dbusmenu
+* fwupd interface: allow access to nvmem for thunderbolt plugin
+* mpris interface: add plasmashell as label
+* mount-control interface: add support for nfs mounts
+* network-{control,manager} interface: add missing dbus link rules
+* network-manager-observe interface: add getDevices methods
+* opengl interface: add Kernel Fusion Driver access to opengl
+* screen-inhibit-control interface: improve screen inhibit control for use on core
+* udisks2 interface: allow ping of the UDisks2 service
+* u2f-devices interface: add Nitrokey Passkey
+
+# New in snapd 2.66.1:
+* AppArmor prompting (experimental): Fix kernel prompting support check
+* Allow kernel snaps to have content slots
+* Fix ignoring snaps in try mode when amending
+
+# New in snapd 2.66:
+* AppArmor prompting (experimental): expand kernel support checks
+* AppArmor prompting (experimental): consolidate error messages and add error kinds
+* AppArmor prompting (experimental): grant /v2/snaps/{name} via snap-interfaces-requests-control
+* AppArmor prompting (experimental): add checks for duplicate pattern variants
+* Registry views (experimental): add handlers that commit (and cleanup) registry transactions
+* Registry views (experimental): add a snapctl fail command for rejecting registry transactions
+* Registry views (experimental): allow custodian snaps to implement registry hooks that modify and save registry data
+* Registry views (experimental): run view-changed hooks only for snaps plugging views affected by modified paths
+* Registry views (experimental): make registry transactions serialisable
+* Snap components: handle refreshing components to revisions that have been on the system before
+* Snap components: enable creating Ubuntu Core images that contain components
+* Snap components: handle refreshing components independently of snaps
+* Snap components: handle removing components when refreshing a snap that no longer defines them
+* Snap components: extend snapd Ubuntu Core installation API to allow for picking optional snaps and components to install
+* Snap components: extend kernel.yaml with "dynamic-modules", allowing kernel to define a location for kmods from component hooks
+* Snap components: renamed component type "test" to "standard"
+* Desktop IDs: support installing desktop files with custom names based on desktop-file-ids desktop interface plug attr
+* Auto-install snapd on classic systems as prerequisite for any non-essential snap install
+* Support loading AppArmor profiles on WSL2 with non-default kernel and securityfs mounted
+* Debian/Fedora packaging updates
+* Add snap debug command for investigating execution aspects of the snap toolchain
+* Improve snap pack error for easier parsing
+* Add support for user services when refreshing snaps
+* Add snap remove --terminate flag for terminating running snap processes
+* Support building FIPS complaint snapd deb and snap
+* Fix to not use nss when looking up for users/groups from snapd snap
+* Fix ordering in which layout changes are saved
+* Patch snapd snap dynamic linker to ignore LD_LIBRARY_PATH and related variables
+* Fix libexec dir for openSUSE Slowroll
+* Fix handling of the shared snap directory for parallel installs
+* Allow writing to /run/systemd/journal/dev-log by default
+* Avoid state lock during snap removal to avoid delaying other snapd operations
+* Add nomad-support interface to enable running Hashicorp Nomad
+* Add intel-qat interface
+* u2f-devices interface: add u2f trustkey t120 product id and fx series fido u2f devices
+* desktop interface: improve integration with xdg-desktop-portal
+* desktop interface: add desktop-file-ids plug attr to desktop interface
+* unity7 interface: support desktop-file-ids in desktop files rule generation
+* desktop-legacy interface: support desktop-file-ids in desktop files rule generation
+* desktop-legacy interface: grant access to gcin socket location
+* login-session-observe interface: allow introspection
+* custom-device interface: allow to explicitly identify matching device in udev tagging block
+* system-packages-doc interface: allow reading /usr/share/javascript
+* modem-manager interface: add new format of WWAN ports
+* pcscd interface: allow pcscd to read opensc.conf
+* cpu-control interface: add IRQ affinity control to cpu_control
+* opengl interface: add support for cuda workloads on Tegra iGPU in opengl interface
+
+# New in snapd 2.65.3:
+* Fix missing aux info from store on snap setup
+
+# New in snapd 2.65.2:
+* Bump squashfuse from version 0.5.0 to 0.5.2 (used in snapd deb only)
+
 # New in snapd 2.65.1:
 * Support building snapd using base Core22 (Snapcraft 8.x)
 * FIPS: support building FIPS complaint snapd variant that switches to FIPS mode when the system boots with FIPS enabled

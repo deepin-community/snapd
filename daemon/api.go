@@ -29,8 +29,8 @@ import (
 
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/auth"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/configstate"
-	"github.com/snapcore/snapd/overlord/registrystate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/strutil"
@@ -82,13 +82,14 @@ var api = []*Command{
 	systemRecoveryKeysCmd,
 	quotaGroupsCmd,
 	quotaGroupInfoCmd,
-	registryCmd,
+	confdbCmd,
 	noticesCmd,
 	noticeCmd,
 	requestsPromptsCmd,
 	requestsPromptCmd,
 	requestsRulesCmd,
 	requestsRuleCmd,
+	systemSecurebootCmd,
 }
 
 const (
@@ -143,6 +144,7 @@ func storeFrom(d *Daemon) snapstate.StoreService {
 
 var (
 	snapstateStoreInstallGoal               = snapstate.StoreInstallGoal
+	snapstatePathUpdateGoal                 = snapstate.PathUpdateGoal
 	snapstateInstallWithGoal                = snapstate.InstallWithGoal
 	snapstateInstallPath                    = snapstate.InstallPath
 	snapstateInstallPathMany                = snapstate.InstallPathMany
@@ -150,8 +152,9 @@ var (
 	snapstateInstallComponents              = snapstate.InstallComponents
 	snapstateRefreshCandidates              = snapstate.RefreshCandidates
 	snapstateTryPath                        = snapstate.TryPath
-	snapstateUpdate                         = snapstate.Update
-	snapstateUpdateMany                     = snapstate.UpdateMany
+	snapstateStoreUpdateGoal                = snapstate.StoreUpdateGoal
+	snapstateUpdateWithGoal                 = snapstate.UpdateWithGoal
+	snapstateUpdateOne                      = snapstate.UpdateOne
 	snapstateRemove                         = snapstate.Remove
 	snapstateRemoveMany                     = snapstate.RemoveMany
 	snapstateResolveValSetsEnforcementError = snapstate.ResolveValidationSetsEnforcementError
@@ -168,9 +171,12 @@ var (
 
 	assertstateRefreshSnapAssertions         = assertstate.RefreshSnapAssertions
 	assertstateRestoreValidationSetsTracking = assertstate.RestoreValidationSetsTracking
+	assertstateFetchAllValidationSets        = assertstate.FetchAllValidationSets
 
-	registrystateGetViaView = registrystate.GetViaView
-	registrystateSetViaView = registrystate.SetViaView
+	confdbstateGetView        = confdbstate.GetView
+	confdbstateGetTransaction = confdbstate.GetTransactionToModify
+	confdbstateGet            = confdbstate.Get
+	confdbstateSetViaView     = confdbstate.SetViaView
 )
 
 func ensureStateSoonImpl(st *state.State) {

@@ -8,17 +8,26 @@ details: |
     properly
 
 systems:
-  - ubuntu-core-20-*
-  - ubuntu-core-22-*
+  - -ubuntu-core-16-*
+  - -ubuntu-core-18-*
 
 execute: |
     case "$SPREAD_SYSTEM" in
+      ubuntu-core-24-*)
+        base_snap=core24
+        run_mnt_pts=()
+        ;;
       ubuntu-core-22-*)
         base_snap=core22
+        run_mnt_pts=(/run/mnt/base /run/mnt/kernel)
         ;;
       ubuntu-core-20-*)
         base_snap=core20
+        run_mnt_pts=(/run/mnt/base /run/mnt/kernel)
         ;;
+      *)
+        echo "Unsupported ubuntu core system, add missing case here"
+        exit 1
     esac
     echo "Check that the system snaps are there"
     snap list "${base_snap}"
@@ -32,12 +41,9 @@ execute: |
     snap changes | MATCH "Done.*Initialize system state"
 
     echo "Check that a simple shell snap"
-    if os.query is-core22; then
-        snap install --edge "test-snapd-sh-${base_snap}"
-    else
-        snap install "test-snapd-sh-${base_snap}"
-    fi
-    "test-snapd-sh-${base_snap}.sh" -c 'echo hello' | MATCH hello
+    SHELL_SNAP="test-snapd-sh-${base_snap}"
+    snap install "$SHELL_SNAP"
+    "${SHELL_SNAP}.sh" -c 'echo hello' | MATCH hello
 
     if python3 -m json.tool < /var/lib/snapd/system-key | grep '"build-id": ""'; then
         echo "The build-id of snapd must not be empty."
@@ -45,10 +51,10 @@ execute: |
     fi
 
     echo "Ensure passwd/group is available for snaps"
-    "test-snapd-sh-${base_snap}.sh" -c 'cat /var/lib/extrausers/passwd' | MATCH test
+    "${SHELL_SNAP}.sh" -c 'cat /var/lib/extrausers/passwd' | MATCH test
 
     # rpi devices don't use grub
-    if ( os.query is-core20 || os.query is-core22 ) && not snap list pi-kernel &>/dev/null; then
+    if not snap list pi-kernel &>/dev/null; then
         echo "Ensure extracted kernel.efi exists"
         kernel_name="$(snaps.name kernel)"
         test -e /boot/grub/"$kernel_name"*/kernel.efi
@@ -110,11 +116,37 @@ execute: |
     test -f /run/snapd/boot-flags
 
     # make sure that loop devices created by snap-bootstrap initramfs-mounts for snaps are readonly
-    for mount in /run/mnt/base /run/mnt/kernel; do
-        mountpoint "${mount}"
-        loop="$(findmnt -o source "${mount}" -n)"
-        echo "${loop}" | MATCH "/dev/loop[0-9]+"
-        losetup -O ro -n --raw "${loop}" | MATCH "1"
+    if [ "$base_snap" = core20 ] || [ "$base_snap" = core22 ]; then
+        for mount in "${run_mnt_pts[@]}"; do
+            mountpoint "${mount}"
+            loop="$(findmnt -o source "${mount}" -n)"
+            echo "${loop}" | MATCH "/dev/loop[0-9]+"
+            losetup -O ro -n --raw "${loop}" | MATCH "1"
+        done
+    else
+        not mountpoint /run/mnt/kernel
+        findmnt -n -o source /lib/firmware | MATCH /var/lib/snapd/kernel/pc-kernel
+        findmnt -n -o source /lib/modules | MATCH /var/lib/snapd/kernel/pc-kernel
+        # These units should have been created by the initramfs
+        stat /run/systemd/system/sysroot-usr-lib-firmware.mount
+        stat /run/systemd/system/sysroot-usr-lib-modules.mount
+        stat /run/systemd/system/'writable-system\x2ddata-snap-pc\x2dkernel-'*
+
+        not mountpoint /run/mnt/base
+        loop="$(findmnt -o source / -n)"
+        losetup -O back-file -n --raw "$loop" | MATCH '/run/mnt/data/.*/core24_.*'
+    fi
+
+    # make sure that ubuntu-{seed,save} is mounted with appropriate flags
+    for mount in /run/mnt/ubuntu-seed /run/mnt/ubuntu-save; do
+        MNT_NAME="${mount##*/}"
+        findmnt -T /run/mnt/ubuntu-save > "${MNT_NAME}.info"
+
+        # print it for debug purposes before we match flags
+        cat "${MNT_NAME}.info"
+        MATCH nosuid < "${MNT_NAME}.info"
+        MATCH noexec < "${MNT_NAME}.info"
+        MATCH nodev < "${MNT_NAME}.info"
     done
 
     # ensure apparmor works, see LP: 2024637

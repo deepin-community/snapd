@@ -33,10 +33,12 @@ import (
 	"github.com/snapcore/snapd/asserts/snapasserts"
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/install"
+	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
 )
@@ -127,7 +129,7 @@ func storageEncryption(encInfo *install.EncryptionSupportInfo) *client.StorageEn
 	}
 	storageEnc := &client.StorageEncryption{
 		StorageSafety: string(encInfo.StorageSafety),
-		Type:          string(encInfo.Type),
+		Type:          encInfo.Type,
 	}
 	required := (encInfo.StorageSafety == asserts.StorageSafetyEncrypted)
 	switch {
@@ -139,6 +141,9 @@ func storageEncryption(encInfo *install.EncryptionSupportInfo) *client.StorageEn
 	case !encInfo.Available && !required:
 		storageEnc.Support = client.StorageEncryptionSupportUnavailable
 		storageEnc.UnavailableReason = encInfo.UnavailableWarning
+	}
+	if encInfo.PassphraseAuthAvailable {
+		storageEnc.Features = append(storageEnc.Features, client.StorageEncryptionFeaturePassphraseAuth)
 	}
 
 	return storageEnc
@@ -171,7 +176,11 @@ func getSystemDetails(c *Command, r *http.Request, user *auth.UserState) Respons
 			Validation:  sys.Brand.Validation(),
 		},
 		// no body: we expect models to have empty bodies
-		Model:             sys.Model.Headers(),
+		Model: sys.Model.Headers(),
+		AvailableOptional: client.AvailableForInstall{
+			Snaps:      sys.OptionalContainers.Snaps,
+			Components: sys.OptionalContainers.Components,
+		},
 		Volumes:           gadgetInfo.Volumes,
 		StorageEncryption: storageEncryption(encryptionInfo),
 	}
@@ -191,6 +200,7 @@ type systemActionRequest struct {
 	client.SystemAction
 	client.InstallSystemOptions
 	client.CreateSystemOptions
+	client.QualityCheckOptions
 }
 
 func postSystemsAction(c *Command, r *http.Request, user *auth.UserState) Response {
@@ -263,6 +273,10 @@ func postSystemsActionJSON(c *Command, r *http.Request) Response {
 		return postSystemActionCreate(c, &req)
 	case "remove":
 		return postSystemActionRemove(c, systemLabel)
+	case "check-passphrase":
+		return postSystemActionCheckPassphrase(c, systemLabel, &req)
+	case "check-pin":
+		return postSystemActionCheckPIN(c, systemLabel, &req)
 	default:
 		return BadRequest("unsupported action %q", req.Action)
 	}
@@ -318,14 +332,32 @@ func postSystemActionInstall(c *Command, systemLabel string, req *systemActionRe
 
 	switch req.Step {
 	case client.InstallStepSetupStorageEncryption:
-		chg, err := devicestateInstallSetupStorageEncryption(st, systemLabel, req.OnVolumes)
+		chg, err := devicestateInstallSetupStorageEncryption(st, systemLabel, req.OnVolumes, req.VolumesAuth)
 		if err != nil {
 			return BadRequest("cannot setup storage encryption for install from %q: %v", systemLabel, err)
 		}
 		ensureStateSoon(st)
 		return AsyncResponse(nil, chg.ID())
 	case client.InstallStepFinish:
-		chg, err := devicestateInstallFinish(st, systemLabel, req.OnVolumes)
+		var optional *devicestate.OptionalContainers
+		if req.OptionalInstall != nil {
+			// note that we provide a nil optional install here in the case that
+			// the request set the All field to true. the nil optional install
+			// indicates that all opitonal snaps and components should be
+			// installed.
+			if req.OptionalInstall.All {
+				if len(req.OptionalInstall.Components) > 0 || len(req.OptionalInstall.Snaps) > 0 {
+					return BadRequest("cannot specify both all and individual optional snaps and components to install")
+				}
+			} else {
+				optional = &devicestate.OptionalContainers{
+					Snaps:      req.OptionalInstall.Snaps,
+					Components: req.OptionalInstall.Components,
+				}
+			}
+		}
+
+		chg, err := devicestateInstallFinish(st, systemLabel, req.OnVolumes, optional)
 		if err != nil {
 			return BadRequest("cannot finish install for %q: %v", systemLabel, err)
 		}
@@ -429,7 +461,7 @@ func postSystemActionCreateOffline(c *Command, form *Form) Response {
 		return BadRequest("cannot parse validation sets: %v", err)
 	}
 
-	var snapFiles []*uploadedSnap
+	var snapFiles []*uploadedContainer
 	if len(form.FileRefs["snap"]) > 0 {
 		snaps, errRsp := form.GetSnapFiles()
 		if errRsp != nil {
@@ -466,23 +498,35 @@ func postSystemActionCreateOffline(c *Command, form *Form) Response {
 		return apiErr
 	}
 
-	if len(slInfo.sideInfos) != len(slInfo.tmpPaths) {
-		return InternalError("mismatch between number of snap side infos and temporary paths")
+	localSnaps := make([]snapstate.PathSnap, 0, len(slInfo.snaps))
+	localComponents := make([]snapstate.PathComponent, 0, len(slInfo.components))
+	for _, sn := range slInfo.snaps {
+		localSnaps = append(localSnaps, snapstate.PathSnap{
+			SideInfo: &sn.info.SideInfo,
+			Path:     sn.tmpPath,
+		})
+
+		for _, c := range sn.components {
+			localComponents = append(localComponents, snapstate.PathComponent{
+				SideInfo: c.sideInfo,
+				Path:     c.tmpPath,
+			})
+		}
 	}
 
-	localSnaps := make([]devicestate.LocalSnap, 0, len(slInfo.sideInfos))
-	for i := range slInfo.sideInfos {
-		localSnaps = append(localSnaps, devicestate.LocalSnap{
-			SideInfo: slInfo.sideInfos[i],
-			Path:     slInfo.tmpPaths[i],
+	for _, ci := range slInfo.components {
+		localComponents = append(localComponents, snapstate.PathComponent{
+			SideInfo: ci.sideInfo,
+			Path:     ci.tmpPath,
 		})
 	}
 
 	chg, err := devicestateCreateRecoverySystem(st, label, devicestate.CreateRecoverySystemOptions{
-		ValidationSets: validationSets.Sets(),
-		LocalSnaps:     localSnaps,
-		TestSystem:     testSystem,
-		MarkDefault:    markDefault,
+		ValidationSets:  validationSets.Sets(),
+		LocalSnaps:      localSnaps,
+		LocalComponents: localComponents,
+		TestSystem:      testSystem,
+		MarkDefault:     markDefault,
 		// using the form-based API implies that this should be an offline operation
 		Offline: true,
 	})
@@ -555,4 +599,116 @@ func postSystemActionRemove(c *Command, systemLabel string) Response {
 	ensureStateSoon(st)
 
 	return AsyncResponse(nil, chg.ID())
+}
+
+type encryptionSupportInfoKey struct{ systemLabel string }
+
+// cachedEncryptionSupportInfoByLabel returns encryption support info for specified system from cache.
+// If no cached value exist it is computed once and reused for future calls.
+//
+// Note that the cached value is never cleared as system seeds are assumed to be immutable.
+func cachedEncryptionSupportInfoByLabel(c *Command, systemLabel string) (*install.EncryptionSupportInfo, error) {
+	c.d.state.Lock()
+	cached := c.d.state.Cached(encryptionSupportInfoKey{systemLabel})
+	c.d.state.Unlock()
+	if cached != nil {
+		encryptionSupportInfo, ok := cached.(*install.EncryptionSupportInfo)
+		if ok {
+			return encryptionSupportInfo, nil
+		}
+	}
+	// no entry found in cache, let's compute encryption support info for target system
+	deviceMgr := c.d.overlord.DeviceManager()
+	_, _, encryptionInfo, err := deviceManagerSystemAndGadgetAndEncryptionInfo(deviceMgr, systemLabel)
+	if err != nil {
+		return nil, err
+	}
+	c.d.state.Lock()
+	c.d.state.Cache(encryptionSupportInfoKey{systemLabel}, encryptionInfo)
+	c.d.state.Unlock()
+	return encryptionInfo, nil
+}
+
+var deviceValidatePassphraseOrPINEntropy = device.ValidatePassphraseOrPINEntropy
+
+func postSystemActionCheckPassphrase(c *Command, systemLabel string, req *systemActionRequest) Response {
+	if systemLabel == "" {
+		return BadRequest("system action requires the system label to be provided")
+	}
+	if req.Passphrase == "" {
+		return BadRequest("passphrase must be provided in request body for action %q", req.Action)
+	}
+
+	encryptionInfo, err := cachedEncryptionSupportInfoByLabel(c, systemLabel)
+	if err != nil {
+		return InternalError(err.Error())
+	}
+	if !encryptionInfo.PassphraseAuthAvailable {
+		return &apiError{
+			Status:  400,
+			Kind:    client.ErrorKindUnsupportedByTargetSystem,
+			Message: "target system does not support passphrase authentication",
+		}
+	}
+
+	err = deviceValidatePassphraseOrPINEntropy(device.AuthModePassphrase, req.Passphrase)
+	if err != nil {
+		var qualityErr *device.AuthQualityError
+		if errors.As(err, &qualityErr) {
+			return &apiError{
+				Status:  400,
+				Kind:    client.ErrorKindInvalidPassphrase,
+				Message: "passphrase did not pass quality checks",
+				Value: map[string]interface{}{
+					"reasons":          qualityErr.Reasons,
+					"entropy-bits":     qualityErr.Entropy,
+					"min-entropy-bits": qualityErr.MinEntropy,
+				},
+			}
+		}
+		return InternalError(err.Error())
+	}
+
+	return SyncResponse(nil)
+}
+
+func postSystemActionCheckPIN(c *Command, systemLabel string, req *systemActionRequest) Response {
+	if systemLabel == "" {
+		return BadRequest("system action requires the system label to be provided")
+	}
+	if req.PIN == "" {
+		return BadRequest("pin must be provided in request body for action %q", req.Action)
+	}
+
+	encryptionInfo, err := cachedEncryptionSupportInfoByLabel(c, systemLabel)
+	if err != nil {
+		return InternalError(err.Error())
+	}
+	if !encryptionInfo.PINAuthAvailable {
+		return &apiError{
+			Status:  400,
+			Kind:    client.ErrorKindUnsupportedByTargetSystem,
+			Message: "target system does not support PIN authentication",
+		}
+	}
+
+	err = deviceValidatePassphraseOrPINEntropy(device.AuthModePIN, req.PIN)
+	if err != nil {
+		var qualityErr *device.AuthQualityError
+		if errors.As(err, &qualityErr) {
+			return &apiError{
+				Status:  400,
+				Kind:    client.ErrorKindInvalidPIN,
+				Message: "PIN did not pass quality checks",
+				Value: map[string]interface{}{
+					"reasons":          qualityErr.Reasons,
+					"entropy-bits":     qualityErr.Entropy,
+					"min-entropy-bits": qualityErr.MinEntropy,
+				},
+			}
+		}
+		return InternalError(err.Error())
+	}
+
+	return SyncResponse(nil)
 }

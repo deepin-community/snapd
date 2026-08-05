@@ -19,11 +19,9 @@ backends: [-autopkgtest]
 
 # disable the following distributions
 # ubuntu-14, lack of systemd-run
-# ubuntu-18.04-32: pc gadget from 20 is not available
 # ubuntu-20.04-arm*, because we use pc kernel and gadget.
 systems:
 - -ubuntu-14.04-*
-- -ubuntu-18.04-32
 # The test downloads pc from track 20, which is not available for arm
 # TODO run the test also for a UC22 model
 - -ubuntu-*-arm-*
@@ -87,12 +85,6 @@ execute: |
         fakestore new-snap-revision --dir "${STORE_DIR}" "$SNAP_PATH" --snap-rev-json snap-"$SNAP_NAME"-rev.json
     }
     
-    # Ensure the following snaps are available on the host snap to avoid the
-    # store script trying to fetch these after setting up the fake store.
-    echo Installing required snaps we will need
-    snap install remarshal
-    snap install jq
-
     echo Download snaps needed for the the model
     snap download core
     snap download pc --channel=20/stable

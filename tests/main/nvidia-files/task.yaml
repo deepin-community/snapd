@@ -13,7 +13,10 @@ details: |
 
 systems:
     - ubuntu-18.04-64
-    - ubuntu-2*.04-64
+    - ubuntu-20.04-64
+    - ubuntu-22.04-64
+    - ubuntu-24.04-64
+    - ubuntu-24.10-64
 
 environment:
     # WARNING: Not all combinations of system and variant do something.
@@ -26,6 +29,7 @@ environment:
     PACKAGE_VERSION/530: 530
     PACKAGE_VERSION/535: 535
     PACKAGE_VERSION/550: 550
+    PACKAGE_VERSION/560: 560
     # All the -server versions.
     PACKAGE_SUFFIX/418_server: -server
     PACKAGE_SUFFIX/450_server: -server
@@ -54,19 +58,29 @@ prepare: |
     skip["ubuntu-18.04-64/535-server"]="no-driver"
     skip["ubuntu-18.04-64/550"]="no-driver"
     skip["ubuntu-18.04-64/550-server"]="no-driver"
+    skip["ubuntu-18.04-64/560"]="no-driver"
+
     skip["ubuntu-20.04-64/390"]="broken-driver"
     skip["ubuntu-20.04-64/510"]="transitional-driver"
     skip["ubuntu-20.04-64/515"]="transitional-driver"
     skip["ubuntu-20.04-64/515-server"]="transitional-driver"
     skip["ubuntu-20.04-64/525"]="transitional-driver"
     skip["ubuntu-20.04-64/530"]="transitional-driver"
+    # The i386 side of the driver is not installable due to
+    # https://bugs.launchpad.net/ubuntu/+source/nvidia-graphics-drivers-535-server/+bug/2080351
+    skip["ubuntu-20.04-64/535-server"]="broken-packaging"
     skip["ubuntu-20.04-64/550"]="no-driver"
+    skip["ubuntu-20.04-64/550-server"]="broken-packaging"
+    skip["ubuntu-20.04-64/560"]="no-driver"
+
     skip["ubuntu-22.04-64/390"]="broken-driver"
     skip["ubuntu-22.04-64/510"]="transitional-driver"
     skip["ubuntu-22.04-64/515"]="transitional-driver"
     skip["ubuntu-22.04-64/515-server"]="transitional-driver"
     skip["ubuntu-22.04-64/525"]="transitional-driver"
     skip["ubuntu-22.04-64/530"]="transitional-driver"
+    skip["ubuntu-22.04-64/560"]="no-driver"
+
     skip["ubuntu-24.04-64/390"]="no-driver"
     skip["ubuntu-24.04-64/418-server"]="no-driver"
     skip["ubuntu-24.04-64/450-server"]="no-driver"
@@ -77,6 +91,22 @@ prepare: |
     skip["ubuntu-24.04-64/515-server"]="transitional-driver"
     skip["ubuntu-24.04-64/525"]="transitional-driver"
     skip["ubuntu-24.04-64/530"]="transitional-driver"
+    skip["ubuntu-24.04-64/560"]="no-driver"
+
+    skip["ubuntu-24.10-64/390"]="no-driver"
+    skip["ubuntu-24.10-64/418-server"]="no-driver"
+    skip["ubuntu-24.10-64/450-server"]="no-driver"
+    skip["ubuntu-24.10-64/470"]="no-driver"
+    skip["ubuntu-24.10-64/470-server"]="no-driver"
+    skip["ubuntu-24.10-64/510"]="no-driver"
+    skip["ubuntu-24.10-64/515"]="no-driver"
+    skip["ubuntu-24.10-64/515-server"]="no-driver"
+    skip["ubuntu-24.10-64/525"]="no-driver"
+    skip["ubuntu-24.10-64/530"]="transitional-driver"
+    skip["ubuntu-24.10-64/535"]="transitional-driver"
+    skip["ubuntu-24.10-64/550"]="transitional-driver"
+    # /bin/bash: line 109: 10426 Segmentation fault      (core dumped) test-snapd-nvidia.64 > log-64.txt
+    skip["ubuntu-24.10-64/560"]="broken-driver"
 
     driver_suffix=$PACKAGE_VERSION${PACKAGE_SUFFIX:-}
     combi_key=$SPREAD_SYSTEM/$driver_suffix
@@ -122,13 +152,13 @@ prepare: |
         test "${skip[$combi_key]}" = "broken-driver"
         exit 0
         ;;
+    ubuntu-24.10-64/560*)
+        # /bin/bash: line 109: 10426 Segmentation fault      (core dumped) test-snapd-nvidia.64 > log-64.txt
+        echo "Broken driver is in use, expecting: skip[\"$combi_key\"]=\"broken-driver\""
+        test "${skip[$combi_key]}" = "broken-driver"
+        exit 0
+        ;;
     esac
-
-    # At this step, we we expect this test to work, and no skip file to exist.
-    echo "Everything is good, expecting: skip[\"$combi_key\"] does not exist"
-    if [[ -v "skip[$combi_key]" ]]; then
-        exit 1
-    fi
 
     # We will need to install i386 libraries. This is specifically done on an
     # amd64 system as there are cases of 32bit programs running through
@@ -137,7 +167,7 @@ prepare: |
     apt-get update
 
     # Install Nvidia userspace libraries at the designated version.
-    apt-get install -y \
+    if ! apt-get install -y \
         libnvidia-common-"$PACKAGE_VERSION${PACKAGE_SUFFIX:-}" \
         libnvidia-compute-"$PACKAGE_VERSION${PACKAGE_SUFFIX:-}":amd64 \
         libnvidia-compute-"$PACKAGE_VERSION${PACKAGE_SUFFIX:-}":i386 \
@@ -148,7 +178,17 @@ prepare: |
         libnvidia-fbc1-"$PACKAGE_VERSION${PACKAGE_SUFFIX:-}":amd64 \
         libnvidia-fbc1-"$PACKAGE_VERSION${PACKAGE_SUFFIX:-}":i386 \
         libnvidia-gl-"$PACKAGE_VERSION${PACKAGE_SUFFIX:-}":amd64 \
-        libnvidia-gl-"$PACKAGE_VERSION${PACKAGE_SUFFIX:-}":i386
+        libnvidia-gl-"$PACKAGE_VERSION${PACKAGE_SUFFIX:-}":i386 >install.txt 2>&1; then
+      echo "Broken packaging, expecting: skip[\"$combi_key\"]=\"broken-packaging\""
+      test "${skip[$combi_key]}" = "broken-packaging"
+      exit 0
+    fi
+
+    # At this step, we we expect this test to work, and no skip condition to exist.
+    echo "Everything is good, expecting: skip[\"$combi_key\"] not to exist"
+    if [[ -v "skip[$combi_key]" ]]; then
+        exit 1
+    fi
 
     # Look at the canary file libnvidia-glcore.so.* to get the exact version of
     # the driver. This file is also used by snap-confine, as a pre-condition
@@ -184,6 +224,7 @@ restore: |
     tests.cleanup restore
 
 debug: |
+    if [ -f install.txt ]; then cat install.txt; fi
     if [ -f log-32.txt ]; then cat log-32.txt; fi
     if [ -f log-64.txt ]; then cat log-64.txt; fi
 

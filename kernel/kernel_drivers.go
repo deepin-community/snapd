@@ -29,6 +29,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
@@ -84,8 +85,7 @@ func createFirmwareSymlinks(fwMount MountPoints, fwDest string) error {
 	entries, err := os.ReadDir(fwOrig)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Bit of a corner case, but maybe possible. Log anyway.
-			logger.Noticef("no firmware found in %q", fwOrig)
+			logger.Debugf("no firmware found in %q", fwOrig)
 			return nil
 		}
 		return err
@@ -203,7 +203,7 @@ func setupModsFromComp(kernelTree, kversion string, compsMntPts []ModulesCompMou
 
 	// Symbolic links to components
 	for _, cmp := range compsMntPts {
-		lname := filepath.Join(compsRoot, cmp.Name)
+		lname := filepath.Join(compsRoot, cmp.LinkName)
 		to := cmp.UnderCurrentPath("modules", kversion)
 		if err := osSymlink(to, lname); err != nil {
 			return err
@@ -222,7 +222,7 @@ func setupModsFromComp(kernelTree, kversion string, compsMntPts []ModulesCompMou
 		if cmp.CurrentEqualsTarget() {
 			continue
 		}
-		lname := filepath.Join(compsRoot, cmp.Name)
+		lname := filepath.Join(compsRoot, cmp.LinkName)
 		to := cmp.UnderTargetPath("modules", kversion)
 		// remove old link
 		os.Remove(lname)
@@ -276,7 +276,9 @@ func (mp *MountPoints) CurrentEqualsTarget() bool {
 
 // ModulesCompMountPoints contains mount points for a component plus its name.
 type ModulesCompMountPoints struct {
-	Name string
+	// LinkName is the name of the symlink in the drivers tree that will
+	// point to the component modules.
+	LinkName string
 	MountPoints
 }
 
@@ -347,10 +349,7 @@ func EnsureKernelDriversTree(kMntPts MountPoints, compsMntPts []ModulesCompMount
 			return err
 		}
 	} else {
-		// Bit of a corner case, but maybe possible. Log anyway.
-		// TODO detect this issue in snap pack, should be enforced
-		// if the snap declares kernel-modules components.
-		logger.Noticef("no modules found in %q", kMntPts.Current)
+		logger.Debugf("no modules found in %q", kMntPts.Current)
 	}
 
 	fwDir := filepath.Join(targetDir, "lib", "firmware")
@@ -409,4 +408,23 @@ func EnsureKernelDriversTree(kMntPts MountPoints, compsMntPts []ModulesCompMount
 	}
 
 	return nil
+}
+
+// NeedsKernelDriversTree returns true if we need a kernel drivers tree for this model.
+func NeedsKernelDriversTree(mod *asserts.Model) bool {
+	// Checking if it has modeenv - it must be UC20+ or hybrid
+	if mod.Grade() == asserts.ModelGradeUnset {
+		return false
+	}
+
+	// We assume core24/hybrid 24.04 onwards have the generator, for older
+	// boot bases we return false.
+	// TODO this won't work for a UC2{0,2} -> UC24+ remodel as we need the
+	// new model here. Get to this ASAP after snapd 2.62 release.
+	switch mod.Base() {
+	case "core20", "core22", "core22-desktop":
+		return false
+	default:
+		return true
+	}
 }

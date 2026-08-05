@@ -26,11 +26,8 @@ import (
 	"fmt"
 	"strconv"
 	"time"
-)
 
-var (
-	// ErrExpirationInThePast may be wrapped with the invalid expiration.
-	ErrExpirationInThePast = fmt.Errorf("cannot have expiration time in the past")
+	prompting_errors "github.com/snapcore/snapd/interfaces/prompting/errors"
 )
 
 // Metadata stores information about the origin or applicability of a prompt or
@@ -49,7 +46,7 @@ type IDType uint64
 func IDFromString(idStr string) (IDType, error) {
 	value, err := strconv.ParseUint(idStr, 16, 64)
 	if err != nil {
-		return IDType(0), fmt.Errorf("cannot parse ID as uint64: %w", err)
+		return IDType(0), fmt.Errorf("%w: %v", prompting_errors.ErrInvalidID, err)
 	}
 	return IDType(value), nil
 }
@@ -88,6 +85,8 @@ const (
 	OutcomeDeny OutcomeType = "deny"
 )
 
+var supportedOutcomes = []string{string(OutcomeAllow), string(OutcomeDeny)}
+
 func (outcome *OutcomeType) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -98,7 +97,7 @@ func (outcome *OutcomeType) UnmarshalJSON(data []byte) error {
 	case OutcomeAllow, OutcomeDeny:
 		*outcome = value
 	default:
-		return fmt.Errorf(`cannot have outcome other than %q or %q: %q`, OutcomeAllow, OutcomeDeny, value)
+		return prompting_errors.NewInvalidOutcomeError(s, supportedOutcomes)
 	}
 	return nil
 }
@@ -112,7 +111,7 @@ func (outcome OutcomeType) AsBool() (bool, error) {
 	case OutcomeDeny:
 		return false, nil
 	default:
-		return false, fmt.Errorf(`internal error: invalid outcome: %q`, outcome)
+		return false, prompting_errors.NewInvalidOutcomeError(string(outcome), supportedOutcomes)
 	}
 }
 
@@ -135,6 +134,13 @@ const (
 	// LifespanSession  LifespanType = "session"
 )
 
+var (
+	supportedLifespans = []string{string(LifespanForever), string(LifespanSingle), string(LifespanTimespan)}
+	// SupportedRuleLifespans is exported so interfaces/promptin/requestrules
+	// can use it when constructing a ErrRuleLifespanSingle
+	SupportedRuleLifespans = []string{string(LifespanForever), string(LifespanTimespan)}
+)
+
 func (lifespan *LifespanType) UnmarshalJSON(data []byte) error {
 	var lifespanStr string
 	if err := json.Unmarshal(data, &lifespanStr); err != nil {
@@ -145,7 +151,7 @@ func (lifespan *LifespanType) UnmarshalJSON(data []byte) error {
 	case LifespanForever, LifespanSingle, LifespanTimespan:
 		*lifespan = value
 	default:
-		return fmt.Errorf(`cannot have lifespan other than %q, %q, or %q: %q`, LifespanForever, LifespanSingle, LifespanTimespan, value)
+		return prompting_errors.NewInvalidLifespanError(lifespanStr, supportedLifespans)
 	}
 	return nil
 }
@@ -153,25 +159,21 @@ func (lifespan *LifespanType) UnmarshalJSON(data []byte) error {
 // ValidateExpiration checks that the given expiration is valid for the
 // receiver lifespan.
 //
-// If the lifespan is LifespanTimespan, then expiration must be non-zero and be
-// after the given currTime. Otherwise, it must be zero. Returns an error if
-// any of the above are invalid.
-func (lifespan LifespanType) ValidateExpiration(expiration time.Time, currTime time.Time) error {
+// If the lifespan is LifespanTimespan, then expiration must be non-zero.
+// Otherwise, it must be zero. Returns an error if any of the above are invalid.
+func (lifespan LifespanType) ValidateExpiration(expiration time.Time) error {
 	switch lifespan {
 	case LifespanForever, LifespanSingle:
 		if !expiration.IsZero() {
-			return fmt.Errorf(`cannot have specified expiration when lifespan is %q: %q`, lifespan, expiration)
+			return prompting_errors.NewInvalidExpirationError(expiration, fmt.Sprintf("cannot have specified expiration when lifespan is %q", lifespan))
 		}
 	case LifespanTimespan:
 		if expiration.IsZero() {
-			return fmt.Errorf(`cannot have unspecified expiration when lifespan is %q`, lifespan)
-		}
-		if currTime.After(expiration) {
-			return fmt.Errorf("%w: %q", ErrExpirationInThePast, expiration)
+			return prompting_errors.NewInvalidExpirationError(expiration, fmt.Sprintf("cannot have unspecified expiration when lifespan is %q", lifespan))
 		}
 	default:
 		// Should not occur, since lifespan is validated when unmarshalled
-		return fmt.Errorf(`internal error: invalid lifespan: %q`, lifespan)
+		return prompting_errors.NewInvalidLifespanError(string(lifespan), supportedLifespans)
 	}
 	return nil
 }
@@ -189,23 +191,53 @@ func (lifespan LifespanType) ParseDuration(duration string, currTime time.Time) 
 	switch lifespan {
 	case LifespanForever, LifespanSingle:
 		if duration != "" {
-			return expiration, fmt.Errorf(`cannot have specified duration when lifespan is %q: %q`, lifespan, duration)
+			return expiration, prompting_errors.NewInvalidDurationError(duration, fmt.Sprintf("cannot have specified duration when lifespan is %q", lifespan))
 		}
 	case LifespanTimespan:
 		if duration == "" {
-			return expiration, fmt.Errorf(`cannot have unspecified duration when lifespan is %q`, lifespan)
+			return expiration, prompting_errors.NewInvalidDurationError(duration, fmt.Sprintf("cannot have unspecified duration when lifespan is %q", lifespan))
 		}
 		parsedDuration, err := time.ParseDuration(duration)
 		if err != nil {
-			return expiration, fmt.Errorf(`cannot parse duration: %w`, err)
+			return expiration, prompting_errors.NewInvalidDurationError(duration, fmt.Sprintf("cannot parse duration: %v", err))
 		}
 		if parsedDuration <= 0 {
-			return expiration, fmt.Errorf(`cannot have zero or negative duration: %q`, duration)
+			return expiration, prompting_errors.NewInvalidDurationError(duration, fmt.Sprintf("cannot have zero or negative duration: %q", duration))
 		}
 		expiration = currTime.Add(parsedDuration)
 	default:
 		// Should not occur, since lifespan is validated when unmarshalled
-		return expiration, fmt.Errorf(`internal error: invalid lifespan: %q`, lifespan)
+		return expiration, prompting_errors.NewInvalidLifespanError(string(lifespan), supportedLifespans)
 	}
 	return expiration, nil
+}
+
+var lifespansBySupersedence = map[LifespanType]int{
+	LifespanSingle:   1,
+	LifespanTimespan: 2,
+	LifespanForever:  3,
+}
+
+// FirstLifespanGreater returns true if the first of the two given
+// lifespan/expiration pairs supersedes the second.
+//
+// LifespanForever supersedes all other lifespans, followed by LifespanTimespan,
+// followed by LifepsanSingle. If two lifespans are identical then return true
+// if the first expiration timestamp is after the second expiration timestamp.
+func FirstLifespanGreater(l1 LifespanType, e1 time.Time, l2 LifespanType, e2 time.Time) bool {
+	order1 := lifespansBySupersedence[l1]
+	order2 := lifespansBySupersedence[l2]
+	switch {
+	case order1 > order2:
+		return true
+	case order1 < order2:
+		return false
+	case e1.After(e2):
+		return true
+	case e1.Before(e2):
+		return false
+	default:
+		// They're the same
+		return false
+	}
 }

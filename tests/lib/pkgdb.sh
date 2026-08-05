@@ -540,6 +540,7 @@ pkg_dependencies_ubuntu_generic(){
         udisks2
         upower
         uuid-runtime
+        pigz
         "
 }
 
@@ -570,6 +571,7 @@ pkg_dependencies_ubuntu_classic(){
             ;;
         ubuntu-16.04-64)
             echo "
+                chrony
                 dbus-user-session
                 evolution-data-server
                 fwupd
@@ -584,22 +586,10 @@ pkg_dependencies_ubuntu_classic(){
                 "
                 pkg_linux_image_extra
             ;;
-        ubuntu-18.04-32)
-            echo "
-                dbus-user-session
-                gccgo-6
-                evolution-data-server
-                fwupd
-                gnome-online-accounts
-                packagekit
-                "
-                pkg_linux_image_extra
-            ;;
         ubuntu-18.04-64)
             echo "
                 dbus-user-session
                 gccgo-8
-                gperf
                 evolution-data-server
                 fwupd
                 packagekit
@@ -621,17 +611,34 @@ pkg_dependencies_ubuntu_classic(){
                 shellcheck
                 "
             ;;
-        ubuntu-22.*|ubuntu-23.*|ubuntu-24.*)
+        ubuntu-22.*|ubuntu-23.*|ubuntu-24.04*)
             # bpftool is part of linux-tools package
             echo "
                 dbus-user-session
                 fwupd
                 golang
+                gperf
                 libvirt-daemon-system
                 linux-tools-$(uname -r)
                 lz4
                 qemu-kvm
                 qemu-utils
+                "
+            ;;
+	ubuntu-24.10*|ubuntu-25.*)
+            # bpftool is part of linux-tools package
+            # ubuntu-24.10+ systemd-dev is optional
+            echo "
+                dbus-user-session
+                fwupd
+                golang
+                gperf
+                libvirt-daemon-system
+                linux-tools-$(uname -r)
+                lz4
+                qemu-kvm
+                qemu-utils
+                systemd-dev
                 "
             ;;
         ubuntu-*)
@@ -697,6 +704,7 @@ pkg_dependencies_fedora_centos_common(){
         git
         golang
         jq
+        iptables
         iptables-services
         man
         net-tools
@@ -809,7 +817,7 @@ pkg_dependencies_opensuse(){
         "
     if os.query is-opensuse tumbleweed; then
         echo "
-            libfwupd2
+            libfwupd3
         "
     fi
 }
@@ -898,6 +906,16 @@ install_pkg_dependencies(){
 # to stdout
 distro_upgrade() {
     case "$SPREAD_SYSTEM" in
+        amazon-linux-2023-*)
+            # Amazon Linux 2023 uses versioned releases, see
+            # https://docs.aws.amazon.com/linux/al2023/ug/deterministic-upgrades-usage.html
+            if [ "$(dnf check-release-update 2>&1)" = "" ]; then
+                return
+            fi
+
+            dnf upgrade --releasever=latest -y
+            echo "reboot"
+            ;;
         arch-*)
             # Arch does not support partial upgrades. On top of this, the image
             # we are running in may have been built some time ago and we need to

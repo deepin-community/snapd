@@ -1,6 +1,6 @@
 #!/bin/bash
 
-: "${NESTED_WORK_DIR:=/tmp/work-dir}"
+: "${NESTED_WORK_DIR:=/var/tmp/work-dir}"
 : "${NESTED_IMAGES_DIR:=${NESTED_WORK_DIR}/images}"
 : "${NESTED_RUNTIME_DIR:=${NESTED_WORK_DIR}/runtime}"
 : "${NESTED_ASSETS_DIR:=${NESTED_WORK_DIR}/assets}"
@@ -15,9 +15,11 @@
 : "${NESTED_CUSTOM_AUTO_IMPORT_ASSERTION:=}"
 : "${NESTED_FAKESTORE_BLOB_DIR:=${NESTED_WORK_DIR}/fakestore/blobs}"
 : "${NESTED_SIGN_SNAPS_FAKESTORE:=false}"
+: "${NESTED_REPACK_FOR_FAKESTORE:=false}"
 : "${NESTED_FAKESTORE_SNAP_DECL_PC_GADGET:=}"
 : "${NESTED_UBUNTU_IMAGE_SNAPPY_FORCE_SAS_URL:=}"
 : "${NESTED_UBUNTU_IMAGE_PRESEED_KEY:=}"
+: "${NESTED_UBUNTU_SEED_SIZE:=}"
 
 : "${NESTED_DISK_PHYSICAL_BLOCK_SIZE:=512}"
 : "${NESTED_DISK_LOGICAL_BLOCK_SIZE:=512}"
@@ -64,6 +66,7 @@ nested_wait_vm_ready() {
         # Check the vm is active
         if ! systemctl is-active "$NESTED_VM"; then
             echo "Unit $NESTED_VM is not active. Aborting!"
+            journalctl -u "${NESTED_VM}"
             return 1
         fi
 
@@ -281,8 +284,6 @@ nested_create_assertions_disk() {
 nested_qemu_name() {
     if os.query is-arm; then
         command -v qemu-system-aarch64
-    elif [ "$NESTED_ARCHITECTURE" = "i386" ]; then
-        command -v qemu-system-i386
     else
         command -v qemu-system-x86_64
     fi
@@ -300,7 +301,7 @@ nested_get_snap_rev_for_channel() {
          -H "Content-Type: application/json" \
          --data "{\"context\": [], \"actions\": [{\"action\": \"install\", \"name\": \"$SNAP\", \"channel\": \"$CHANNEL\", \"instance-key\": \"1\"}]}" \
          https://api.snapcraft.io/v2/snaps/refresh | \
-        jq '.results[0].snap.revision'
+        gojq '.results[0].snap.revision'
 }
 
 nested_is_nested_system() {
@@ -399,12 +400,11 @@ nested_refresh_to_new_core() {
 }
 
 nested_get_snakeoil_key() {
-    local KEYNAME="PkKek-1-snakeoil"
-    local VERSION
-    VERSION="$(nested_get_version)"
-    wget -q https://raw.githubusercontent.com/snapcore/pc-amd64-gadget/"$VERSION"/snakeoil/"$KEYNAME".key
-    wget -q https://raw.githubusercontent.com/snapcore/pc-amd64-gadget/"$VERSION"/snakeoil/"$KEYNAME".pem
-    echo "$KEYNAME"
+    nested_ensure_ovmf >/dev/null
+
+    cp "${NESTED_ASSETS_DIR}/ovmf/secboot/DB.key" DB.key
+    cp "${NESTED_ASSETS_DIR}/ovmf/secboot/DB.crt" DB.pem
+    echo DB
 }
 
 nested_secboot_remove_signature() {
@@ -415,10 +415,24 @@ nested_secboot_remove_signature() {
 }
 
 nested_secboot_sign_file() {
-    local FILE="$1"
-    local KEY="$2"
-    local CERT="$3"
-    nested_secboot_remove_signature "$FILE"
+    local keep_signatures
+    args=()
+    while [ "${#}" -gt 0 ]; do
+        case "${1}" in
+            --keep-signatures)
+                keep_signatures=1
+                ;;
+            *)
+                args+=("${1}")
+        esac
+        shift
+    done
+    local FILE="${args[0]}"
+    local KEY="${args[1]}"
+    local CERT="${args[2]}"
+    if [ "${keep_signatures+set}" != set ]; then
+        nested_secboot_remove_signature "$FILE"
+    fi
     sbsign --key "$KEY" --cert "$CERT" --output "$FILE" "$FILE"
 }
 
@@ -455,7 +469,7 @@ nested_cleanup_env() {
     rm -rf "$(nested_get_extra_snaps_path)"
 }
 
-nested_get_image_name() {
+nested_get_image_name_base() {
     local TYPE="$1"
     local SOURCE="${NESTED_CORE_CHANNEL}"
     local NAME="${NESTED_IMAGE_ID:-generic}"
@@ -477,7 +491,13 @@ nested_get_image_name() {
     if [ "$(nested_get_extra_snaps | wc -l)" != "0" ]; then
         SOURCE="custom"
     fi
-    echo "ubuntu-${TYPE}-${VERSION}-${SOURCE}-${NAME}.img"
+    echo "ubuntu-${TYPE}-${VERSION}-${SOURCE}-${NAME}"
+}
+
+nested_get_image_name() {
+    local BASE_NAME
+    BASE_NAME="$(nested_get_image_name_base "$1")"
+    echo "${BASE_NAME}.img"
 }
 
 nested_is_generic_image() {
@@ -496,16 +516,24 @@ nested_get_images_path() {
     echo "$NESTED_IMAGES_DIR"
 }
 
-nested_get_extra_snaps() {
-    local EXTRA_SNAPS=""
+nested_get_extra_containers() {
+    local SUFFIX=$1
     local EXTRA_SNAPS_PATH
     EXTRA_SNAPS_PATH="$(nested_get_extra_snaps_path)"
 
     if [ -d "$EXTRA_SNAPS_PATH" ]; then
         while IFS= read -r mysnap; do
             echo "$mysnap"
-        done < <(find "$EXTRA_SNAPS_PATH" -name '*.snap')
+        done < <(find "$EXTRA_SNAPS_PATH" -name "*.$SUFFIX")
     fi
+}
+
+nested_get_extra_snaps() {
+    nested_get_extra_containers snap
+}
+
+nested_get_extra_comps() {
+    nested_get_extra_containers comp
 }
 
 nested_download_image() {
@@ -652,6 +680,8 @@ nested_prepare_kernel() {
                 fi
 
                 if nested_is_core_24_system; then
+                    # shellcheck source=tests/lib/prepare.sh
+                    . "$TESTSLIB"/prepare.sh
                     uc24_build_initramfs_kernel_snap "pc-kernel.snap" "$NESTED_ASSETS_DIR" "$epochBumpTime"
                 else
                     uc20_build_initramfs_kernel_snap "pc-kernel.snap" "$NESTED_ASSETS_DIR" "$epochBumpTime"
@@ -730,6 +760,7 @@ EOF
                 # visibility what happens when a machine fails to boot
                 GADGET_EXTRA_CMDLINE="console=ttyS0 snapd.debug=1 systemd.journald.forward_to_console=1"
             fi
+
             if [ -n "$NESTED_EXTRA_CMDLINE" ]; then
                 GADGET_EXTRA_CMDLINE="$GADGET_EXTRA_CMDLINE $NESTED_EXTRA_CMDLINE"
             fi
@@ -737,6 +768,18 @@ EOF
             if [ -n "$GADGET_EXTRA_CMDLINE" ]; then
                 echo "Configuring command line parameters in the gadget snap: \"console=ttyS0 $GADGET_EXTRA_CMDLINE\""
                 echo "$GADGET_EXTRA_CMDLINE" > pc-gadget/cmdline.extra
+            fi
+
+            if [ -n "$NESTED_UBUNTU_SEED_SIZE" ]; then
+                "$TESTSLIB"/manip_ubuntu_seed.py pc-gadget/meta/gadget.yaml "$NESTED_UBUNTU_SEED_SIZE"
+            fi
+
+            if [ "$NESTED_REPACK_FOR_FAKESTORE" = "true" ]; then
+                cat > pc-gadget/meta/hooks/prepare-device << EOF
+#!/bin/sh
+snapctl set device-service.url=http://10.0.2.2:11029
+EOF
+                chmod +x pc-gadget/meta/hooks/prepare-device
             fi
 
             # pack the gadget
@@ -817,20 +860,24 @@ nested_prepare_essential_snaps() {
 
 nested_configure_default_user() {
     local IMAGE_NAME
+    local IMAGE_PATH
+    
     IMAGE_NAME="$(nested_get_image_name core)"
+    IMAGE_PATH="$(realpath "$NESTED_IMAGES_DIR/$IMAGE_NAME")"
+
     # Configure the user for the vm
     if [ "$NESTED_USE_CLOUD_INIT" = "true" ]; then
         if nested_is_core_ge 20; then
-            nested_configure_cloud_init_on_core20_vm "$NESTED_IMAGES_DIR/$IMAGE_NAME"
+            nested_configure_cloud_init_on_core20_vm "$IMAGE_PATH"
         else
-            nested_configure_cloud_init_on_core_vm "$NESTED_IMAGES_DIR/$IMAGE_NAME"
+            nested_configure_cloud_init_on_core_vm "$IMAGE_PATH"
         fi
     else
         nested_create_assertions_disk
     fi
 
-    # Save a copy of the image
-    cp -v "$NESTED_IMAGES_DIR/$IMAGE_NAME" "$NESTED_IMAGES_DIR/$IMAGE_NAME.pristine"
+    # Save a copy of the primary image
+    cp -v "$IMAGE_PATH" "$IMAGE_PATH.pristine"
 }
 
 nested_create_core_vm() {
@@ -843,14 +890,19 @@ nested_create_core_vm() {
     IMAGE_NAME="$(nested_get_image_name core)"
     mkdir -p "$NESTED_IMAGES_DIR"
 
-    if [ -f "$NESTED_IMAGES_DIR/$IMAGE_NAME.pristine" ]; then
-        cp -v "$NESTED_IMAGES_DIR/$IMAGE_NAME.pristine" "$NESTED_IMAGES_DIR/$IMAGE_NAME"
-        if [ ! "$NESTED_USE_CLOUD_INIT" = "true" ]; then
-            nested_create_assertions_disk
-        fi
-        return
+    if [ -f "$NESTED_IMAGES_DIR/$IMAGE_NAME" ]; then
+        local IMAGE_PATH
+        IMAGE_PATH="$(realpath "$NESTED_IMAGES_DIR/$IMAGE_NAME")"
 
-    elif [ ! -f "$NESTED_IMAGES_DIR/$IMAGE_NAME" ]; then
+        if [ -f "$IMAGE_PATH.pristine" ]; then
+            cp -v "$IMAGE_PATH.pristine" "$IMAGE_PATH"
+            if [ ! "$NESTED_USE_CLOUD_INIT" = "true" ]; then
+                nested_create_assertions_disk
+            fi
+            return
+        fi
+
+    else
         if [ -n "$NESTED_CUSTOM_IMAGE_URL" ]; then
             # download the ubuntu-core image from $CUSTOM_IMAGE_URL
             nested_download_image "$NESTED_CUSTOM_IMAGE_URL" "$IMAGE_NAME"
@@ -872,11 +924,17 @@ nested_create_core_vm() {
             # Invoke ubuntu image
             local NESTED_MODEL
             NESTED_MODEL="$(nested_get_model)"
-            
+
             local EXTRA_SNAPS=""
             for mysnap in $(nested_get_extra_snaps); do
                 EXTRA_SNAPS="$EXTRA_SNAPS --snap $mysnap"
             done
+            for mycomp in $(nested_get_extra_comps); do
+                EXTRA_SNAPS="$EXTRA_SNAPS --comp $mycomp"
+            done
+            if [ -n "$NESTED_KERNEL_MODULES_COMP" ] && [ "$(nested_get_version)" -ge "24" ]; then
+                EXTRA_SNAPS="$EXTRA_SNAPS --comp pc-kernel+${NESTED_KERNEL_MODULES_COMP}.comp"
+            fi
 
             # only set SNAPPY_FORCE_SAS_URL because we don't need it defined 
             # anywhere else but here, where snap prepare-image as called by 
@@ -910,13 +968,29 @@ nested_create_core_vm() {
             # ubuntu-image dropped the --output parameter, so we have to rename
             # the image ourselves, the images are named after volumes listed in
             # gadget.yaml
+            local IMAGE_BASE_NAME
+            IMAGE_BASE_NAME="$(nested_get_image_name_base core)"
             find "$NESTED_IMAGES_DIR/" -maxdepth 1 -name '*.img' | while read -r imgname; do
-                if [ -e "$NESTED_IMAGES_DIR/$IMAGE_NAME" ]; then
-                    echo "Image $IMAGE_NAME file already present"
+                volname=$(basename "$imgname" .img)
+                mv "$imgname" "$NESTED_IMAGES_DIR/$IMAGE_BASE_NAME-$volname.img"
+            done
+
+            # get the name of the boot-volume, and then create a symlink
+            # between the regular image name and the main volume, additional
+            # volumes must be manually added to the VM creation by the tests
+            local BOOTVOLUME
+            BOOTVOLUME=pc
+            if [ -e pc-gadget/meta/gadget.yaml ]; then
+                # shellcheck disable=SC2016
+                BOOTVOLUME="$(gojq --yaml-input '.volumes | to_entries[] | .key as $p | .value.structure[] | select(.name == "ubuntu-boot") | $p' pc-gadget/meta/gadget.yaml | tr -d '"')"
+                if [ -z "$BOOTVOLUME" ]; then
+                    echo "was not able to deduce the ubuntu-boot partition from gadget.yaml in pc-gadget/meta/gadget.yaml"
+                    echo "please inspect it and make sure it looks as expected"
                     exit 1
                 fi
-                mv "$imgname" "$NESTED_IMAGES_DIR/$IMAGE_NAME"
-            done
+            fi
+            ln -s "$NESTED_IMAGES_DIR/$IMAGE_BASE_NAME-$BOOTVOLUME.img" "$NESTED_IMAGES_DIR/$IMAGE_NAME"
+
             unset SNAPPY_FORCE_SAS_URL
             unset UBUNTU_IMAGE_SNAP_CMD
         fi
@@ -1086,6 +1160,16 @@ nested_force_stop_vm() {
     systemctl stop "$NESTED_VM"
 }
 
+nested_ensure_ovmf() {
+    if [ -d "${NESTED_ASSETS_DIR}/ovmf" ]; then
+        return
+    fi
+    if ! [ -f "${NESTED_ASSETS_DIR}/test-snapd-ovmf.snap" ]; then
+        snap download --channel=latest/edge test-snapd-ovmf --basename=test-snapd-ovmf --target-directory="${NESTED_ASSETS_DIR}"
+    fi
+    unsquashfs -d "${NESTED_ASSETS_DIR}/ovmf" "${NESTED_ASSETS_DIR}/test-snapd-ovmf.snap"
+}
+
 nested_force_start_vm() {
     # if the $NESTED_VM is using a swtpm, we need to wait until the file exists
     # because the file disappears temporarily after qemu exits
@@ -1200,47 +1284,31 @@ nested_start_core_vm_unit() {
         PARAM_ASSERTIONS="-drive if=none,id=stick,format=raw,file=$NESTED_ASSETS_DIR/assertions.disk,cache=none,format=raw -device nec-usb-xhci,id=xhci -device usb-storage,bus=xhci.0,removable=true,drive=stick"
     fi
     if nested_is_core_ge 20; then
-        # use a bundle EFI bios by default
+        nested_ensure_ovmf
+        local OVMF_CODE OVMF_VARS OVMF_VARS_SECBOOT OVMF_VARS_CURRENT OVMF
         if os.query is-arm; then
-            PARAM_BIOS="-bios /usr/share/AAVMF/AAVMF_CODE.fd"
+            OVMF=QEMU
         else
-            PARAM_BIOS="-bios /usr/share/ovmf/OVMF.fd"
+            OVMF=OVMF
         fi
-        local OVMF_CODE OVMF_VARS
-        OVMF_CODE=""
-        OVMF_VARS=""
+        OVMF_CODE="${NESTED_ASSETS_DIR}/ovmf/fw/${OVMF}_CODE.fd"
+        OVMF_VARS="${NESTED_ASSETS_DIR}/ovmf/fw/${OVMF}_VARS.fd"
+        OVMF_VARS_SECBOOT="${NESTED_ASSETS_DIR}/ovmf/fw/${OVMF}_VARS.enrolled.fd"
+        OVMF_VARS_CURRENT="${NESTED_ASSETS_DIR}/ovmf/fw/${OVMF}_VARS.current.fd"
 
-        if nested_is_core_ge 22; then
-            wget -q https://storage.googleapis.com/snapd-spread-tests/dependencies/OVMF_CODE.secboot.fd
-            mv OVMF_CODE.secboot.fd /usr/share/OVMF/OVMF_CODE.secboot.fd
-            wget -q https://storage.googleapis.com/snapd-spread-tests/dependencies/OVMF_VARS.snakeoil.fd
-            mv OVMF_VARS.snakeoil.fd /usr/share/OVMF/OVMF_VARS.snakeoil.fd
-            wget -q https://storage.googleapis.com/snapd-spread-tests/dependencies/OVMF_VARS.ms.fd
-            mv OVMF_VARS.ms.fd /usr/share/OVMF/OVMF_VARS.ms.fd
-        fi
-
-        # In this case the kernel.efi is unsigned and signed with snaleoil certs
-        if [ "$NESTED_FORCE_MS_KEYS" != "true" ] && [ "$NESTED_BUILD_SNAPD_FROM_CURRENT" = "true" ]; then
-            OVMF_VARS="snakeoil"
-        else
-            OVMF_VARS="ms"
-        fi
-
-        if nested_is_secure_boot_enabled; then
-            OVMF_CODE="secboot"
-            if os.query is-arm; then
-                cp -f "/usr/share/AAVMF/AAVMF_VARS.fd" "$NESTED_ASSETS_DIR/AAVMF_VARS.fd"
-                PARAM_BIOS="-drive file=/usr/share/AAVMF/AAVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on -drive file=$NESTED_ASSETS_DIR/AAVMF_VARS.fd,if=pflash,format=raw"
+        if [ -z "${NESTED_KEEP_FIRMWARE_STATE-}" ] || ! [ -e "${OVMF_VARS_CURRENT}" ]; then
+            if nested_is_secure_boot_enabled; then
+                cp -fv "${OVMF_VARS_SECBOOT}" "${OVMF_VARS_CURRENT}"
             else
-                cp -f "/usr/share/OVMF/OVMF_VARS.${OVMF_VARS}.fd" "$NESTED_ASSETS_DIR/OVMF_VARS.${OVMF_VARS}.fd"
-                PARAM_BIOS="-drive file=/usr/share/OVMF/OVMF_CODE.${OVMF_CODE}.fd,if=pflash,format=raw,unit=0,readonly=on -drive file=$NESTED_ASSETS_DIR/OVMF_VARS.${OVMF_VARS}.fd,if=pflash,format=raw"
-                PARAM_MACHINE="-machine q35${ATTR_KVM} -global ICH9-LPC.disable_s3=1"
+                cp -fv "${OVMF_VARS}" "${OVMF_VARS_CURRENT}"
             fi
         fi
+        PARAM_BIOS="-drive file=${OVMF_CODE},if=pflash,format=raw,readonly=on -drive file=${OVMF_VARS_CURRENT},if=pflash,format=raw"
+        PARAM_MACHINE="-machine q35${ATTR_KVM}"
 
         if nested_is_tpm_enabled; then
             if snap list test-snapd-swtpm >/dev/null; then
-                if [ -z "$NESTED_TPM_NO_RESTART" ]; then
+                if [ -z "${NESTED_KEEP_FIRMWARE_STATE-}" ]; then
                     # reset the tpm state
                     snap stop test-snapd-swtpm > /dev/null
                     rm /var/snap/test-snapd-swtpm/current/tpm2-00.permall || true
@@ -1258,7 +1326,8 @@ nested_start_core_vm_unit() {
                 PARAM_TPM="$PARAM_TPM -device tpm-tis,tpmdev=tpm0"
             fi
         fi
-        PARAM_IMAGE="-drive file=$CURRENT_IMAGE,cache=none,format=raw,id=disk1,if=none -device virtio-blk-pci,drive=disk1,bootindex=1"
+        # addr=5 is to make tests/nested/manual/install-volume-assignment have stable address
+        PARAM_IMAGE="-drive file=$CURRENT_IMAGE,cache=none,format=raw,id=disk1,if=none -device virtio-blk-pci,drive=disk1,bootindex=1,addr=5"
     else
         PARAM_IMAGE="-drive file=$CURRENT_IMAGE,cache=none,format=raw,id=disk1,if=none -device ide-hd,drive=disk1"
     fi
@@ -1358,6 +1427,7 @@ nested_start_core_vm() {
         # options, so if that env var is set, we will reuse the existing file if it
         # exists
         local IMAGE_NAME
+        local IMAGE_PATH
         IMAGE_NAME="$(nested_get_image_name core)"
         if ! [ -f "$NESTED_IMAGES_DIR/$IMAGE_NAME" ]; then
             echo "No image found to be started"
@@ -1366,12 +1436,13 @@ nested_start_core_vm() {
 
         # images are created as sparse files, simple cp should preserve that
         # property
-        cp -v "$NESTED_IMAGES_DIR/$IMAGE_NAME" "$CURRENT_IMAGE"
+        IMAGE_PATH="$(realpath "$NESTED_IMAGES_DIR/$IMAGE_NAME")"
+        cp -v "$IMAGE_PATH" "$CURRENT_IMAGE"
 
         # Start the nested core vm
         nested_start_core_vm_unit "$CURRENT_IMAGE"
 
-        if [ ! -f "$NESTED_IMAGES_DIR/$IMAGE_NAME.configured" ]; then
+        if [ ! -f "$IMAGE_PATH.configured" ]; then
             # configure ssh for first time
             nested_prepare_ssh
             sync
@@ -1382,8 +1453,8 @@ nested_start_core_vm() {
                 nested_shutdown
 
                 # Save the image with the name of the original image
-                cp -v "${CURRENT_IMAGE}" "$NESTED_IMAGES_DIR/$IMAGE_NAME"
-                touch "$NESTED_IMAGES_DIR/$IMAGE_NAME.configured"
+                cp -v "${CURRENT_IMAGE}" "$IMAGE_PATH"
+                touch "$IMAGE_PATH.configured"
 
                 # Start the current image again and wait until it is ready
                 nested_start

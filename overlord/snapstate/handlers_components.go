@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/snapstate/backend"
 	"github.com/snapcore/snapd/overlord/snapstate/sequence"
 	"github.com/snapcore/snapd/overlord/state"
@@ -190,15 +191,7 @@ func (m *SnapManager) doDownloadComponent(t *state.Task, tomb *tomb.Tomb) error 
 		rate = autoRefreshRateLimited(st)
 	}
 
-	cpi := snap.MinimalComponentContainerPlaceInfo(
-		compsup.ComponentName(), compsup.CompSideInfo.Revision,
-		snapsup.InstanceName(),
-	)
-
-	// TODO:COMPS: to be consistent with snaps, this should be able to point
-	// somewhere else, based on a path that is in the compsup. this would be
-	// used for creating new recovery systems, like it is now for snaps
-	target := cpi.MountFile()
+	target := compsup.BlobPath(snapsup.InstanceName())
 
 	sto := Store(st, deviceCtx)
 	meter := NewTaskProgressAdapterUnlocked(t)
@@ -295,7 +288,7 @@ func (m *SnapManager) doMountComponent(t *state.Task, _ *tomb.Tomb) (err error) 
 	var readInfoErr error
 	for i := 0; i < 10; i++ {
 		compMntDir := cpi.MountDir()
-		_, readInfoErr = readComponentInfo(compMntDir, nil, csi)
+		_, readInfoErr = readComponentInfoAt(compMntDir, nil, csi)
 		if readInfoErr == nil {
 			logger.Debugf("component %q (%v) available at %q",
 				csi.Component, compSetup.Revision(), compMntDir)
@@ -341,8 +334,15 @@ func (m *SnapManager) doMountComponent(t *state.Task, _ *tomb.Tomb) (err error) 
 	return nil
 }
 
+// ReadComponentInfo reads the snap's component and returns a ComponentInfo.
+func ReadComponentInfo(snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
+	compName, compRev := csi.Component.ComponentName, csi.Revision
+	mountDir := snap.ComponentMountDir(compName, compRev, snapInfo.InstanceName())
+	return readComponentInfoAt(mountDir, snapInfo, csi)
+}
+
 // Maybe we will need flags as in readInfo
-var readComponentInfo = func(compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
+var readComponentInfoAt = func(compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
 	cont := snapdir.New(compMntDir)
 	return snap.ReadComponentInfoFromContainer(cont, snapInfo, csi)
 }
@@ -522,11 +522,15 @@ func (m *SnapManager) doUnlinkCurrentComponent(t *state.Task, _ *tomb.Tomb) (err
 	defer st.Unlock()
 
 	// snapSt is a copy of the current state
-	compSetup, _, snapSt, err := compSetupAndState(t)
+	compSetup, snapsup, snapSt, err := compSetupAndState(t)
 	if err != nil {
 		return err
 	}
 	cref := compSetup.CompSideInfo.Component
+
+	if err := saveCurrentKernelModuleComponents(t, snapsup, snapSt); err != nil {
+		return err
+	}
 
 	// Expected to be installed
 	snapInfo, err := snapSt.CurrentInfo()
@@ -557,12 +561,6 @@ func (m *SnapManager) doUnlinkComponent(t *state.Task, _ *tomb.Tomb) (err error)
 	// snapSt is a copy of the current state
 	compSetup, snapSup, snapSt, err := compSetupAndState(t)
 	if err != nil {
-		return err
-	}
-
-	// TODO:COMPS: test taking this branch when unlinking components during a
-	// refresh where we lose components
-	if err := saveCurrentKernelModuleComponents(t, snapSup, snapSt); err != nil {
 		return err
 	}
 
@@ -713,6 +711,45 @@ func (m *SnapManager) doPrepareKernelModulesComponents(t *state.Task, _ *tomb.To
 	st.Lock()
 	if err != nil {
 		return err
+	}
+
+	// Inject fault during the kernel components setup
+	osutil.MaybeInjectFault("prepare-kernel-components")
+
+	var newInfo *snap.Info
+	// Set the default to false for compatibility with older snapd (case of
+	// joint refresh of snapd and kernel).
+	setNextBoot := false
+	if err := t.Get("set-next-boot", &setNextBoot); err != nil &&
+		!errors.Is(err, state.ErrNoState) {
+		return err
+	}
+	if setNextBoot {
+		// TODO we have to revert changes in bootloader config/modeenv if an
+		// error happens later in this method. This is not likely as possible
+		// errors after this would happen only due to internal errors or not
+		// being able to write to the filesystem, but still. There is also the
+		// question of what would happen if a restart happens when the boot
+		// configuration has been already written but DoneStatus in the state
+		// has not.
+		cand := sequence.NewRevisionSideState(snapsup.SideInfo, nil)
+		newInfo, err = readInfo(snapsup.InstanceName(), cand.Snap, 0)
+		if err != nil {
+			return err
+		}
+		deviceCtx, err := DeviceCtx(st, t, nil)
+		if err != nil {
+			return err
+		}
+		isUndo := false
+		rebootInfo, err := m.backend.MaybeSetNextBoot(newInfo, deviceCtx, isUndo)
+		if err != nil {
+			return err
+		}
+		if rebootInfo.RebootRequired {
+			return m.finishTaskWithMaybeRestart(t, state.DoneStatus,
+				restartPossibility{info: newInfo, RebootInfo: rebootInfo})
+		}
 	}
 
 	// Make sure we won't be rerun

@@ -20,7 +20,6 @@
 package snapstate
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -51,10 +50,6 @@ import (
 	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/systemd"
 	"github.com/snapcore/snapd/wrappers"
-)
-
-var (
-	snapdTransitionDelayWithRandomness = 3*time.Hour + randutil.RandomDuration(4*time.Hour)
 )
 
 // SnapManager is responsible for the installation and removal of snaps.
@@ -155,23 +150,27 @@ type SnapSetup struct {
 	// effect on which tasks get created to update the snap.
 	AlwaysUpdate bool `json:"-"`
 
-	// Registries is the set of registries that the snap plugs, identified by
-	// account and registry name pairs.
-	Registries []RegistryID `json:"registries,omitempty"`
+	// Confdbs is the set of confdbs that the snap plugs, identified by
+	// account and confdb name pairs.
+	Confdbs []ConfdbID `json:"confdbs,omitempty"`
 
 	// PreUpdateKernelModuleComponents is set if the kernel-modules component
 	// that are set up, prior to any changes to the state. This is used in the
 	// case of an undo. Note that this cannot be tagged as omitempty, since we
 	// need to distinguish between empty and nil.
 	PreUpdateKernelModuleComponents []*snap.ComponentSideInfo `json:"pre-update-kernel-module-components"`
+
+	// ComponentExclusiveOperation is set if this SnapSetup exists only to deal with
+	// components, and not the snap itself.
+	ComponentExclusiveOperation bool `json:"component-exclusive-operation,omitempty"`
 }
 
-// RegistryID identifies a registry.
-type RegistryID struct {
-	// Account is the name of the account that publishes the registry.
+// ConfdbID identifies a confdb.
+type ConfdbID struct {
+	// Account is the name of the account that publishes the confdb.
 	Account string
-	// Registry is the name of the registry within the account namespace.
-	Registry string
+	// Confdb is the name of the confdb within the account namespace.
+	Confdb string
 }
 
 func (snapsup *SnapSetup) InstanceName() string {
@@ -202,8 +201,10 @@ func (snapsup *SnapSetup) MountDir() string {
 	return snap.MountDir(snapsup.InstanceName(), snapsup.Revision())
 }
 
-// MountFile returns the path to the snap/squashfs file that is used to mount the snap.
-func (snapsup *SnapSetup) MountFile() string {
+// BlobPath returns the path to the snap/squashfs file that backs the snap that
+// is being setup. Unless the snap was downloaded to a custom location, this
+// will be under dirs.SnapBlobDir.
+func (snapsup *SnapSetup) BlobPath() string {
 	blobDir := snapsup.DownloadBlobDir
 	if blobDir == "" {
 		blobDir = dirs.SnapBlobDir
@@ -225,9 +226,15 @@ type ComponentSetup struct {
 	// DownloadInfo contains information about how to download this component.
 	// Will be nil if the component should be sourced from a local file.
 	DownloadInfo *snap.DownloadInfo `json:"download-info,omitempty"`
-	// componentInstallFlags is a set of flags that control the behavior of the
+	// SkipAssertionsDownload indicates that all assertions needed to install
+	// the component should already be present on the system.
+	SkipAssertionsDownload bool `json:"skip-assertions-download,omitempty"`
+	// DownloadBlobDir is the directory where the component file is downloaded to. If
+	// empty, then the components are downloaded to the default download directory.
+	DownloadBlobDir string `json:"download-blob-dir,omitempty"`
+	// ComponentInstallFlags is a set of flags that control the behavior of the
 	// component's installation/update.
-	componentInstallFlags
+	ComponentInstallFlags
 }
 
 func NewComponentSetup(csi *snap.ComponentSideInfo, compType snap.ComponentType, compPath string) *ComponentSetup {
@@ -245,6 +252,29 @@ func (compsu *ComponentSetup) ComponentName() string {
 
 func (compsu *ComponentSetup) Revision() snap.Revision {
 	return compsu.CompSideInfo.Revision
+}
+
+// BlobPath returns the path to the component/squashfs file that backs the
+// component that is being setup. Unless the component was downloaded to a
+// custom location, this will be under dirs.SnapBlobDir.
+func (compsu *ComponentSetup) BlobPath(instanceName string) string {
+	if instanceName == "" {
+		instanceName = compsu.CompSideInfo.Component.SnapName
+	}
+
+	blobDir := compsu.DownloadBlobDir
+	if blobDir == "" {
+		blobDir = dirs.SnapBlobDir
+	}
+
+	cpi := snap.MinimalComponentContainerPlaceInfo(
+		compsu.CompSideInfo.Component.ComponentName,
+		compsu.CompSideInfo.Revision,
+		instanceName,
+	)
+
+	return filepath.Join(blobDir,
+		fmt.Sprintf("%s_%s.comp", cpi.ContainerName(), compsu.CompSideInfo.Revision))
 }
 
 // ComponentSetupFromSnapSetup returns a list of ComponentSetup structs for the
@@ -321,10 +351,15 @@ type SnapState struct {
 	// remember services that were disabled in another revision and then renamed
 	// or otherwise removed from the snap in a future refresh.
 	LastActiveDisabledServices []string `json:"last-active-disabled-services,omitempty"`
+	// LastActiveDisabledUserServices, like LastActiveDisabledServices is a map of user-services
+	// that were disabled in the snap when it was last active. The same rules apply.
+	LastActiveDisabledUserServices map[int][]string `json:"last-active-disabled-user-services,omitempty"`
 
 	// tracking services enabled and disabled by hooks
-	ServicesEnabledByHooks  []string `json:"services-enabled-by-hooks,omitempty"`
-	ServicesDisabledByHooks []string `json:"services-disabled-by-hooks,omitempty"`
+	ServicesEnabledByHooks      []string         `json:"services-enabled-by-hooks,omitempty"`
+	UserServicesEnabledByHooks  map[int][]string `json:"user-services-enabled-by-hooks,omitempty"`
+	ServicesDisabledByHooks     []string         `json:"services-disabled-by-hooks,omitempty"`
+	UserServicesDisabledByHooks map[int][]string `json:"user-services-disabled-by-hooks,omitempty"`
 
 	// Current indicates the current active revision if Active is
 	// true or the last active revision if Active is false
@@ -371,6 +406,9 @@ type SnapState struct {
 	// their security profiles set up but are not active.
 	// It is managed by ifacestate.
 	PendingSecurity *PendingSecurityState `json:"pending-security,omitempty"`
+
+	// RefreshFailures tracks information about snap failed refreshes.
+	RefreshFailures *snap.RefreshFailuresInfo `json:"refresh-failures,omitempty"`
 }
 
 // PendingSecurityState holds information about snaps that have
@@ -657,10 +695,7 @@ func (snapst *SnapState) ComponentInfosForRevision(rev snap.Revision) ([]*snap.C
 
 	compInfos := make([]*snap.ComponentInfo, 0, len(revState.Components))
 	for _, comp := range revState.Components {
-		cpi := snap.MinimalComponentContainerPlaceInfo(comp.SideInfo.Component.ComponentName,
-			comp.SideInfo.Revision, si.InstanceName())
-
-		compInfo, err := readComponentInfo(cpi.MountDir(), si, comp.SideInfo)
+		compInfo, err := ReadComponentInfo(si, comp.SideInfo)
 		if err != nil {
 			return nil, err
 		}
@@ -685,9 +720,7 @@ func (snapst *SnapState) CurrentComponentInfo(cref naming.ComponentRef) (*snap.C
 		return nil, err
 	}
 
-	cpi := snap.MinimalComponentContainerPlaceInfo(csi.Component.ComponentName,
-		csi.Revision, si.InstanceName())
-	return readComponentInfo(cpi.MountDir(), si, csi)
+	return ReadComponentInfo(si, csi)
 }
 
 func (snapst *SnapState) InstanceName() string {
@@ -870,9 +903,12 @@ func (m *SnapManager) StartUp() error {
 		return fmt.Errorf("failed to generate cookies: %q", err)
 	}
 
-	// register handler that records a refresh-inhibit notice when
-	// the set of inhibited snaps is changed.
-	m.changeCallbackID = m.state.AddChangeStatusChangedHandler(processInhibitedAutoRefresh)
+	m.changeCallbackID = m.state.AddChangeStatusChangedHandler(func(chg *state.Change, old, new state.Status) {
+		// This handler records a refresh-inhibit notice when the set of inhibited snaps is changed.
+		processInhibitedAutoRefresh(chg, old, new)
+		// This handler implements marks failed snaps auto-refresh attempts for backoff.
+		processFailedAutoRefresh(chg, old, new)
+	})
 
 	if CheckExpectedRestart(m.state) == ErrUnexpectedRuntimeRestart {
 		logger.Noticef("detected a restart at runtime without a corresponding snapd change")
@@ -1162,112 +1198,6 @@ func changeInFlight(st *state.State) bool {
 		}
 	}
 	return false
-}
-
-// ensureSnapdSnapTransition will migrate systems to use the "snapd" snap
-func (m *SnapManager) ensureSnapdSnapTransition() error {
-	m.state.Lock()
-	defer m.state.Unlock()
-
-	// we only auto-transition people on classic systems, for core we
-	// will need to do a proper re-model
-	if !release.OnClassic {
-		return nil
-	}
-
-	// Wait for the system to be seeded before transtioning
-	var seeded bool
-	err := m.state.Get("seeded", &seeded)
-	if err != nil {
-		if !errors.Is(err, state.ErrNoState) {
-			// already seeded or other error
-			return err
-		}
-		return nil
-	}
-	if !seeded {
-		return nil
-	}
-
-	// check if snapd snap is installed
-	var snapst SnapState
-	err = Get(m.state, "snapd", &snapst)
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-	// nothing to do
-	if snapst.IsInstalled() {
-		return nil
-	}
-
-	// check if the user opts into the snapd snap
-	optedIntoSnapdTransition, err := optedIntoSnapdSnap(m.state)
-	if err != nil {
-		return err
-	}
-	// nothing to do: the user does not want the snapd snap yet
-	if !optedIntoSnapdTransition {
-		return nil
-	}
-
-	// ensure we only transition systems that have snaps already
-	installedSnaps, err := NumSnaps(m.state)
-	if err != nil {
-		return err
-	}
-	// no installed snaps (yet): do nothing (fresh classic install)
-	if installedSnaps == 0 {
-		return nil
-	}
-
-	// get current core snap and use same channel/user for the snapd snap
-	err = Get(m.state, "core", &snapst)
-	// Note that state.ErrNoState should never happen in practice. However
-	// if it *does* happen we still want to fix those systems by installing
-	// the snapd snap.
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-	coreChannel := snapst.TrackingChannel
-	// snapd/core are never blocked on auth so we don't need to copy
-	// the userID from the snapst here
-	userID := 0
-
-	if changeInFlight(m.state) {
-		// check that there is no change in flight already, this is a
-		// precaution to ensure the snapd transition is safe
-		return nil
-	}
-
-	// ensure we limit the retries in case something goes wrong
-	var lastSnapdTransitionAttempt time.Time
-	err = m.state.Get("snapd-transition-last-retry-time", &lastSnapdTransitionAttempt)
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-	now := time.Now()
-	if !lastSnapdTransitionAttempt.IsZero() && lastSnapdTransitionAttempt.Add(snapdTransitionDelayWithRandomness).After(now) {
-		return nil
-	}
-	m.state.Set("snapd-transition-last-retry-time", now)
-
-	var retryCount int
-	err = m.state.Get("snapd-transition-retry", &retryCount)
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-	m.state.Set("snapd-transition-retry", retryCount+1)
-
-	ts, err := Install(context.Background(), m.state, "snapd", &RevisionOptions{Channel: coreChannel}, userID, Flags{})
-	if err != nil {
-		return err
-	}
-
-	msg := i18n.G("Transition to the snapd snap")
-	chg := m.state.NewChange("transition-to-snapd-snap", msg)
-	chg.AddAll(ts)
-
-	return nil
 }
 
 // ensureUbuntuCoreTransition will migrate systems that use "ubuntu-core"
@@ -1588,7 +1518,6 @@ func (m *SnapManager) Ensure() error {
 		m.ensureAliasesV2(),
 		m.ensureForceDevmodeDropsDevmodeFromState(),
 		m.ensureUbuntuCoreTransition(),
-		m.ensureSnapdSnapTransition(),
 		// we should check for full regular refreshes before
 		// considering issuing a hint only refresh request
 		m.autoRefresh.Ensure(),

@@ -14,6 +14,15 @@ export DH_OPTIONS
 export DH_GOPKG := github.com/snapcore/snapd
 #export DEB_BUILD_OPTIONS=nocheck
 export DH_GOLANG_EXCLUDES=tests
+export DH_GOLANG_BUILDPKG = $(strip $(addprefix $(DH_GOPKG)/, \
+    cmd/snap \
+    cmd/snap-exec \
+    cmd/snap-seccomp \
+    cmd/snap-update-ns \
+    cmd/snapctl \
+    cmd/snapd \
+    cmd/snapd-apparmor \
+    ))
 # skip Go generate, all source code should have been committed
 export DH_GOLANG_GO_GENERATE=0
 
@@ -74,7 +83,11 @@ endif
 
 DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
 
-BUILT_USING_PACKAGES=
+# /usr/lib/snapd/snap-{update-ns,gdbserver-shim,gdb-shim} are always linked
+# statically against glibc. Use libc-dev-bin to avoid having to handle the
+# different soname (e.g. libc6 vs libc6.1)
+BUILT_USING_PACKAGES=libc-dev-bin
+
 # export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 # DPKG_EXPORT_BUILDFLAGS = 1
 # include /usr/share/dpkg/buildflags.mk
@@ -94,11 +107,11 @@ ifeq ($(shell dpkg-vendor --query Vendor),Ubuntu)
 ifeq ($(shell dpkg-architecture -qDEB_HOST_ARCH),amd64)
 		VENDOR_ARGS+= --with-host-arch-32bit-triplet=$(shell dpkg-architecture -f -ai386 -qDEB_HOST_MULTIARCH)
 endif
-    BUILT_USING_PACKAGES=libcap-dev libapparmor-dev libseccomp-dev
+    BUILT_USING_PACKAGES+=libcap-dev libapparmor-dev libseccomp-dev
 else
 ifeq ($(shell dpkg-vendor --query Vendor),Debian)
     VENDOR_ARGS=--enable-nvidia-multiarch
-    BUILT_USING_PACKAGES=libcap-dev
+    BUILT_USING_PACKAGES+=libcap-dev
 else
     VENDOR_ARGS=--disable-apparmor
 endif
@@ -143,6 +156,9 @@ override_dh_auto_build:
 	find _build/src/$(DH_GOPKG)/gadget/install -name "*.go" | grep -vE '(params\.go|install_dummy\.go|kernel\.go)'| xargs rm -f
 	# XXX: once dh-golang understands go build tags this would not be needed
 	find _build/src/$(DH_GOPKG)/secboot/ -name "*.go" | grep -E '(.*_sb(_test)?\.go|.*_tpm(_test)?\.go|secboot_hooks.go|keymgr/)' | xargs rm -f
+	mv _build/src/$(DH_GOPKG)/secboot/keys/plainkey.go _build/src/$(DH_GOPKG)/secboot/keys/plainkey_sb.go
+	mv _build/src/$(DH_GOPKG)/secboot/keys/plainkey_test.go _build/src/$(DH_GOPKG)/secboot/keys/plainkey_sb_test.go
+	find _build/src/$(DH_GOPKG)/secboot/keys/ -name "*.go" | grep -E '(.*_sb(_test)?\.go)' | xargs rm -f
 	find _build/src/$(DH_GOPKG)/boot/ -name "*.go" | grep -E '(.*_sb(_test)?\.go)' | xargs rm -f
 	# and build, we cannot use modules as packaging on Debian requires us to use
 	# dependencies from the distro, and this would require further updates to the
@@ -182,27 +198,20 @@ endif
 
 	# Build C bits, sadly manually
 	cd cmd && ( autoreconf -i -f )
-	cd cmd && ( ./configure --prefix=/usr --libexecdir=/usr/lib/snapd $(VENDOR_ARGS))
+	cd cmd && ( ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --libexecdir=/usr/lib/snapd $(VENDOR_ARGS))
 	$(MAKE) -C cmd all
 
 	# Generate the real systemd/dbus/env config files
 	$(MAKE) -C data all
 
 override_dh_auto_test:
-	LANG=C.utf-8 SNAPD_SKIP_SLOW_TESTS=true GO111MODULE=off dh_auto_test -- $(BUILDFLAGS) -tags "$(TAGS)" $(GCCGOFLAGS) $(DH_GOPKG)/...
+	LANG=C.utf-8 LC_ALL=C.utf-8 SNAPD_SKIP_SLOW_TESTS=true GO111MODULE=off dh_auto_test -- $(BUILDFLAGS) -tags "$(TAGS)" $(GCCGOFLAGS) $(DH_GOPKG)/...
 # a tested default (production) build should have no test keys
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	# check that only the main trusted account-keys are included
 	[ $$(strings _build/bin/snapd|grep -c -E "public-key-sha3-384: [a-zA-Z0-9_-]{64}") -eq 2 ]
 	strings _build/bin/snapd|grep -c "^public-key-sha3-384: -CvQKAwRQ5h3Ffn10FILJoEZUXOv6km9FwA80-Rcj-f-6jadQ89VRswHNiEB9Lxk$$"
 	strings _build/bin/snapd|grep -c "^public-key-sha3-384: d-JcZF9nD9eBw7bwMnH61x-bklnQOhQud1Is6o_cn2wTj8EYDi9musrIT9z2MdAa$$"
-	# same for snap-repair
-	[ $$(strings _build/bin/snap-repair|grep -c -E "public-key-sha3-384: [a-zA-Z0-9_-]{64}") -eq 3 ]
-	# common with snapd
-	strings _build/bin/snap-repair|grep -c "^public-key-sha3-384: -CvQKAwRQ5h3Ffn10FILJoEZUXOv6km9FwA80-Rcj-f-6jadQ89VRswHNiEB9Lxk$$"
-	strings _build/bin/snap-repair|grep -c "^public-key-sha3-384: d-JcZF9nD9eBw7bwMnH61x-bklnQOhQud1Is6o_cn2wTj8EYDi9musrIT9z2MdAa$$"
-	# repair-root
-	strings _build/bin/snap-repair|grep -c "^public-key-sha3-384: nttW6NfBXI_E-00u38W-KH6eiksfQNXuI7IiumoV49_zkbhM0sYTzSnFlwZC-W4t$$"
 endif
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	# run the snap-confine tests
@@ -258,6 +267,8 @@ override_dh_install-arch:
 	mv debian/snapd/etc/profile.d/snapd.sh debian/snapd/etc/profile.d/apps-bin-path.sh
 
 	$(MAKE) -C cmd install DESTDIR=$(CURDIR)/debian/tmp
+	# This breaks autopkgtest. The desired permission 111 is re-applied in postinst.
+	chmod 755 $(CURDIR)/debian/tmp/var/lib/snapd/void
 
 	# Rename the apparmor profile, see dh_apparmor call above for an explanation.
 	mv $(CURDIR)/debian/tmp/etc/apparmor.d/usr.lib.snapd.snap-confine $(CURDIR)/debian/tmp/etc/apparmor.d/usr.lib.snapd.snap-confine.real

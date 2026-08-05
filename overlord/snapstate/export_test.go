@@ -73,9 +73,9 @@ func MockSnapReadInfo(mock func(name string, si *snap.SideInfo) (*snap.Info, err
 }
 
 func MockReadComponentInfo(mock func(compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error)) (restore func()) {
-	old := readComponentInfo
-	readComponentInfo = mock
-	return func() { readComponentInfo = old }
+	old := readComponentInfoAt
+	readComponentInfoAt = mock
+	return func() { readComponentInfoAt = old }
 }
 
 func MockMountPollInterval(intv time.Duration) (restore func()) {
@@ -169,6 +169,11 @@ var (
 // dbus
 var (
 	CheckDBusServiceConflicts = checkDBusServiceConflicts
+)
+
+// desktop-file-ids
+var (
+	CheckDesktopFileIDsConflicts = checkDesktopFileIDsConflicts
 )
 
 // readme files
@@ -336,6 +341,7 @@ var (
 )
 
 type AuxStoreInfo = auxStoreInfo
+type DisabledServices = disabledServices
 
 // link, misc handlers
 var (

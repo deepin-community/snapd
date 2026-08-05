@@ -24,6 +24,7 @@ import (
 	"fmt"
 
 	"github.com/snapcore/snapd/bootloader"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/snap"
 )
 
@@ -506,6 +507,8 @@ func updateManagedBootConfigForBootloader(dev snap.Device, mode, gadgetSnapOrDir
 		return false, err
 	}
 
+	osutil.MaybeInjectFault("update-config-bootloader")
+
 	if cmdlineChange {
 		candidate := true
 		if err := updateCmdlineVars(tbl, gadgetSnapOrDir, cmdlineAppend, candidate, dev); err != nil {
@@ -559,22 +562,11 @@ func UpdateCommandLineForGadgetComponent(dev snap.Device, gadgetSnapOrDir, cmdli
 		return false, nil
 	}
 
+	osutil.MaybeInjectFault("update-command-line-gadget")
+
 	candidate := false
 	if err := updateCmdlineVars(tbl, gadgetSnapOrDir, cmdlineAppend, candidate, dev); err != nil {
 		return false, err
 	}
 	return cmdlineChange, nil
-}
-
-// MarkFactoryResetComplete runs a series of steps in a run system that complete a
-// factory reset process.
-func MarkFactoryResetComplete(encrypted bool) error {
-	if !encrypted {
-		// there is nothing to do on an unencrypted system
-		return nil
-	}
-	if err := postFactoryResetCleanup(); err != nil {
-		return fmt.Errorf("cannot perform post factory reset boot cleanup: %v", err)
-	}
-	return nil
 }

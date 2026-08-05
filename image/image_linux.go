@@ -284,11 +284,12 @@ type imageSeeder struct {
 	model *asserts.Model
 	tsto  *tooling.ToolingStore
 
-	classic        bool
-	prepareDir     string
-	wideCohortKey  string
-	customizations *Customizations
-	architecture   string
+	classic                  bool
+	prepareDir               string
+	wideCohortKey            string
+	customizations           *Customizations
+	architecture             string
+	allowSnapdKernelMismatch bool
 
 	hasModes    bool
 	rootDir     string
@@ -313,12 +314,17 @@ func newImageSeeder(tsto *tooling.ToolingStore, model *asserts.Model, opts *Opti
 		wideCohortKey: opts.WideCohortKey,
 		// keep a pointer to the customization object in opts as the Validation
 		// member might be defaulted if not set.
-		customizations: &opts.Customizations,
-		architecture:   determineImageArchitecture(model, opts),
+		customizations:           &opts.Customizations,
+		architecture:             determineImageArchitecture(model, opts),
+		allowSnapdKernelMismatch: opts.AllowSnapdKernelMismatch,
 
 		hasModes: model.Grade() != asserts.ModelGradeUnset,
 		model:    model,
 		tsto:     tsto,
+	}
+
+	if os.Getenv("SNAPD_ALLOW_SNAPD_KERNEL_MISMATCH") == "true" {
+		s.allowSnapdKernelMismatch = true
 	}
 
 	if !s.hasModes {
@@ -559,16 +565,18 @@ func (s *imageSeeder) validationSetKeysAndRevisionForSnap(snapName string) ([]sn
 		return nil, snap.Revision{}, err
 	}
 
-	// TODO: It's pointed out that here and some of the others uses of this
-	// may miss logic for optional snaps which have required revisions. This
-	// is not covered by the below check, and we may or may not have multiple places
-	// with a similar issue.
-	snapVsKeys, snapRev, err := allVss.CheckPresenceRequired(naming.Snap(snapName))
+	pres, err := allVss.Presence(naming.Snap(snapName))
 	if err != nil {
 		return nil, snap.Revision{}, err
 	}
-	if len(snapVsKeys) > 0 {
-		return snapVsKeys, snapRev, nil
+
+	// TODO: figure out if this is needed
+	if pres.Presence == asserts.PresenceInvalid {
+		return nil, snap.Revision{}, fmt.Errorf("snap %q is invalid in validation sets: %v", snapName, pres.Sets.CommaSeparated())
+	}
+
+	if pres.Constrained() {
+		return pres.Sets, pres.Revision, nil
 	}
 	return nil, s.w.Manifest().AllowedSnapRevision(snapName), nil
 }
@@ -576,10 +584,10 @@ func (s *imageSeeder) validationSetKeysAndRevisionForSnap(snapName string) ([]sn
 func (s *imageSeeder) downloadSnaps(snapsToDownload []*seedwriter.SeedSnap, curSnaps []*tooling.CurrentSnap) (downloadedSnaps map[string]*tooling.DownloadedSnap, err error) {
 	byName := make(map[string]*seedwriter.SeedSnap, len(snapsToDownload))
 	revisions := make(map[string]snap.Revision)
-	beforeDownload := func(info *snap.Info, cinfos map[string]*snap.ComponentInfo) (string, error) {
+	beforeDownload := func(info *snap.Info, cinfos map[string]*snap.ComponentInfo) (string, map[string]string, error) {
 		sn := byName[info.SnapName()]
 		if sn == nil {
-			return "", fmt.Errorf("internal error: downloading unexpected snap %q", info.SnapName())
+			return "", nil, fmt.Errorf("internal error: downloading unexpected snap %q", info.SnapName())
 		}
 		rev := revisions[info.SnapName()]
 		if rev.Unset() {
@@ -596,12 +604,18 @@ func (s *imageSeeder) downloadSnaps(snapsToDownload []*seedwriter.SeedSnap, curS
 		}
 		fmt.Fprintf(Stdout, "Fetching %s (%s)\n", sn.SnapName(), rev)
 		if err := s.w.SetInfo(sn, info, seedComps); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if err := s.validateSnapArchs([]*seedwriter.SeedSnap{sn}); err != nil {
-			return "", err
+			return "", nil, err
 		}
-		return sn.Path, nil
+
+		compPaths := make(map[string]string, len(cinfos))
+		for _, comp := range sn.Components {
+			compPaths[comp.ComponentName] = comp.Path
+		}
+
+		return sn.Path, compPaths, nil
 	}
 	snapToDownloadOptions := make([]tooling.SnapToDownload, len(snapsToDownload))
 	for i, sn := range snapsToDownload {
@@ -834,6 +848,17 @@ func (s *imageSeeder) warnOnUnassertedSnaps() error {
 }
 
 func (s *imageSeeder) finish() error {
+	// Ensure that the snapd snap is compatible with the snap-bootstrap
+	// contained within the kernel snap.
+	if err := s.w.VerifySnapBootstrapCompatibility(); err != nil {
+		if !s.allowSnapdKernelMismatch {
+			// If not, error out as there is no reason to allow
+			// this as the resulting image will be invalid.
+			return err
+		}
+		fmt.Fprintf(Stderr, "WARNING: %v\n", err)
+	}
+
 	// print any warnings that occurred during the download phase
 	for _, warn := range s.w.Warnings() {
 		fmt.Fprintf(Stderr, "WARNING: %s\n", warn)

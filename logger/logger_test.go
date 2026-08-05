@@ -150,7 +150,7 @@ func (s *LogSuite) TestDebugfEnv(c *C) {
 	defer os.Unsetenv("SNAPD_DEBUG")
 
 	logger.Debugf("xyzzy")
-	c.Check(s.logbuf.String(), testutil.Contains, `DEBUG: xyzzy`)
+	c.Check(s.logbuf.String(), Matches, `(?m).*logger_test\.go:\d+: DEBUG: xyzzy`)
 }
 
 func (s *LogSuite) TestNoticef(c *C) {
@@ -243,4 +243,11 @@ func (s *LogSuite) TestForceDebug(c *C) {
 	c.Assert(err, IsNil)
 	l.Debug("xyzzy")
 	c.Check(buf.String(), testutil.Contains, `DEBUG: xyzzy`)
+}
+
+func (s *LogSuite) TestMockDebugLogger(c *C) {
+	logbuf, restore := logger.MockDebugLogger()
+	defer restore()
+	logger.Debugf("xyzzy")
+	c.Check(logbuf.String(), testutil.Contains, "DEBUG: xyzzy")
 }

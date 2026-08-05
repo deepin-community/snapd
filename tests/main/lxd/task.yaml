@@ -14,7 +14,6 @@ backends: [-autopkgtest]
 
 # Only run this on ubuntu 16+, lxd will not work on !ubuntu systems
 # currently nor on ubuntu 14.04
-# ubuntu-18.04-32: i386 is not supported by lxd
 systems: [ubuntu-16.04-64, ubuntu-18.04-64, ubuntu-2*, ubuntu-core-*]
 
 # Start before anything else as it can take a really long time.
@@ -88,8 +87,8 @@ execute: |
 
     # There isn't an official image for noble yet, let's use the community one
     REMOTE=ubuntu
-    # There isn't an official image for 24.10 yet, let's use the daily one
-    if os.query is-ubuntu 24.10; then
+    # There isn't an official image for 25.04 yet, let's use the daily one
+    if os.query is-ubuntu 25.04; then
         REMOTE=ubuntu-daily
     fi
     VERSION_ID="$(. /etc/os-release && echo "$VERSION_ID" )"

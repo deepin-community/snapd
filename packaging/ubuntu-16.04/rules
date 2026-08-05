@@ -16,9 +16,24 @@ export DH_GOPKG := github.com/snapcore/snapd
 export DH_GOLANG_EXCLUDES=tests
 export DH_GOLANG_GO_GENERATE=1
 
+VERSION := $(shell dpkg-parsechangelog -S Version)
+
+ifneq (,$(findstring +fips,$(VERSION)))
+	# the version has +fips tag, we're building a FIPS variant
+	FIPSBUILD = 1
+else
+	FIPSBUILD = 0
+endif
+
 export PATH:=${PATH}:${CURDIR}
 # make sure that correct go version is found on xenial
 export PATH:=/usr/lib/go-1.18/bin:${PATH}
+ifeq (${FIPSBUILD},1)
+	# when building with FIPS, use Go 1.21 which is also declared in build
+	# dependencies; during testing it is manually installed, but during LP builds
+	# it should be pulled in as a build dependency
+	export PATH:=/usr/lib/go-1.21/bin:${PATH}
+endif
 # GOCACHE is needed by go-1.13+
 export GOCACHE:=/tmp/go-build
 
@@ -83,16 +98,25 @@ endif
 # build with "tpm" support on ubuntu by default
 # TAGS are the go build tags for all binaries, SNAP_TAGS are for snap and
 # snap-bootstrap build only.
-TAGS=
-SNAP_TAGS=
+_TAGS=
+_SNAP_TAGS=
 # check if we need to include the testkeys in the binary
 ifneq (,$(filter testkeys,$(DEB_BUILD_OPTIONS)))
   # if enabled also enable bootloader assets testing and fault injection
-	TAGS=-tags "withtestkeys withbootassetstesting faultinject"
-	SNAP_TAGS=-tags "nomanagers withtestkeys faultinject"
+	_TAGS := withtestkeys,withbootassetstesting,faultinject,statelocktrace
+	_SNAP_TAGS := nomanagers,withtestkeys,faultinject,statelocktrace
 else
-	SNAP_TAGS=-tags nomanagers
+	_SNAP_TAGS=nomanagers
 endif
+
+ifeq (${FIPSBUILD},1)
+  # if enabled also enable bootloader assets testing and fault injection
+	_TAGS := $(_TAGS),goexperiment.opensslcrypto,snapdfips
+	_SNAP_TAGS := $(_SNAP_TAGS),goexperiment.opensslcrypto,snapdfips
+endif
+
+TAGS=-tags "$(_TAGS)"
+SNAP_TAGS=-tags "$(_SNAP_TAGS)"
 
 DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
 
@@ -174,6 +198,15 @@ override_dh_clean:
 	(cd c-vendor/squashfuse && rm -f snapfuse && make distclean || true )
 
 override_dh_auto_build:
+	# very ugly test for FIPS variant of a toolchain
+	# see https://warthogs.atlassian.net/browse/FR-8860
+ifeq (${FIPSBUILD},1)
+	if ! test -f /usr/lib/go-1.21/src/crypto/internal/backend/openssl_linux.go; then \
+		echo "Go 1.21 FIPS toolchain not found"; \
+		exit 1; \
+	fi
+endif
+
 	# generate dh-golang does not copy modules.txt
 	cp -a vendor/modules.txt _build/src/$(DH_GOPKG)/vendor
 	# usually done via `go generate` but that is not supported on powerpc
@@ -221,7 +254,7 @@ endif
 
 	# Build C bits, sadly manually
 	cd cmd && ( autoreconf -i -f )
-	cd cmd && ( ./configure --prefix=/usr --libexecdir=/usr/lib/snapd $(VENDOR_ARGS))
+	cd cmd && ( ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --libexecdir=/usr/lib/snapd $(VENDOR_ARGS))
 	$(MAKE) -C cmd all
 
 	# Generate the real systemd/dbus/env config files
@@ -256,7 +289,9 @@ ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 endif
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	# run the snap-confine tests
-	$(MAKE) -C cmd check
+	$(MAKE) -C cmd -k check
+	# and data files tests
+	$(MAKE) -C data -k check
 endif
 
 
@@ -296,6 +331,9 @@ override_dh_install: debian/snapd.install
 	mv debian/snapd/etc/profile.d/snapd.sh debian/snapd/etc/profile.d/apps-bin-path.sh
 
 	$(MAKE) -C cmd install DESTDIR=$(CURDIR)/debian/tmp
+	# Permission 111 breaks deb builds on plucky e.g. "Can't opendir(debian/tmp/var/lib/snapd/void): Permission denied".
+	# The desired permission 111 is re-applied in postinst.
+	chmod 755 $(CURDIR)/debian/tmp/var/lib/snapd/void
 
 	# Rename the apparmor profile, see dh_apparmor call above for an explanation.
 	mv $(CURDIR)/debian/tmp/etc/apparmor.d/usr.lib.snapd.snap-confine $(CURDIR)/debian/tmp/etc/apparmor.d/usr.lib.snapd.snap-confine.real

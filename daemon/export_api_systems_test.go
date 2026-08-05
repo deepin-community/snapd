@@ -21,6 +21,7 @@ package daemon
 
 import (
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/install"
 	"github.com/snapcore/snapd/overlord/state"
@@ -45,13 +46,13 @@ func MockDeviceManagerSystemAndGadgetAndEncryptionInfo(f func(*devicestate.Devic
 	return restore
 }
 
-func MockDevicestateInstallFinish(f func(*state.State, string, map[string]*gadget.Volume) (*state.Change, error)) (restore func()) {
+func MockDevicestateInstallFinish(f func(*state.State, string, map[string]*gadget.Volume, *devicestate.OptionalContainers) (*state.Change, error)) (restore func()) {
 	restore = testutil.Backup(&devicestateInstallFinish)
 	devicestateInstallFinish = f
 	return restore
 }
 
-func MockDevicestateInstallSetupStorageEncryption(f func(*state.State, string, map[string]*gadget.Volume) (*state.Change, error)) (restore func()) {
+func MockDevicestateInstallSetupStorageEncryption(f func(*state.State, string, map[string]*gadget.Volume, *device.VolumesAuthOptions) (*state.Change, error)) (restore func()) {
 	restore = testutil.Backup(&devicestateInstallSetupStorageEncryption)
 	devicestateInstallSetupStorageEncryption = f
 	return restore
@@ -67,4 +68,14 @@ func MockDevicestateRemoveRecoverySystem(f func(*state.State, string) (*state.Ch
 	restore = testutil.Backup(&devicestateRemoveRecoverySystem)
 	devicestateRemoveRecoverySystem = f
 	return restore
+}
+
+func MockDeviceValidatePassphraseOrPINEntropy(f func(device.AuthMode, string) error) (restore func()) {
+	restore = testutil.Backup(&deviceValidatePassphraseOrPINEntropy)
+	deviceValidatePassphraseOrPINEntropy = f
+	return restore
+}
+
+func ClearCachedEncryptionSupportInfoForLabel(st *state.State, systemLabel string) {
+	st.Cache(encryptionSupportInfoKey{systemLabel}, nil)
 }

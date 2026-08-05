@@ -67,9 +67,9 @@ func (s *promptingSuite) TestOutcomeAsBool(c *C) {
 	c.Check(err, IsNil)
 	c.Check(result, Equals, false)
 	_, err = prompting.OutcomeUnset.AsBool()
-	c.Check(err, ErrorMatches, `internal error: invalid outcome.*`)
+	c.Check(err, ErrorMatches, `invalid outcome: ""`)
 	_, err = prompting.OutcomeType("foo").AsBool()
-	c.Check(err, ErrorMatches, `internal error: invalid outcome.*`)
+	c.Check(err, ErrorMatches, `invalid outcome: "foo"`)
 }
 
 type fakeOutcomeWrapper struct {
@@ -106,12 +106,12 @@ func (s *promptingSuite) TestUnmarshalOutcomeUnhappy(c *C) {
 		var fow1 fakeOutcomeWrapper
 		data := []byte(fmt.Sprintf(`{"field1": "%s", "field2": "%s"}`, outcome, outcome))
 		err := json.Unmarshal(data, &fow1)
-		c.Check(err, ErrorMatches, `cannot have outcome other than.*`, Commentf("data: %v", string(data)))
+		c.Check(err, ErrorMatches, fmt.Sprintf(`invalid outcome: %q`, outcome), Commentf("data: %v", string(data)))
 
 		var fow2 fakeOutcomeWrapper
 		data = []byte(fmt.Sprintf(`{"field1": "%s", "field2": "%s"}`, prompting.OutcomeAllow, outcome))
 		err = json.Unmarshal(data, &fow2)
-		c.Check(err, ErrorMatches, `cannot have outcome other than.*`, Commentf("data: %v", string(data)))
+		c.Check(err, ErrorMatches, fmt.Sprintf(`invalid outcome: %q`, outcome), Commentf("data: %v", string(data)))
 	}
 }
 
@@ -150,12 +150,12 @@ func (s *promptingSuite) TestUnmarshalLifespanUnhappy(c *C) {
 		var flw1 fakeLifespanWrapper
 		data := []byte(fmt.Sprintf(`{"field1": "%s", "field2": "%s"}`, lifespan, lifespan))
 		err := json.Unmarshal(data, &flw1)
-		c.Check(err, ErrorMatches, `cannot have lifespan other than.*`, Commentf("data: %v", string(data)))
+		c.Check(err, ErrorMatches, fmt.Sprintf(`invalid lifespan: %q`, lifespan), Commentf("data: %v", string(data)))
 
 		var flw2 fakeLifespanWrapper
 		data = []byte(fmt.Sprintf(`{"field1": "%s", "field2": "%s"}`, prompting.LifespanForever, lifespan))
 		err = json.Unmarshal(data, &flw2)
-		c.Check(err, ErrorMatches, `cannot have lifespan other than.*`, Commentf("data: %v", string(data)))
+		c.Check(err, ErrorMatches, fmt.Sprintf(`invalid lifespan: %q`, lifespan), Commentf("data: %v", string(data)))
 	}
 }
 
@@ -169,21 +169,18 @@ func (s *promptingSuite) TestValidateExpiration(c *C) {
 		prompting.LifespanForever,
 		prompting.LifespanSingle,
 	} {
-		err := lifespan.ValidateExpiration(unsetExpiration, currTime)
+		err := lifespan.ValidateExpiration(unsetExpiration)
 		c.Check(err, IsNil)
 		for _, exp := range []time.Time{negativeExpiration, validExpiration} {
-			err = lifespan.ValidateExpiration(exp, currTime)
-			c.Check(err, ErrorMatches, `cannot have specified expiration when lifespan is.*`)
+			err = lifespan.ValidateExpiration(exp)
+			c.Check(err, ErrorMatches, `invalid expiration: cannot have specified expiration when lifespan is.*`)
 		}
 	}
 
-	err := prompting.LifespanTimespan.ValidateExpiration(unsetExpiration, currTime)
-	c.Check(err, ErrorMatches, `cannot have unspecified expiration when lifespan is.*`)
+	err := prompting.LifespanTimespan.ValidateExpiration(unsetExpiration)
+	c.Check(err, ErrorMatches, `invalid expiration: cannot have unspecified expiration when lifespan is.*`)
 
-	err = prompting.LifespanTimespan.ValidateExpiration(negativeExpiration, currTime)
-	c.Check(err, ErrorMatches, `cannot have expiration time in the past.*`)
-
-	err = prompting.LifespanTimespan.ValidateExpiration(validExpiration, currTime)
+	err = prompting.LifespanTimespan.ValidateExpiration(validExpiration)
 	c.Check(err, IsNil)
 }
 
@@ -206,21 +203,21 @@ func (s *promptingSuite) TestParseDuration(c *C) {
 		for _, dur := range []string{invalidDuration, negativeDuration, validDuration} {
 			expiration, err = lifespan.ParseDuration(dur, currTime)
 			c.Check(expiration.IsZero(), Equals, true)
-			c.Check(err, ErrorMatches, `cannot have specified duration when lifespan is.*`)
+			c.Check(err, ErrorMatches, `invalid duration: cannot have specified duration when lifespan is.*`)
 		}
 	}
 
 	expiration, err := prompting.LifespanTimespan.ParseDuration(unsetDuration, currTime)
 	c.Check(expiration.IsZero(), Equals, true)
-	c.Check(err, ErrorMatches, `cannot have unspecified duration when lifespan is.*`)
+	c.Check(err, ErrorMatches, `invalid duration: cannot have unspecified duration when lifespan is.*`)
 
 	expiration, err = prompting.LifespanTimespan.ParseDuration(invalidDuration, currTime)
 	c.Check(expiration.IsZero(), Equals, true)
-	c.Check(err, ErrorMatches, `cannot parse duration.*`)
+	c.Check(err, ErrorMatches, `invalid duration: cannot parse duration.*`)
 
 	expiration, err = prompting.LifespanTimespan.ParseDuration(negativeDuration, currTime)
 	c.Check(expiration.IsZero(), Equals, true)
-	c.Check(err, ErrorMatches, `cannot have zero or negative duration.*`)
+	c.Check(err, ErrorMatches, `invalid duration: cannot have zero or negative duration.*`)
 
 	expiration, err = prompting.LifespanTimespan.ParseDuration(validDuration, currTime)
 	c.Check(err, IsNil)
@@ -230,4 +227,82 @@ func (s *promptingSuite) TestParseDuration(c *C) {
 	expiration2, err := prompting.LifespanTimespan.ParseDuration(validDuration, currTime)
 	c.Check(err, IsNil)
 	c.Check(expiration2.Equal(expiration), Equals, true)
+}
+
+func (s *promptingSuite) TestFirstLifespanGreater(c *C) {
+	for _, testCase := range []struct {
+		l1     prompting.LifespanType
+		e1     time.Time
+		l2     prompting.LifespanType
+		e2     time.Time
+		result bool
+	}{
+		{
+			l1:     prompting.LifespanForever,
+			l2:     prompting.LifespanForever,
+			result: false,
+		},
+		{
+			l1:     prompting.LifespanForever,
+			l2:     prompting.LifespanTimespan,
+			e2:     time.Now().Add(time.Second),
+			result: true,
+		},
+		{
+			l1:     prompting.LifespanForever,
+			l2:     prompting.LifespanSingle,
+			result: true,
+		},
+		{
+			l1:     prompting.LifespanTimespan,
+			e1:     time.Now().Add(time.Second),
+			l2:     prompting.LifespanForever,
+			result: false,
+		},
+		{
+			l1:     prompting.LifespanTimespan,
+			e1:     time.Now().Add(2 * time.Second),
+			l2:     prompting.LifespanTimespan,
+			e2:     time.Now().Add(time.Second),
+			result: true,
+		},
+		{
+			l1:     prompting.LifespanTimespan,
+			e1:     time.Now().Add(time.Second),
+			l2:     prompting.LifespanTimespan,
+			e2:     time.Now().Add(time.Second),
+			result: false,
+		},
+		{
+			l1:     prompting.LifespanTimespan,
+			e1:     time.Now().Add(time.Second),
+			l2:     prompting.LifespanTimespan,
+			e2:     time.Now().Add(2 * time.Second),
+			result: false,
+		},
+		{
+			l1:     prompting.LifespanTimespan,
+			e1:     time.Now().Add(time.Second),
+			l2:     prompting.LifespanSingle,
+			result: true,
+		},
+		{
+			l1:     prompting.LifespanSingle,
+			l2:     prompting.LifespanForever,
+			result: false,
+		},
+		{
+			l1:     prompting.LifespanSingle,
+			l2:     prompting.LifespanTimespan,
+			e2:     time.Now().Add(time.Second),
+			result: false,
+		},
+		{
+			l1:     prompting.LifespanSingle,
+			l2:     prompting.LifespanSingle,
+			result: false,
+		},
+	} {
+		c.Check(prompting.FirstLifespanGreater(testCase.l1, testCase.e1, testCase.l2, testCase.e2), Equals, testCase.result, Commentf("testCase: %+v", testCase))
+	}
 }

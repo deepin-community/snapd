@@ -1,0 +1,15 @@
+rules:
+  nested:
+    from:
+      - tests/nested/.*
+    to: [$SELF]
+
+  nestedlib:
+    from:
+      - tests/lib/nested.sh
+    to: [tests/nested/]
+
+  assertions:
+    from:
+      - tests/lib/assertions/.*
+    to: [tests/nested/]

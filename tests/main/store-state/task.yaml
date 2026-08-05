@@ -12,29 +12,40 @@ backends: [-external]
 systems: [-ubuntu-14.04-64]
 
 prepare: |
-    echo "Ensure jq is installed"
-    if ! command -v jq; then
-        snap install --devmode jq
+    if [ "$TRUST_TEST_KEYS" = "false" ]; then
+        echo "This test needs test keys to be trusted"
+        exit
     fi
 
-    echo "Ensure yaml2json is installed"
-    if ! command -v yaml2json; then
-        snap install --devmode remarshal
-    fi
+    # acquire session macaroon
+    snap find core
 
 execute: |
+    if [ "$TRUST_TEST_KEYS" = "false" ]; then
+        echo "This test needs test keys to be trusted"
+        exit
+    fi
+
     # Check help
     "$TESTSTOOLS"/store-state | MATCH "usage: store-state setup-fake-store <DIR>"
     "$TESTSTOOLS"/store-state -h | MATCH "usage: store-state setup-fake-store <DIR>"
     "$TESTSTOOLS"/store-state --help | MATCH "usage: store-state setup-fake-store <DIR>"
 
-    # Setup staging store
-    "$TESTSTOOLS"/store-state setup-staging-store
-    snap info core | MATCH "store-url:.*https://staging-api.snapcraft.io"
+    # Staging store cannot be used with snapd deb from the repository
+    # The staging keys are being checked before snapd re-exec into snapd snap
+    if not tests.info is-snapd-from-archive; then
+        # Setup staging store
+        "$TESTSTOOLS"/store-state setup-staging-store
+        snap info core | MATCH "store-url:.*https://staging-api.snapcraft.io"
 
-    # Teardown staging store
-    "$TESTSTOOLS"/store-state teardown-staging-store
-    snap info core | MATCH "store-url:.*https://snapcraft.io"
+        # Teardown staging store
+        "$TESTSTOOLS"/store-state teardown-staging-store
+        snap info core | MATCH "store-url:.*https://snapcraft.io"
+    fi
+
+    # install test snap dependency before switching to fake store
+    base_dep="$(gojq -r --yaml-input '.base' < snap/meta/snap.yaml.in)"
+    snap install "$base_dep"
 
     # Setup fakestore
     STORE_DIR="$(pwd)/fake-store-blobdir"
@@ -46,8 +57,8 @@ execute: |
 
     # Check make-snap-installable command with snap-id
     create_snap() {
-        yaml2json -i snap/meta/snap.yaml.in > snap/meta/snap.json
-        jq ".name = \"$1\"" snap/meta/snap.json | json2yaml -o snap/meta/snap.yaml
+        gojq --yaml-input --yaml-output \
+            ".name = \"$1\"" snap/meta/snap.yaml.in > snap/meta/snap.yaml
         "$TESTSTOOLS"/snaps-state pack-local snap
     }
 

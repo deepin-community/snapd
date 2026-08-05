@@ -25,14 +25,17 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	. "gopkg.in/check.v1"
 
+	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/assertstest"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/kernel"
-	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -228,14 +231,12 @@ func testBuildKernelDriversTree(c *C, opts createKernelSnapFilesOpts) {
 }
 
 func (s *kernelDriversTestSuite) TestBuildKernelDriversNoModsOrFw(c *C) {
-	buf, restore := logger.MockLogger()
-	defer restore()
-
+	kversion := "5.15.0-78-generic"
 	mountDir := filepath.Join(dirs.SnapMountDir, "pc-kernel/11")
-	c.Assert(os.MkdirAll(mountDir, 0755), IsNil)
+	createKernelSnapFilesOnlyModules(c, kversion, mountDir)
 
 	// Build the tree should not fail
-	destDir := kernel.DriversTreeDir(dirs.GlobalRootDir, "pc-kernel", snap.R(1))
+	destDir := kernel.DriversTreeDir(dirs.GlobalRootDir, "pc-kernel", snap.R(11))
 	err := kernel.EnsureKernelDriversTree(
 		kernel.MountPoints{
 			Current: mountDir,
@@ -243,9 +244,13 @@ func (s *kernelDriversTestSuite) TestBuildKernelDriversNoModsOrFw(c *C) {
 		&kernel.KernelDriversTreeOptions{KernelInstall: true})
 	c.Assert(err, IsNil)
 
-	// but log should warn about this
-	c.Assert(buf.String(), testutil.Contains, `no modules found in "`+mountDir+`"`)
-	c.Assert(buf.String(), testutil.Contains, `no firmware found in "`+mountDir+`/firmware"`)
+	// check kernel dep file is still copied
+	modPath := filepath.Join(dirs.SnapdStateDir(dirs.GlobalRootDir),
+		"kernel", "pc-kernel", "11", "lib", "modules", kversion, "modules.dep.bin")
+	exists, isReg, err := osutil.RegularFileExists(modPath)
+	c.Assert(err, IsNil)
+	c.Check(exists, Equals, true)
+	c.Check(isReg, Equals, true)
 }
 
 func createKernelSnapFilesOnlyModules(c *C, kversion, kdir string) {
@@ -258,9 +263,6 @@ func createKernelSnapFilesOnlyModules(c *C, kversion, kdir string) {
 }
 
 func (s *kernelDriversTestSuite) TestBuildKernelDriversOnlyMods(c *C) {
-	buf, restore := logger.MockLogger()
-	defer restore()
-
 	mountDir := filepath.Join(dirs.RunDir, "mnt/pc-kernel")
 	kversion := "5.15.0-78-generic"
 	createKernelSnapFilesOnlyModules(c, kversion, mountDir)
@@ -280,15 +282,9 @@ func (s *kernelDriversTestSuite) TestBuildKernelDriversOnlyMods(c *C) {
 	c.Assert(err, IsNil)
 	c.Check(exists, Equals, true)
 	c.Check(isReg, Equals, true)
-
-	// but log should warn about this
-	c.Assert(buf.String(), testutil.Contains, `no firmware found in "`+mountDir+`/firmware"`)
 }
 
 func (s *kernelDriversTestSuite) TestBuildKernelDriversOnlyModsWithTargetDir(c *C) {
-	buf, restore := logger.MockLogger()
-	defer restore()
-
 	mountDir := filepath.Join(dirs.RunDir, "mnt/tmp-mount")
 	kTargetDir := filepath.Join(dirs.RunDir, "mnt/pc-kernel")
 	kversion := "5.15.0-78-generic"
@@ -315,9 +311,6 @@ func (s *kernelDriversTestSuite) TestBuildKernelDriversOnlyModsWithTargetDir(c *
 	modsTarget, err := os.Readlink(modsPath)
 	c.Assert(err, IsNil)
 	c.Check(modsTarget, Equals, filepath.Join(kTargetDir, "modules", kversion, "kernel"))
-
-	// but log should warn about this
-	c.Assert(buf.String(), testutil.Contains, `no firmware found in "`+mountDir+`/firmware"`)
 }
 
 func createKernelSnapFilesOnlyFw(c *C, kdir string) {
@@ -330,9 +323,6 @@ func createKernelSnapFilesOnlyFw(c *C, kdir string) {
 }
 
 func (s *kernelDriversTestSuite) TestBuildKernelDriversOnlyFw(c *C) {
-	buf, restore := logger.MockLogger()
-	defer restore()
-
 	mountDir := filepath.Join(dirs.RunDir, "mnt/pc-kernel")
 	createKernelSnapFilesOnlyFw(c, mountDir)
 
@@ -348,15 +338,9 @@ func (s *kernelDriversTestSuite) TestBuildKernelDriversOnlyFw(c *C) {
 	// check link
 	fwPath := filepath.Join(dirs.SnapdStateDir(dirs.GlobalRootDir), "kernel", "pc-kernel", "1", "lib", "firmware", "wifi_fw.bin")
 	c.Assert(osutil.IsSymlink(fwPath), Equals, true)
-
-	// but log should warn about this
-	c.Assert(buf.String(), testutil.Contains, `no modules found in "`+mountDir+`"`)
 }
 
 func (s *kernelDriversTestSuite) TestBuildKernelDriversOnlyFwWithTargetDir(c *C) {
-	buf, restore := logger.MockLogger()
-	defer restore()
-
 	mountDir := filepath.Join(dirs.RunDir, "mnt/tmp-mount")
 	kTargetDir := filepath.Join(dirs.RunDir, "mnt/pc-kernel")
 	createKernelSnapFilesOnlyFw(c, mountDir)
@@ -375,9 +359,6 @@ func (s *kernelDriversTestSuite) TestBuildKernelDriversOnlyFwWithTargetDir(c *C)
 	fwPathTarget, err := os.Readlink(fwPath)
 	c.Assert(err, IsNil)
 	c.Check(fwPathTarget, Equals, filepath.Join(kTargetDir, "firmware", "wifi_fw.bin"))
-
-	// but log should warn about this
-	c.Assert(buf.String(), testutil.Contains, `no modules found in "`+mountDir+`"`)
 }
 
 func (s *kernelDriversTestSuite) TestBuildKernelDriversAbsFwSymlink(c *C) {
@@ -678,4 +659,58 @@ func (s *kernelDriversTestSuite) TestBuildKernelDriversTreeCompsWithTargetDir(c 
 		{"comp1.bin", fs.ModeSymlink, filepath.Join(kmodCont.MountDir(), "firmware/comp1.bin")},
 	}
 	doDirChecks(c, fwUpdates, expected)
+}
+
+func mockModel16(override map[string]interface{}) *asserts.Model {
+	model := map[string]interface{}{
+		"type":         "model",
+		"authority-id": "my-brand",
+		"series":       "16",
+		"brand-id":     "my-brand",
+		"model":        "my-model",
+		"gadget":       "gadget",
+		"kernel":       "krnl",
+		"architecture": "amd64",
+		"timestamp":    time.Now().Format(time.RFC3339),
+	}
+	return assertstest.FakeAssertion(model, override).(*asserts.Model)
+}
+
+func mockModel20plus(override map[string]interface{}) *asserts.Model {
+	model := map[string]interface{}{
+		"type":         "model",
+		"authority-id": "my-brand",
+		"series":       "16",
+		"brand-id":     "my-brand",
+		"model":        "my-model",
+		"display-name": "my model",
+		"architecture": "amd64",
+		"base":         "core20",
+		"grade":        "dangerous",
+		"snaps": []interface{}{
+			map[string]interface{}{
+				"name":            "pc-kernel",
+				"id":              snaptest.AssertedSnapID("pc-kernel"),
+				"type":            "kernel",
+				"default-channel": "20",
+			},
+			map[string]interface{}{
+				"name":            "pc",
+				"id":              snaptest.AssertedSnapID("pc"),
+				"type":            "gadget",
+				"default-channel": "20",
+			}}}
+	for n, v := range override {
+		model[n] = v
+	}
+	return assertstest.FakeAssertion(model, override).(*asserts.Model)
+}
+
+func (s *kernelDriversTestSuite) TestNeedsKernelDriversTree(c *C) {
+	uc16model := mockModel16(nil)
+	c.Assert(kernel.NeedsKernelDriversTree(uc16model), Equals, false)
+	uc20model := mockModel20plus(nil)
+	c.Assert(kernel.NeedsKernelDriversTree(uc20model), Equals, false)
+	uc24model := mockModel20plus(map[string]interface{}{"base": "core24"})
+	c.Assert(kernel.NeedsKernelDriversTree(uc24model), Equals, true)
 }

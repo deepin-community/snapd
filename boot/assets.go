@@ -37,7 +37,7 @@ import (
 	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
-	"github.com/snapcore/snapd/secboot/keys"
+	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/strutil"
 )
 
@@ -256,7 +256,9 @@ func isAssetHashTrackedInMap(bam bootAssetsMap, assetName, assetHash string) boo
 type TrustedAssetsInstallObserver interface {
 	BootLoaderSupportsEfiVariables() bool
 	ObserveExistingTrustedRecoveryAssets(recoveryRootDir string) error
-	ChosenEncryptionKeys(key, saveKey keys.EncryptionKey)
+	// FIXME: Combine relevant FDE params into some FDE context that can be
+	// passed around instead of passing around many params.
+	SetEncryptionParams(key, saveKey secboot.BootstrappedContainer, primaryKey []byte, volumesAuth *device.VolumesAuthOptions)
 	UpdateBootEntry() error
 	Observe(op gadget.ContentOperation, partRole, root, relativeTarget string, data *gadget.ContentChange) (gadget.ContentChangeAction, error)
 }
@@ -279,11 +281,15 @@ type trustedAssetsInstallObserverImpl struct {
 	trustedRecoveryAssets map[string]string
 	trackedRecoveryAssets bootAssetsMap
 
-	useEncryption     bool
-	dataEncryptionKey keys.EncryptionKey
-	saveEncryptionKey keys.EncryptionKey
+	useEncryption             bool
+	dataBootstrappedContainer secboot.BootstrappedContainer
+	saveBootstrappedContainer secboot.BootstrappedContainer
 
 	seedBootloader bootloader.Bootloader
+
+	primaryKey []byte
+
+	volumesAuth *device.VolumesAuthOptions
 }
 
 func (o *trustedAssetsInstallObserverImpl) BootLoaderSupportsEfiVariables() bool {
@@ -368,10 +374,12 @@ func (o *trustedAssetsInstallObserverImpl) currentTrustedRecoveryBootAssetsMap()
 	return o.trackedRecoveryAssets
 }
 
-func (o *trustedAssetsInstallObserverImpl) ChosenEncryptionKeys(key, saveKey keys.EncryptionKey) {
+func (o *trustedAssetsInstallObserverImpl) SetEncryptionParams(key, saveKey secboot.BootstrappedContainer, primaryKey []byte, volumesAuth *device.VolumesAuthOptions) {
 	o.useEncryption = true
-	o.dataEncryptionKey = key
-	o.saveEncryptionKey = saveKey
+	o.dataBootstrappedContainer = key
+	o.saveBootstrappedContainer = saveKey
+	o.primaryKey = primaryKey
+	o.volumesAuth = volumesAuth
 }
 
 func (o *trustedAssetsInstallObserverImpl) UpdateBootEntry() error {

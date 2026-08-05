@@ -22,6 +22,7 @@ package snap
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -30,14 +31,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/snapcore/snapd/desktop/desktopentry"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/metautil"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/sys"
 	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snapdtool"
 	"github.com/snapcore/snapd/strutil"
-	"github.com/snapcore/snapd/systemd"
 	"github.com/snapcore/snapd/timeout"
 )
 
@@ -233,18 +235,6 @@ func HookSecurityTag(snapName, hookName string) string {
 // are not associated to an app or hook in the snap.
 func NoneSecurityTag(snapName, uniqueName string) string {
 	return ScopedSecurityTag(snapName, "none", uniqueName)
-}
-
-// TransientScopeGlob returns the glob pattern matching
-// snap's transient scope units.
-//
-// e.g. snap.hello-world.sh-4706fe54-7802-4808-aa7e-ae8b567239e0.scope
-func TransientScopeGlob(snapName string) (string, error) {
-	snapSecurityTag := SecurityTag(snapName)
-	unitPrefix, err := systemd.SecurityTagToUnitName(snapSecurityTag)
-	// XXX: Should we also match snap components glob pattern (i.e. snap.name+*.*.scope?
-	// snap.name.*.scope
-	return unitPrefix + ".*.scope", err
 }
 
 // BaseDataDir returns the base directory for snap data locations.
@@ -950,6 +940,128 @@ func (s *Info) DesktopPrefix() string {
 	return fmt.Sprintf("%s+%s", s.SnapName(), s.InstanceKey)
 }
 
+// DesktopPlugFileIDs returns desktop-file-ids desktop plug attribute entries.
+// The desktop-file-ids attribute is optional so an empty list is returned if
+// the it is not found.
+//
+// Note: DesktopPlugFileIDs doesn't check if the desktop plug is connected because
+// the desktop-file-ids attribute is controlled by an allow-installation rule.
+func (s *Info) DesktopPlugFileIDs() ([]string, error) {
+	var desktopPlug *PlugInfo
+	for _, plug := range s.Plugs {
+		if plug.Interface == "desktop" {
+			desktopPlug = plug
+			break
+		}
+	}
+	if desktopPlug == nil {
+		return nil, nil
+	}
+
+	attrVal, exists := desktopPlug.Lookup("desktop-file-ids")
+	if !exists {
+		// desktop-file-ids attribute is optional
+		return nil, nil
+	}
+
+	// TODO: The internal errors below should never happen due to validation
+	// in the desktop interface. It would be a good candidate for telemetry
+	// error reporting.
+
+	// desktop-file-ids must be a list of strings
+	attrList, ok := attrVal.([]interface{})
+	if !ok {
+		return nil, errors.New(`internal error: "desktop-file-ids" must be a list of strings`)
+	}
+
+	desktopFileIDs := make([]string, 0, len(attrList))
+	for _, val := range attrList {
+		desktopFileID, ok := val.(string)
+		if !ok {
+			return nil, errors.New(`internal error: "desktop-file-ids" must be a list of strings`)
+		}
+		desktopFileIDs = append(desktopFileIDs, desktopFileID)
+	}
+	return desktopFileIDs, nil
+}
+
+func sanitizeDesktopFileName(base string) string {
+	var b strings.Builder
+	b.Grow(len(base))
+
+	for _, c := range base {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' {
+			b.WriteRune(c)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+
+	return b.String()
+}
+
+// MangleDesktopFileName returns the sanitized file name prefixed with Info.DesktopPrefix().
+// If the passed name (without the .desktop extension) is listed under the desktop-file-ids
+// desktop interface plug attribute then the desktop file name is returned as is without
+// mangling.
+//
+// File name sanitization is done by replacing any character not in [A-Za-z0-9-_.] by
+// an underscore '_'.
+//   - "test*.desktop" -> "PREFIX_test_.desktop
+//   - "test 123.desktop" -> "PREFIX_test_123.desktop
+//   - "test, *$$.desktop" -> "PREFIX_test_____.desktop"
+func (s *Info) MangleDesktopFileName(desktopFile string) (string, error) {
+	desktopFileIDs, err := s.DesktopPlugFileIDs()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Dir(desktopFile)
+	base := filepath.Base(desktopFile)
+	// Don't mangle desktop files if listed under desktop-file-ids attribute
+	// XXX: Do we want to fail if a desktop-file-ids entry doesn't
+	// have a corresponding file?
+	for _, desktopFileID := range desktopFileIDs {
+		if strings.TrimSuffix(base, ".desktop") == desktopFileID {
+			return filepath.Join(dir, base), nil
+		}
+	}
+
+	// Sanitization logic shouldn't worry about being backware compatible because the
+	// desktop files are always written when snapd starts in ensureDesktopFilesUpdated.
+	sanitizedBase := sanitizeDesktopFileName(base)
+
+	return filepath.Join(dir, fmt.Sprintf("%s_%s", s.DesktopPrefix(), sanitizedBase)), nil
+}
+
+type DesktopFilesFromInstalledSnapOptions struct {
+	// Mangles found desktop files using Info.MangleDesktopFileName()
+	MangleFileNames bool
+}
+
+// DesktopFilesFromInstalledSnap returns the desktop files found under <snap-mount>/meta/gui.
+func (s *Info) DesktopFilesFromInstalledSnap(opts DesktopFilesFromInstalledSnapOptions) ([]string, error) {
+	rootDir := filepath.Join(s.MountDir(), "meta", "gui")
+	if !osutil.IsDirectory(rootDir) {
+		return nil, nil
+	}
+	desktopFiles, err := filepath.Glob(filepath.Join(rootDir, "*.desktop"))
+	if err != nil {
+		return nil, fmt.Errorf("cannot get desktop files from %v: %s", rootDir, err)
+	}
+
+	if !opts.MangleFileNames {
+		return desktopFiles, nil
+	}
+
+	for i, df := range desktopFiles {
+		desktopFiles[i], err = s.MangleDesktopFileName(df)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return desktopFiles, nil
+}
+
 // DownloadInfo contains the information to download a snap.
 // It can be marshalled.
 type DownloadInfo struct {
@@ -1338,6 +1450,34 @@ func (app *AppInfo) SecurityTag() string {
 // DesktopFile returns the path to the installed optional desktop file for the
 // application.
 func (app *AppInfo) DesktopFile() string {
+	desktopFileIDs, err := app.Snap.DesktopPlugFileIDs()
+	if err != nil || len(desktopFileIDs) == 0 {
+		// fallback to a simple heuristic "$PREFIX_$APP.desktop"
+		return filepath.Join(dirs.SnapDesktopFilesDir, fmt.Sprintf("%s_%s.desktop", app.Snap.DesktopPrefix(), app.Name))
+	}
+	// Loop through desktop-file-ids desktop interface plug attribute in order to
+	// have deterministic output
+	for _, desktopFileID := range desktopFileIDs {
+		desktopFile := filepath.Join(dirs.SnapDesktopFilesDir, desktopFileID+".desktop")
+		if !osutil.FileExists(desktopFile) {
+			continue
+		}
+		// No need to also check instance name because we already filter by the
+		// snap's desktop file ids
+		de, err := desktopentry.Read(desktopFile)
+		if err != nil {
+			// Errors when reading indicates either an issue opening the desktop
+			// file or a malformed desktop file, both of which are internal
+			// errors caused somewhere else.
+			// Let's log for debugging and try the next desktop file id.
+			logger.Debugf("internal error: failed to read %q: %v", desktopFile, err)
+			continue
+		}
+		if de.SnapAppName == app.Name {
+			return desktopFile
+		}
+	}
+	// fallback to a simple heuristic "$PREFIX_$APP.desktop"
 	return filepath.Join(dirs.SnapDesktopFilesDir, fmt.Sprintf("%s_%s.desktop", app.Snap.DesktopPrefix(), app.Name))
 }
 
@@ -1750,16 +1890,6 @@ func InstanceName(snapName, instanceKey string) string {
 	return snapName
 }
 
-// ByType supports sorting the given slice of snap info by types. The most
-// important types will come first.
-type ByType []*Info
-
-func (r ByType) Len() int      { return len(r) }
-func (r ByType) Swap(i, j int) { r[i], r[j] = r[j], r[i] }
-func (r ByType) Less(i, j int) bool {
-	return r[i].Type().SortsBefore(r[j].Type())
-}
-
 // SortServices sorts the apps based on their Before and After specs, such that
 // starting the services in the returned ordering will satisfy all specs.
 func SortServices(apps []*AppInfo) (sorted []*AppInfo, err error) {
@@ -1852,6 +1982,31 @@ func (a AppInfoBySnapApp) Less(i, j int) bool {
 	return iName < jName
 }
 
+// SnapdInfoFromSnapFile returns the snapd information carried by the given
+// snap. This is only applicable to snapd/core or UC20+ kernel snaps.
+func SnapdInfoFromSnapFile(snapf Container, snapType Type) (version string, flags map[string]string, err error) {
+	var infoFile string
+	missingOK := false
+	switch snapType {
+	case TypeOS, TypeSnapd:
+		infoFile = "/usr/lib/snapd/info"
+	case TypeKernel:
+		infoFile = "/snapd-info"
+		// some old kernel file will not contain this
+		missingOK = true
+	default:
+		return "", nil, fmt.Errorf("cannot extract snapd information, snaps of type %s do not carry snapd information", snapType)
+	}
+	b, err := snapf.ReadFile(infoFile)
+	if err != nil {
+		if missingOK && os.IsNotExist(err) {
+			return "", nil, nil
+		}
+		return "", nil, err
+	}
+	return snapdtool.ParseInfoFile(bytes.NewBuffer(b), fmt.Sprintf("from %s snap", snapType))
+}
+
 // SnapdAssertionMaxFormatsFromSnapFile returns the supported assertion max
 // formats for the snapd code carried by the given snap, plus its snapd
 // version. This is only applicable to snapd/core or UC20+ kernel snaps.
@@ -1863,34 +2018,18 @@ func SnapdAssertionMaxFormatsFromSnapFile(snapf Container) (maxFormats map[strin
 	if err != nil {
 		return nil, "", err
 	}
-	var infoFile string
-	missingOK := false
-	typ := info.Type()
-	switch typ {
-	case TypeOS, TypeSnapd:
-		infoFile = "/usr/lib/snapd/info"
-	case TypeKernel:
-		infoFile = "/snapd-info"
-		// some old kernel file will not contain this
-		missingOK = true
-	default:
-		return nil, "", fmt.Errorf("cannot extract assertion max formats information, snaps of type %s do not carry snapd", typ)
-	}
-	b, err := snapf.ReadFile(infoFile)
-	if err != nil {
-		if missingOK && os.IsNotExist(err) {
-			return nil, "", nil
-		}
-		return nil, "", err
-	}
-	ver, flags, err := snapdtool.ParseInfoFile(bytes.NewBuffer(b), fmt.Sprintf("from %s snap", typ))
+	ver, flags, err := SnapdInfoFromSnapFile(snapf, info.Type())
 	if err != nil {
 		return nil, "", err
+	}
+	if info.Type() == TypeKernel && flags == nil {
+		// some old kernels will not contain snapd-info
+		return nil, ver, nil
 	}
 	if fmts := flags["SNAPD_ASSERTS_FORMATS"]; fmts != "" {
 		err := json.Unmarshal([]byte(strings.Trim(fmts, "'")), &maxFormats)
 		if err != nil {
-			return nil, "", fmt.Errorf("cannot unmarshal SNAPD_ASSERTS_FORMATS from info file from %s snap", typ)
+			return nil, "", fmt.Errorf("cannot unmarshal SNAPD_ASSERTS_FORMATS from info file from %s snap", info.Type())
 		}
 		return maxFormats, ver, nil
 	}
@@ -1898,7 +2037,7 @@ func SnapdAssertionMaxFormatsFromSnapFile(snapf Container) (maxFormats map[strin
 	sysUser := 0
 	cmp, err := strutil.VersionCompare(ver, "2.46")
 	if err != nil {
-		return nil, "", fmt.Errorf("invalid snapd version in info file from %s snap: %v", typ, err)
+		return nil, "", fmt.Errorf("invalid snapd version in info file from %s snap: %v", info.Type(), err)
 	}
 	if cmp >= 0 {
 		sysUser = 1
@@ -1934,28 +2073,48 @@ var verToSnapDecl = []struct {
 	{"2.17", 1},
 }
 
-// RegistryPlugAttrs returns the account, registry and view specified in a plug
-// if that plug is of type registry. If it's not or the information cannot be
+// ConfdbPlugAttrs returns the account, confdb and view specified in a plug
+// if that plug is of type confdb. If it's not or the information cannot be
 // found, returns an error.
-func RegistryPlugAttrs(plug *PlugInfo) (account, registry, view string, err error) {
-	if plug.Interface != "registry" {
-		return "", "", "", fmt.Errorf("must be registry plug: %s", plug.Interface)
+func ConfdbPlugAttrs(plug *PlugInfo) (account, confdb, view string, err error) {
+	if plug.Interface != "confdb" {
+		return "", "", "", fmt.Errorf("must be confdb plug: %s", plug.Interface)
 	}
 
 	if err := plug.Attr("account", &account); err != nil {
 		return "", "", "", err
 	}
 
-	var registryView string
-	if err := plug.Attr("view", &registryView); err != nil {
+	var confdbView string
+	if err := plug.Attr("view", &confdbView); err != nil {
 		return "", "", "", err
 	}
 
-	parts := strings.Split(registryView, "/")
+	parts := strings.Split(confdbView, "/")
 	if len(parts) != 2 {
-		return "", "", "", fmt.Errorf("\"view\" must conform to <registry>/<view>: %s", registryView)
+		return "", "", "", fmt.Errorf("\"view\" must conform to <confdb>/<view>: %s", confdbView)
 	}
-	registry, view = parts[0], parts[1]
+	confdb, view = parts[0], parts[1]
 
-	return account, registry, view, nil
+	return account, confdb, view, nil
+}
+
+type RefreshFailureSeverity string
+
+const (
+	RefreshFailureSeverityNone        RefreshFailureSeverity = ""
+	RefreshFailureSeverityAfterReboot RefreshFailureSeverity = "after-reboot"
+)
+
+// RefreshFailures holds information about snap failed refreshes.
+type RefreshFailuresInfo struct {
+	// Revision is the target revision that caused the refresh failure.
+	Revision Revision `json:"revision"`
+	// FailureCount is the number of failed attempts to refresh to the given revision.
+	FailureCount int `json:"failure-count"`
+	// LastFailureTime is the time of the last failed refresh attempt for the revision.
+	LastFailureTime time.Time `json:"last-failure-time"`
+	// LastFailureSeverity identifies how severe the last failure was.
+	// This allows for more aggressive backoff delay for snaps that fail after a reboot.
+	LastFailureSeverity RefreshFailureSeverity `json:"last-failure-severity,omitempty"`
 }

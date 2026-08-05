@@ -24,9 +24,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/strutil"
 )
 
 // encryptionMarkerUnder returns the path of the encrypted system marker under a
@@ -136,4 +138,119 @@ func SealedKeysMethod(rootdir string) (sm SealingMethod, err error) {
 		return sm, ErrNoSealedKeys
 	}
 	return SealingMethod(content), err
+}
+
+// EncryptionType specifies what encryption backend should be used (if any)
+type EncryptionType string
+
+const (
+	EncryptionTypeNone        EncryptionType = ""
+	EncryptionTypeLUKS        EncryptionType = "cryptsetup"
+	EncryptionTypeLUKSWithICE EncryptionType = "cryptsetup-with-inline-crypto-engine"
+)
+
+// TODO:ICE: all EncryptionTypes are LUKS based now so this could be removed?
+func (et EncryptionType) IsLUKS() bool {
+	return et == EncryptionTypeLUKS || et == EncryptionTypeLUKSWithICE
+}
+
+// AuthMode corresponds to an authentication mechanism.
+type AuthMode string
+
+const (
+	AuthModePassphrase AuthMode = "passphrase"
+	AuthModePIN        AuthMode = "pin"
+)
+
+// VolumesAuthOptions contains options for the volumes authentication
+// mechanism (e.g. passphrase authentication).
+//
+// TODO: Add PIN option when secboot support lands.
+type VolumesAuthOptions struct {
+	Mode       AuthMode      `json:"mode,omitempty"`
+	Passphrase string        `json:"passphrase,omitempty"`
+	KDFType    string        `json:"kdf-type,omitempty"`
+	KDFTime    time.Duration `json:"kdf-time,omitempty"`
+}
+
+// Validates authentication options.
+func (o *VolumesAuthOptions) Validate() error {
+	if o == nil {
+		return nil
+	}
+
+	switch o.Mode {
+	case AuthModePassphrase:
+		if len(o.Passphrase) == 0 {
+			return fmt.Errorf("passphrase cannot be empty")
+		}
+	case AuthModePIN:
+		if o.KDFType != "" {
+			return fmt.Errorf("%q authentication mode does not support custom kdf types", AuthModePIN)
+		}
+		return fmt.Errorf("%q authentication mode is not implemented", AuthModePIN)
+	default:
+		return fmt.Errorf("invalid authentication mode %q, only %q and %q modes are supported", o.Mode, AuthModePassphrase, AuthModePIN)
+	}
+
+	switch o.KDFType {
+	case "argon2i", "argon2id", "pbkdf2", "":
+	default:
+		return fmt.Errorf("invalid kdf type %q, only \"argon2i\", \"argon2id\" and \"pbkdf2\" are supported", o.KDFType)
+	}
+
+	if o.KDFTime < 0 {
+		return fmt.Errorf("kdf time cannot be negative")
+	}
+
+	return nil
+}
+
+type AuthQualityErrorReason string
+
+const (
+	AuthQualityErrorReasonLowEntropy AuthQualityErrorReason = "low-entropy"
+)
+
+// AuthQualityError contains rich inforamtion on why some auth value
+// did not pass quality checks.
+type AuthQualityError struct {
+	// Reasons is a list of reason enums to explain exactly what quality
+	// criteria failed e.g. AuthQualityErrorReasonLowEntropy.
+	Reasons []AuthQualityErrorReason
+	// Entropy is the calculated entropy in bits for the passed passphrase
+	// or PIN.
+	Entropy float64
+	// MinEntropy is the minimum entropy in bits for the corresponding
+	// authentication mode i.e. passhrase or PIN.
+	MinEntropy float64
+
+	err error
+}
+
+func (e *AuthQualityError) Error() string {
+	return e.err.Error()
+}
+
+// ValidatePassphraseOrPINEntropy checks quality of given passphrase or PIN based
+// on their entropy. An AuthQualityError error is returned which contains more
+// information about the given passphrase or PIN quality.
+func ValidatePassphraseOrPINEntropy(mode AuthMode, value string) error {
+	var minEntropy float64 = 42
+	if mode == AuthModePIN {
+		minEntropy = 13.3
+	}
+
+	// FIXME: The quality checks need to be revisited to properly support unicode and be more robust.
+	entropy := strutil.Entropy(value)
+	if entropy >= minEntropy {
+		return nil
+	}
+
+	return &AuthQualityError{
+		Reasons:    []AuthQualityErrorReason{AuthQualityErrorReasonLowEntropy},
+		Entropy:    entropy,
+		MinEntropy: minEntropy,
+		err:        fmt.Errorf("calculated entropy (%.2f) is less than the required minimum entropy (%.2f) for the %q authentication mode", entropy, minEntropy, mode),
+	}
 }

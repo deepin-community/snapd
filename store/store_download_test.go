@@ -38,6 +38,7 @@ import (
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/httputil"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/progress"
@@ -54,6 +55,8 @@ type storeDownloadSuite struct {
 	localUser *auth.UserState
 
 	mockXDelta *testutil.MockCmd
+
+	logbuf *bytes.Buffer
 }
 
 var _ = Suite(&storeDownloadSuite{})
@@ -80,6 +83,18 @@ func (s *storeDownloadSuite) SetUpTest(c *C) {
 			Factor:  1,
 		},
 	)))
+
+	buf, restore := logger.MockLogger()
+	s.AddCleanup(restore)
+	s.logbuf = buf
+}
+
+func (s *storeDownloadSuite) TearDownTest(c *C) {
+	if s.logbuf.Len() != 0 {
+		c.Logf("logs:\n%s", s.logbuf.String())
+	}
+
+	s.BaseTest.TearDownTest(c)
 }
 
 func (s *storeDownloadSuite) TestDownloadOK(c *C) {
@@ -696,6 +711,10 @@ type cacheObserver struct {
 
 	gets []string
 	puts []string
+
+	// list of errors to return on Put() to a specific key
+	putFailForKey map[string][]error
+	putErrHits    map[string]int
 }
 
 func (co *cacheObserver) Get(cacheKey, targetPath string) bool {
@@ -709,6 +728,18 @@ func (co *cacheObserver) GetPath(cacheKey string) string {
 
 func (co *cacheObserver) Put(cacheKey, sourcePath string) error {
 	co.puts = append(co.puts, fmt.Sprintf("%s:%s", cacheKey, sourcePath))
+	if len(co.putFailForKey) != 0 {
+		if errs, ok := co.putFailForKey[cacheKey]; ok && len(errs) > 0 {
+			if co.putErrHits == nil {
+				co.putErrHits = map[string]int{}
+			}
+			co.putErrHits[cacheKey]++
+			// consume the error
+			co.putFailForKey[cacheKey] = errs[1:]
+			return errs[0]
+		}
+	}
+	co.inCache[cacheKey] = true
 	return nil
 }
 
@@ -756,6 +787,189 @@ func (s *storeDownloadSuite) TestDownloadCacheMiss(c *C) {
 
 	c.Check(obs.gets, DeepEquals, []string{fmt.Sprintf("the-snaps-sha3_384:%s", path)})
 	c.Check(obs.puts, DeepEquals, []string{fmt.Sprintf("the-snaps-sha3_384:%s", path)})
+}
+
+func (s *storeDownloadSuite) TestDownloadDeltaCacheMiss(c *C) {
+	obs := &cacheObserver{inCache: map[string]bool{}}
+	restore := s.store.MockCacher(obs)
+	defer restore()
+
+	var downloadURLs []string
+	restore = store.MockDownload(func(
+		ctx context.Context, name, sha3, url string, user *auth.UserState, s *store.Store,
+		w io.ReadWriteSeeker, resume int64, pbar progress.Meter, dlOpts *store.DownloadOptions,
+	) error {
+		c.Logf("url: %v -> %v", url, name)
+		downloadURLs = append(downloadURLs, url)
+
+		switch url {
+		case "http://delta.download.url/get":
+			// equivalent to `echo "foo"``
+			_, err := w.Write([]byte("foo\n"))
+			return err
+		}
+		panic(fmt.Sprintf("unexpected URL %v", url))
+	})
+	defer restore()
+
+	// mock xdelta to create an output file with a known checksum
+	//
+	mockXDelta := testutil.MockCommand(c, "xdelta3", `
+case "$@" in
+config)
+    ;;
+-d\ -s*)
+    # -d -s <prev-rev>.snap <delta.file> <out.file>
+    # fake reconstructed content:
+    echo "foo" > "$5"
+    ;;
+*)
+    exit 123
+    ;;
+esac
+`)
+	defer mockXDelta.Restore()
+
+	// mock a previous revision of the snap
+	oldRevBlob := filepath.Join(dirs.SnapBlobDir, "foo_0.snap")
+	c.Assert(os.MkdirAll(filepath.Dir(oldRevBlob), 0755), IsNil)
+	c.Assert(os.WriteFile(oldRevBlob, nil, 0644), IsNil)
+
+	// sha3-384256 of: foo\n
+	foo_sha3 := "a4d62fdfee48479a8951de809d9f3604309e8783d754d94c0842c89ddb544ee963bf64063644251e0521ca44aca97350"
+	snap := &snap.Info{
+		SideInfo: snap.SideInfo{
+			Revision: snap.R(1),
+		},
+		DownloadInfo: snap.DownloadInfo{
+			DownloadURL: "http://download.url/get",
+			Deltas: []snap.DeltaInfo{
+				{
+					ToRevision:  1,
+					Format:      "xdelta3",
+					DownloadURL: "http://delta.download.url/get",
+					Sha3_384:    foo_sha3,
+				},
+			},
+			Sha3_384: foo_sha3,
+		},
+	}
+
+	downDir := c.MkDir()
+	path := filepath.Join(downDir, "downloaded-file")
+	pathDeltaPartial := filepath.Join(downDir, "downloaded-file.xdelta3-0-to-1.partial")
+	pathPartial := filepath.Join(downDir, "downloaded-file.partial")
+	err := s.store.Download(s.ctx, "foo", path, &snap.DownloadInfo, nil, nil, nil)
+	c.Assert(err, IsNil)
+	c.Check(downloadURLs, DeepEquals, []string{"http://delta.download.url/get"})
+	c.Check(mockXDelta.Calls(), DeepEquals, [][]string{
+		{"xdelta3", "config"},
+		{"xdelta3", "-d", "-s", oldRevBlob, pathDeltaPartial, pathPartial},
+	})
+
+	c.Check(obs.gets, DeepEquals, []string{fmt.Sprintf("%s:%s", snap.Sha3_384, path)})
+	c.Check(obs.puts, DeepEquals, []string{fmt.Sprintf("%s:%s", snap.Sha3_384, path)})
+
+	// subsequent download pulls the file from the cache
+	mockXDelta.ForgetCalls()
+	downloadURLs = nil
+	err = s.store.Download(s.ctx, "foo", path, &snap.DownloadInfo, nil, nil, nil)
+	c.Assert(err, IsNil)
+	c.Check(downloadURLs, HasLen, 0)
+	c.Check(mockXDelta.Calls(), HasLen, 0)
+
+	// we have another get
+	c.Check(obs.gets, DeepEquals, []string{
+		fmt.Sprintf("%s:%s", snap.Sha3_384, path),
+		fmt.Sprintf("%s:%s", snap.Sha3_384, path),
+	})
+	c.Check(obs.puts, DeepEquals, []string{fmt.Sprintf("%s:%s", snap.Sha3_384, path)})
+}
+
+func (s *storeDownloadSuite) TestDownloadDeltaRebuitlButCachePutFail(c *C) {
+	obs := &cacheObserver{inCache: map[string]bool{}}
+	restore := s.store.MockCacher(obs)
+	defer restore()
+
+	var downloadURLs []string
+	restore = store.MockDownload(func(
+		ctx context.Context, name, sha3, url string, user *auth.UserState, s *store.Store,
+		w io.ReadWriteSeeker, resume int64, pbar progress.Meter, dlOpts *store.DownloadOptions,
+	) error {
+		c.Logf("url: %v -> %v", url, name)
+		downloadURLs = append(downloadURLs, url)
+
+		switch url {
+		case "http://delta.download.url/get", "http://download.url/get":
+			// equivalent to `echo "foo"``
+			_, err := w.Write([]byte("foo\n"))
+			return err
+		}
+		panic(fmt.Sprintf("unexpected URL %v", url))
+	})
+	defer restore()
+
+	// mock xdelta to create an output file with a known checksum
+	applyDeltaCalls := 0
+	restore = store.MockApplyDelta(func(s *store.Store, name string, deltaPath string, deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string) error {
+		applyDeltaCalls++
+		return os.WriteFile(targetPath, []byte("foo\n"), 0644)
+	})
+	defer restore()
+
+	// mock a previous revision of the snap
+	oldRevBlob := filepath.Join(dirs.SnapBlobDir, "foo_0.snap")
+	c.Assert(os.MkdirAll(filepath.Dir(oldRevBlob), 0755), IsNil)
+	c.Assert(os.WriteFile(oldRevBlob, nil, 0644), IsNil)
+
+	// sha3-384256 of: foo\n
+	foo_sha3 := "a4d62fdfee48479a8951de809d9f3604309e8783d754d94c0842c89ddb544ee963bf64063644251e0521ca44aca97350"
+	snap := &snap.Info{
+		SideInfo: snap.SideInfo{
+			Revision: snap.R(1),
+		},
+		DownloadInfo: snap.DownloadInfo{
+			DownloadURL: "http://download.url/get",
+			Deltas: []snap.DeltaInfo{
+				{
+					ToRevision:  1,
+					Format:      "xdelta3",
+					DownloadURL: "http://delta.download.url/get",
+					Sha3_384:    foo_sha3,
+				},
+			},
+			Sha3_384: foo_sha3,
+		},
+	}
+
+	downDir := c.MkDir()
+	path := filepath.Join(downDir, "downloaded-file")
+	// keys we use in cache observer when logging get/put
+	ckey := fmt.Sprintf("%s:%s", foo_sha3, path)
+	// make cache Put fail for the rebuilt file
+	obs.putFailForKey = map[string][]error{
+		// use actual key that store package uses
+		foo_sha3: {fmt.Errorf("mock error")},
+	}
+	err := s.store.Download(s.ctx, "foo", path, &snap.DownloadInfo, nil, nil, nil)
+	c.Assert(err, IsNil)
+	c.Check(downloadURLs, DeepEquals, []string{
+		// first download is delta
+		"http://delta.download.url/get",
+		// next download is the snap blob after falling back
+		"http://download.url/get",
+	})
+
+	c.Check(obs.puts, DeepEquals, []string{
+		// attempt after rebuilding from mockXDelta
+		ckey,
+		// attempt after successful download
+		ckey,
+	})
+	c.Check(obs.gets, DeepEquals, []string{ckey})
+	c.Check(obs.putErrHits, DeepEquals, map[string]int{
+		foo_sha3: 1,
+	})
 }
 
 func (s *storeDownloadSuite) TestDownloadStreamOK(c *C) {
@@ -1037,4 +1251,175 @@ func (s *storeDownloadSuite) TestDownloadInfiniteRedirect(c *C) {
 	targetFn := filepath.Join(c.MkDir(), "foo_1.0_all.snap")
 	err := s.store.Download(s.ctx, "foo", targetFn, &snap.DownloadInfo, nil, s.user, nil)
 	c.Assert(err, ErrorMatches, fmt.Sprintf("Get %q: stopped after 10 redirects", mockServer.URL))
+}
+
+func (s *storeDownloadSuite) TestDownloadIconOK(c *C) {
+	expectedURL := "URL"
+	expectedContent := []byte("I was downloaded")
+
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, url string, w store.ReadWriteSeekTruncater) error {
+		c.Check(url, Equals, expectedURL)
+		w.Write(expectedContent)
+		return nil
+	})
+	defer restore()
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	err := store.DownloadIcon(s.ctx, "foo", path, expectedURL)
+	c.Assert(err, IsNil)
+	defer os.Remove(path)
+
+	c.Assert(path, testutil.FileEquals, expectedContent)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconDoesNotOverwriteLinks(c *C) {
+	expectedURL := "URL"
+	oldContent := []byte("I was already here")
+	newContent := []byte("I was downloaded")
+
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, url string, w store.ReadWriteSeekTruncater) error {
+		c.Check(url, Equals, expectedURL)
+		w.Write(newContent)
+		return nil
+	})
+	defer restore()
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	linkPath := path + "-existing"
+
+	// Create an existing file at the path
+	err := os.MkdirAll(filepath.Dir(path), 0o755)
+	c.Assert(err, IsNil)
+	err = os.WriteFile(path, oldContent, 0o600)
+	c.Assert(err, IsNil)
+	// Create a hard link to the existing file
+	err = os.Link(path, linkPath)
+	c.Assert(err, IsNil)
+
+	err = store.DownloadIcon(s.ctx, "foo", path, expectedURL)
+	c.Assert(err, IsNil)
+	defer os.Remove(path)
+
+	c.Assert(path, testutil.FileEquals, newContent)
+	// Check that the contents of the existing hard-linked file were not overwritten
+	c.Assert(linkPath, testutil.FileEquals, oldContent)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconFails(c *C) {
+	const fakeName = "foo"
+	fakePath := filepath.Join(c.MkDir(), "downloaded-file")
+	const fakeURL = "URL"
+
+	var tmpfile *osutil.AtomicFile
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, url string, w store.ReadWriteSeekTruncater) error {
+		c.Assert(name, Equals, fakeName)
+		c.Assert(url, Equals, fakeURL)
+		tmpfile = w.(*osutil.AtomicFile)
+		return fmt.Errorf("uh, it failed")
+	})
+	defer restore()
+
+	// simulate a failed download
+	err := store.DownloadIcon(s.ctx, fakeName, fakePath, fakeURL)
+	c.Assert(err, ErrorMatches, "uh, it failed")
+	// ... and ensure that the tempfile is removed
+	c.Assert(osutil.FileExists(tmpfile.Name()), Equals, false)
+	// ... and not because it succeeded either
+	c.Assert(osutil.FileExists(fakePath), Equals, false)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconFailsDoesNotLeavePartial(c *C) {
+	const fakeName = "foo"
+	fakePath := filepath.Join(c.MkDir(), "downloaded-file")
+	const fakeURL = "URL"
+
+	var tmpfile *osutil.AtomicFile
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, url string, w store.ReadWriteSeekTruncater) error {
+		c.Assert(name, Equals, fakeName)
+		c.Assert(url, Equals, fakeURL)
+		tmpfile = w.(*osutil.AtomicFile)
+		w.Write([]byte{'X'}) // so it's not empty
+		return fmt.Errorf("uh, it failed")
+	})
+	defer restore()
+
+	// simulate a failed download
+	err := store.DownloadIcon(s.ctx, fakeName, fakePath, fakeURL)
+	c.Assert(err, ErrorMatches, "uh, it failed")
+	// ... and ensure that the tempfile is removed
+	c.Assert(osutil.FileExists(tmpfile.Name()), Equals, false)
+	// ... and the target path isn't there
+	c.Assert(osutil.FileExists(fakePath), Equals, false)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconFailsWithExisting(c *C) {
+	const fakeName = "foo"
+	fakePath := filepath.Join(c.MkDir(), "downloaded-file")
+	const fakeURL = "URL"
+
+	// Create an existing file at the path
+	oldContent := []byte("I was already here")
+	err := os.MkdirAll(filepath.Dir(fakePath), 0o577)
+	c.Assert(err, IsNil)
+	err = os.WriteFile(fakePath, oldContent, 0o600)
+	c.Assert(err, IsNil)
+
+	s.testDownloadIconSyncFailsGeneric(c, fakeName, fakePath, fakeURL)
+
+	// Check that the existing file contents remain unchanged
+	c.Assert(fakePath, testutil.FileEquals, oldContent)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconFailsWithoutExisting(c *C) {
+	const fakeName = "foo"
+	fakePath := filepath.Join(c.MkDir(), "downloaded-file")
+	const fakeURL = "URL"
+
+	s.testDownloadIconSyncFailsGeneric(c, fakeName, fakePath, fakeURL)
+
+	// Check that the file was not renamed to fakePath
+	c.Assert(osutil.FileExists(fakePath), Equals, false)
+}
+
+func (s *storeDownloadSuite) testDownloadIconSyncFailsGeneric(c *C, fakeName, fakePath, fakeURL string) {
+	var tmpfile *osutil.AtomicFile
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, url string, w store.ReadWriteSeekTruncater) error {
+		c.Assert(name, Equals, fakeName)
+		c.Assert(url, Equals, fakeURL)
+		tmpfile = w.(*osutil.AtomicFile)
+		w.Write([]byte("commit will fail"))
+		err := tmpfile.Close()
+		c.Assert(err, IsNil)
+		return nil
+	})
+	defer restore()
+
+	// simulate a failed sync
+	err := store.DownloadIcon(s.ctx, fakeName, fakePath, fakeURL)
+	c.Assert(err, ErrorMatches, "cannot commit snap icon file for snap foo: .* file already closed")
+	// ... and ensure that the tempfile is removed
+	c.Assert(osutil.FileExists(tmpfile.Name()), Equals, false)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconInfiniteRedirect(c *C) {
+	n := 0
+	var mockServer *httptest.Server
+
+	mockServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// n = 0 -> initial request
+		// n = 10 -> max redirects
+		// n = 11 -> exceeded max redirects
+		c.Assert(n, testutil.IntNotEqual, 11)
+		n++
+		http.Redirect(w, r, mockServer.URL, 302)
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	const fakeName = "foo"
+	fakePath := filepath.Join(c.MkDir(), "foo.icon")
+	fakeURL := mockServer.URL
+
+	err := store.DownloadIcon(s.ctx, fakeName, fakePath, fakeURL)
+	c.Assert(err, ErrorMatches, fmt.Sprintf("Get %q: stopped after 10 redirects", fakeURL))
 }
